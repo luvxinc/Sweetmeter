@@ -38,7 +38,8 @@
   ],
   "device": {
     "battery_percent": -1,
-    "firmware": "2026.9.7"
+    "firmware": "2026.9.8",
+    "rssi": -65
   },
   "example_data": true,
   "example_note": "Illustrative quotas, token totals and subscription labels; not live account data."

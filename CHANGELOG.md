@@ -37,3 +37,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.7] - 2026-09-20
 
 - Prefix the upper-left running firmware version with "v " on the meter and matching preview.
+
+## [2026.9.8] - 2026-09-20
+
+- Show four Bluetooth signal bars after BT using live peer RSSI; clear stale/disconnected readings and reuse normal e-ink refreshes.

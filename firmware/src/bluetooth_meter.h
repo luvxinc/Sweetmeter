@@ -30,6 +30,8 @@ Preferences preferences;
 String selectedHost,selectedName;
 bool authorized=false,hostDirty=false;
 volatile bool connected=false;
+volatile int signalRssi=127;
+volatile uint32_t signalReadAt=0;
 volatile uint32_t linkGeneration=0,connectionAt=0,firstProbeAt=0;
 volatile esp_gatt_if_t gattInterface=ESP_GATT_IF_NONE;
 volatile bool bleServiceStarted=false;
@@ -177,6 +179,7 @@ class OtaStatusCallbacks : public BLECharacteristicCallbacks {
 };
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
+    signalRssi=127; signalReadAt=0;
     connected=true; connectionAt=millis(); firstProbeAt=0; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
   }
   void onConnect(BLEServer *server,esp_ble_gatts_cb_param_t *parameters) override {
@@ -184,17 +187,19 @@ class ServerCallbacks : public BLEServerCallbacks {
     server->updateConnParams(peerAddress,12,24,0,600);
   }
   void onDisconnect(BLEServer *) override {
+    signalRssi=127; signalReadAt=0;
     connected=false; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
   }
 };
 void updateDeviceSnapshot() {
   char next[512];
   int length=snprintf(next,sizeof(next),
-    "{\"protocol\":4,\"firmware\":\"%s\",\"board\":\"%s\",\"selected_host\":\"%s\",\"battery_percent\":%d,\"battery_mv\":%d,\"interval\":%u,\"critical\":%s,\"charge_state\":\"unknown\",\"clock_synced\":%s,\"menu\":%s,\"discovery_nonce\":%lu,\"discovery_remaining_ms\":%lu,\"computers\":%u,\"ota\":%s,\"boot_health\":\"%s\",\"last_update\":\"%s\",\"ota_target\":\"%s\"}",
+    "{\"protocol\":4,\"firmware\":\"%s\",\"board\":\"%s\",\"selected_host\":\"%s\",\"battery_percent\":%d,\"battery_mv\":%d,\"interval\":%u,\"critical\":%s,\"charge_state\":\"unknown\",\"clock_synced\":%s,\"menu\":%s,\"discovery_nonce\":%lu,\"discovery_remaining_ms\":%lu,\"computers\":%u,\"ota\":%s,\"boot_health\":\"%s\",\"last_update\":\"%s\",\"ota_target\":\"%s\",\"rssi\":%d}",
     SWEETMETER_VERSION,sweetmeter::boardId,selectedHost.c_str(),batteryPercent,batteryMillivolts,refreshSeconds(),
     criticalBattery()?"true":"false",clockSynced?"true":"false",discovery.open?"true":"false",
     (unsigned long)(discovery.open?discovery.nonce:0),(unsigned long)discovery.remaining(millis()),discovery.count,
-    ota.active()?"true":"false",bootHealth.health,bootHealth.lastUpdate,bootHealth.target);
+    ota.active()?"true":"false",bootHealth.health,bootHealth.lastUpdate,bootHealth.target,
+    connected&&authorized&&signalReadAt&&millis()-signalReadAt<30000?signalRssi:127);
   if(length<0 || size_t(length)>=sizeof(next)) {
     // Never expose truncated JSON. The fixed bounded fields are covered by tests.
     Serial.println("ERR STATUS_OVERFLOW"); return;
@@ -303,8 +308,11 @@ void drawScreen() {
       textAt(4,77,"github.com/luvxinc/Sweetmeter");
     }
     box(0,0,250,13,true); textAt(3,1,"v " SWEETMETER_VERSION,false);
-    textAt(90,1,connected&&authorized?"BT":"--",false);
-    if(refreshRequestedAt && millis()-refreshRequestedAt<10000) textAt(112,1,"*",false);
+    textAt(90,1,"BT",false);
+    int rssi=connected&&authorized&&signalReadAt&&millis()-signalReadAt<30000?signalRssi:127;
+    int bars=rssi>20||rssi<-127?0:rssi>=-60?4:rssi>=-70?3:rssi>=-80?2:1;
+    for(int i=0;i<4;++i) { int height=i<bars?2+i*2:1; box(105+i*4,10-height,2,height,false); }
+    if(refreshRequestedAt && millis()-refreshRequestedAt<10000) textAt(78,1,"*",false);
     char stamp[24]="----/--/-- --:--";
     if(clockSynced) { time_t now=time(nullptr)+timezoneOffset; tm local; gmtime_r(&now,&local); strftime(stamp,sizeof(stamp),"%Y/%m/%d %H:%M",&local); }
     textAt(124,1,stamp,false); batteryIcon();
@@ -399,6 +407,13 @@ void setupBluetooth() {
   Wire.begin(40,41,100000); Wire.setTimeOut(25); readBattery();
   char name[24]; snprintf(name,sizeof(name),"Sweetmeter-%04X",unsigned(ESP.getEfuseMac()&0xffff));
   BLEDevice::init(name);
+  BLEDevice::setCustomGapHandler([](esp_gap_ble_cb_event_t event,esp_ble_gap_cb_param_t *parameters) {
+    if(event==ESP_GAP_BLE_READ_RSSI_COMPLETE_EVT && connected &&
+       memcmp(parameters->read_rssi_cmpl.remote_addr,peerAddress,sizeof(peerAddress))==0) {
+      signalRssi=parameters->read_rssi_cmpl.status==ESP_BT_STATUS_SUCCESS?parameters->read_rssi_cmpl.rssi:127;
+      signalReadAt=millis();
+    }
+  });
   BLEDevice::setCustomGattsHandler([](esp_gatts_cb_event_t event,esp_gatt_if_t interface,esp_ble_gatts_cb_param_t *parameters) {
     if(event==ESP_GATTS_REG_EVT && parameters->reg.status==ESP_GATT_OK) gattInterface=interface;
     if(event==ESP_GATTS_START_EVT) bleServiceStarted=parameters->start.status==ESP_GATT_OK;
@@ -442,7 +457,7 @@ void setupBluetooth() {
 }
 void bluetoothLoop() {
   using namespace sweetmeter;
-  static uint32_t seenGeneration=0,batteryAt=0,snapshotAt=0,otaDrawAt=0;
+  static uint32_t seenGeneration=0,batteryAt=0,snapshotAt=0,otaDrawAt=0,signalPollAt=0;
   static unsigned otaDrawPercent=0;
   static bool serviceChangeSent=false,wasOta=false;
   static time_t paintedMinute=-1;
@@ -461,6 +476,9 @@ void bluetoothLoop() {
     Serial.printf("BLE SERVICE_CHANGED result=%d\n",int(result));
   }
   if(now-batteryAt>=10000) { readBattery(); batteryAt=now; }
+  if(connected && authorized && !ota.active() && now-signalPollAt>=10000) {
+    signalPollAt=now; esp_ble_gap_read_rssi(peerAddress);
+  }
   ota.tick();
   updateOtaRadio();
   if(ota.exited) {

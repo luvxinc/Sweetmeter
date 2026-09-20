@@ -63,6 +63,11 @@ def render(snapshot):
     draw.rectangle((0, 0, 249, 12), fill=0)
     draw.text((3, 0), 'v ' + (snapshot.get('device', {}).get('firmware') or '--'), font=font(9), fill=1)
     draw.text((90, 0), 'BT', font=font(9), fill=1)
+    rssi = snapshot.get('device', {}).get('rssi', 127)
+    bars = (4 if rssi >= -60 else 3 if rssi >= -70 else 2 if rssi >= -80 else 1) if type(rssi) is int and -127 <= rssi <= 20 else 0
+    for i in range(4):
+        height = 2 + i * 2 if i < bars else 1
+        draw.rectangle((105 + i * 4, 10 - height, 106 + i * 4, 9), fill=1)
     now = snapshot.get('clock_at', snapshot['as_of'])
     stamp = datetime.fromtimestamp(now).strftime('%Y/%m/%d %H:%M')
     draw.text((220, 0), stamp, anchor='ra', font=font(9), fill=1)

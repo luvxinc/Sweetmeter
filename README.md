@@ -253,3 +253,5 @@ remains unresolved; vendor assets are not relabeled Apache-2.0. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for sources and notices,
 including CodexBar, ccusage and CodexIsland. Sweetmeter is an independent
 project, not an official product of the AI providers or ELECROW.
+
+The header shows the running firmware as `v YYYY.M.N`, followed by `BT` and four signal bars. Bars use the connected peer’s RSSI (4: ≥ −60 dBm, 3: ≥ −70, 2: ≥ −80, 1: weaker). Unknown, stale or disconnected readings show empty bars. RSSI is sampled every 10 seconds and painted with the normal dashboard refresh to avoid extra e-ink updates.
