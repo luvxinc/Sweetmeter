@@ -12,7 +12,14 @@ permissions:
 jobs:
   version-policy-tests:
     name: version-policy-tests
-    runs-on: ubuntu-latest
+    # All PR source executes on GitHub-hosted runners. The Mac mini's isolated
+    # Linux ARM64 VM pool handles only the owner's main/codex push/manual jobs.
+    runs-on: >-
+      ${{ fromJSON(github.repository == 'luvxinc/Sweetmeter' &&
+          github.actor == 'luvxinc' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/codex/')) &&
+          '["self-hosted","Linux","ARM64","sweetmeter-ci"]' || '["ubuntu-22.04"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,6 +28,6 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Exercise proposed policy changes without privileged credentials
         run: python -m unittest discover -s tests -p test_versioning.py -v

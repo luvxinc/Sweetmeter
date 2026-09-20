@@ -75,6 +75,7 @@ The old Swift helper which requires `protocol == 3` itself needs replacement.
 | Device → control, hello ACK | `H:u8, result:u8` (`0` selected, `7` not selected/menu open) |
 | Host → control, clock | `T:u8, unix_seconds:u32, UTC_offset_seconds:i32` |
 | Host → control, begin frame | `B:u8, sequence:u32, CRC32:u32, length:u16` (length 4000) |
+| Device → control, protocol-4 begin-ready ACK | `b:u8, result:u8, sequence:u32, CRC32:u32` |
 | Host → data | `offset:u16, payload:1..180 bytes` (also bounded by negotiated value size) |
 | Host → control, commit frame | `C:u8, sequence:u32` |
 | Device → control, displayed ACK | `A:u8, result:u8, sequence:u32, CRC32:u32` |
@@ -98,6 +99,18 @@ Protocol 4 requires **physical selection before a new host can use H**. An empty
 selected host no longer causes implicit first-peer selection. Existing persisted
 selection is honored. H is refused while discovery is open. A selected H success
 is the only network event that cancels the normal target-disconnect timer.
+
+Protocol 4 waits for a matching **b0** begin-ready ACK before sending any
+framebuffer data. The 10-byte b ACK echoes B's sequence and CRC: result 0 means the
+worker is ready to receive, 2 means busy/invalid begin, 6 means critical battery,
+and 7 means unauthorized/discovery open. Wait up to 30 seconds: B may be queued
+behind a full panel refresh. After accepting B, the worker defers all normal UI
+and clock panel redraws until C is complete or the 15-second receive timeout
+expires, and drains frame packets without a fixed per-packet sleep. This prevents
+a short four-packet callback queue overflowing behind a multi-second panel draw.
+The GATT write response alone is never readiness. Protocol 3 has no b event and
+retains its legacy begin behavior. A b error ends that frame attempt; do not send
+data. C still receives its A acknowledgement only after panel completion.
 
 Frame A results: 0 displayed; 1 already identical; 2 busy/invalid begin length;
 3 incomplete/CRC/commit mismatch; 4 offset error; 5 display failure; 6 critical
@@ -341,8 +354,11 @@ session 0 and MALFORMED. Never acknowledge an unwritten byte as received.
 | 20 | IMAGE | ESP image/chip validation failed |
 
 Cancel is a normal terminal state with error 0. An unknown opcode is MALFORMED.
-The metadata format/protocol distinction is deliberate: metadata format changes
-are METADATA, a valid header requesting a different protocol is PROTOCOL.
+Error notifications may echo any trigger opcode byte, including an unknown
+opcode rejected as MALFORMED; successful notifications allow only the documented
+opcodes or zero. The metadata format/protocol distinction is deliberate: metadata
+format changes are METADATA, a valid header requesting a different protocol is
+PROTOCOL.
 
 ### Timeouts, loss and cancellation
 
@@ -486,7 +502,10 @@ Each artifact has `kind` (`firmware` or `companion`), `version`, `asset` (basena
 (64 lower-case hex). A firmware artifact additionally has `board`, `protocol`
 (4), `minimum_companion`, `metadata_asset`, `metadata_url`, `metadata_size` and
 `metadata_sha256`; its version/board/protocol/minimum/size/hash must agree with the
-signed binary header. A companion artifact additionally has `os` (`macos`,
+signed binary header. `minimum_companion` cannot exceed the manifest release
+version: all companion artifacts in this release use that same version, so a
+future minimum would make its offered companion update unable to satisfy it.
+A companion artifact additionally has `os` (`macos`,
 `windows`, `linux`) and `arch` (`arm64`, `x86_64`). Reject duplicate matching
 artifacts and non-GitHub asset URLs; redirects are limited to HTTPS GitHub release
 asset/CDN hosts by the downloader. Verify every size and digest before use.

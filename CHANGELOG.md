@@ -8,3 +8,11 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 - Add a single-page Claude, Fable and Codex quota dashboard with subscription labels and reset countdowns.
 - Prepare a public source tree with bundled redistributable fonts, hardware documentation and private runtime data excluded.
 - Enforce a calendar version and user-facing changelog for every commit before publication.
+
+## [2026.9.2] - 2026-09-20
+
+- Add native desktop companions for macOS, Windows and Linux with per-user startup and update notifications.
+- Offer signed Bluetooth firmware updates with explicit confirmation, progress and rollback after failed startup.
+- Improve computer selection, reconnect and e-paper frame transfer while keeping the approved four-quota dashboard.
+- Recover interrupted companion updates and preserve existing local device identities during installation.
+- Run trusted primary CI in disposable Mac mini VMs and publish only the exact hardware-accepted firmware artifact.

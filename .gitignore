@@ -5,6 +5,7 @@ backups/
 *.sqlite3-*
 *.log
 *.pem
+!meter/assets/keys/release-1.pem
 *.key
 .env
 .env.*
@@ -16,13 +17,18 @@ __pycache__/
 .venv/
 venv/
 .pio/
+firmware/.generated/
 .pytest_cache/
 .mypy_cache/
 build/
 dist/
+incoming/
+signed-release/
 *.egg-info/
 *.app/
 *.dmg
+*.p12
+*.pfx
 *.exe
 *.bin
 *.elf

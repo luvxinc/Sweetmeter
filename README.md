@@ -74,63 +74,117 @@ press the top button to wake before reconnecting. E-paper retains its OFF
 screen without power. Button sleep does not electrically disconnect every
 component on the development board.
 
-## Installation status
+## Install the companion
 
-This branch is being developed from the working macOS prototype. The baseline
-has macOS CoreBluetooth transport; Windows/Linux transport, native packages,
-signed update prompts and BLE OTA are being added. Do not treat the planned
-features below as validated release behavior until a release's verification
-record says so. There is no app signing/notarization claim for this baseline.
+The companion targets **Windows 11 x64**, **macOS 15+ arm64 / Intel**, and
+**Ubuntu 22.04+ x64 with a graphical desktop and BlueZ 5.55+**. These are build
+and software-compatibility targets; Windows/Linux physical Bluetooth and battery
+acceptance have not been performed. Read each release's validation record.
+Native builds include Python, Tk, BLE libraries, fonts, the public update key and
+third-party notices. Claude Code and Codex themselves must already be installed
+and logged in as the same OS user.
 
-Development setup for the imported macOS baseline:
+Download the matching ZIP from [Releases](https://github.com/luvxinc/Sweetmeter/releases)
+when a tested release is available. Extract the ZIP **before** running it. On
+macOS use Archive Utility or another extractor that preserves framework links.
+Install the extracted app for your user with its own `--install` option:
+
+| System | From the extracted folder |
+| --- | --- |
+| macOS | `./Sweetmeter.app/Contents/MacOS/Sweetmeter --install` |
+| Windows PowerShell | `.\Sweetmeter\Sweetmeter.exe --install` |
+| Linux | `./Sweetmeter/Sweetmeter --install` |
+
+The installer registers login startup and starts the managed companion. The
+managed locations are `~/Applications/Sweetmeter.app`,
+`%LOCALAPPDATA%/Programs/Sweetmeter`, and `~/.local/lib/Sweetmeter`. Running directly
+from Downloads is possible, but automatic application replacement requires the
+managed installation. Existing installs are not overwritten by the first-install
+command; use the confirmed updater for subsequent releases.
+
+**Current macOS development builds are ad-hoc signed, not Developer ID signed or
+notarized. Windows builds are not Authenticode signed.** OS warnings must not be
+misrepresented as verification by Apple/Microsoft. Verify the source/release you
+intend to trust; do not disable OS security globally. Release signatures checked
+by Sweetmeter are separate from platform app signing.
+
+Allow Bluetooth permission when requested. On Linux ensure BlueZ and its D-Bus
+service are running and the current desktop user has Bluetooth permission. Log
+into the official Claude Code and Codex clients, open Sweetmeter, then long-press
+the meter's bottom button for three seconds and select this computer with the rocker. The device only lists companions that register during
+that physical selection window. Pairing alone cannot read account data: the
+companion must be running.
+
+First firmware installation still uses USB; see [HARDWARE.md](docs/HARDWARE.md).
+Existing `QM3.2` firmware requires this USB bootstrap for protocol 4 OTA. Normal
+quota traffic and subsequent firmware updates use BLE.
+
+### Source installation
+
+Python **3.11+ with Tk** is required; release builds use Python 3.12. On Debian /
+Ubuntu install `python3-venv`, `python3-tk` and `bluez` first. On Windows use native
+Python and native Claude/Codex clients; WSL login directories are not bridged.
+On macOS a Python distribution that includes working Tk is required.
 
 ```sh
 git clone https://github.com/luvxinc/Sweetmeter.git
 cd Sweetmeter
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python scripts/install_hooks.py
-```
-
-Log into the official Claude Code and Codex clients as the same OS user who
-will run Sweetmeter. Do not paste account tokens into repository files. The
-baseline reads Claude's existing login and calls its usage endpoint, and uses
-the official local Codex `app-server` command for `account/rateLimits/read`.
-
-For a fresh macOS prototype installation, Xcode Command Line Tools are required
-to build the legacy helper:
-
-```sh
+.venv/bin/python -m meter --self-test
 .venv/bin/python scripts/install_agent.py
 ```
 
-That installer uses `~/Library/Application Support/QuotaMeter`, keeps that
-installation's own state on upgrades, and creates
-`~/Library/LaunchAgents/com.sweetmeter.companion.plist`. It never copies caches,
-logs or credentials from the source checkout. Permit Bluetooth access when
-macOS requests it. Existing prototype installations need explicit migration;
-do not start a second background companion alongside the first.
+On Windows replace `.venv/bin/python` with `.venv\Scripts\python.exe` and use
+`py -3` to create the environment. `--no-startup` installs without registering
+login startup. `--remove-startup` removes Sweetmeter's current startup entry.
+Source installs receive update notices and verified manual packages; the app
+never pretends to automatically replace an arbitrary source checkout.
 
-First firmware flash and private backup instructions are in
-[HARDWARE.md](docs/HARDWARE.md). After flashing, open computer selection on the
-device and choose the companion. A Bluetooth connection alone cannot read
-account data: the companion must be running, and the official clients must be
-logged in. Windows/Linux installation steps will accompany their native
-packages; those platforms have not been physically tested in this baseline.
+Optional profile paths are `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and
+`SWEETMETER_CODEX_PATH` (a literal Codex executable/npm shim path). Existing
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` is honored when the installed official CLI
+uses it, including an explicitly empty value. Set these before running the
+installer so its startup entry preserves the selected profile. Do not place
+access tokens in these variables or repository files.
+
+Per-user state is under `~/Library/Application Support/Sweetmeter/state`,
+`%LOCALAPPDATA%/Sweetmeter/state`, or `$XDG_DATA_HOME/sweetmeter/state` (default
+`~/.local/share/sweetmeter/state`). On macOS an existing prototype identity at
+`~/Library/Application Support/QuotaMeter/state/companion.json` keeps that state
+location. Installation retires a legacy macOS startup entry only when it points
+to that adopted prototype path. Stop other custom helpers before starting the
+new one; only one companion should use the device. Installation never imports another
+person's source-checkout caches or account credentials.
 
 ## Updates and release notes
 
-The target flow is: the companion checks GitHub Releases, shows the signed
-release notes, and offers **Install / Later / Skip this version**. Installation
-begins only after the user selects Install. Firmware is downloaded and verified,
-transferred over BLE to the inactive firmware slot, then booted and checked;
-failed startup health checks trigger rollback. A USB bootstrap flash is needed
-once to install the OTA-capable firmware. Keep USB power connected during
-firmware upgrades until battery-side acceptance has been completed.
+Sweetmeter checks GitHub Releases, verifies the signed manifest and shows the
+release's cumulative change notes before offering **Install / Later / Skip**.
+Downloads and installation require an explicit Install choice. A firmware
+update also asks the user to confirm USB power; the board cannot measure that
+connection. Keep the computer and device running throughout the transfer.
 
-The build/acceptance sequence is tracked in
-[IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md). An available draft or
-source commit is not a promise that its OTA path has passed hardware tests.
+Firmware is written to the inactive slot and checked before reboot. The new
+firmware confirms startup health or rolls back. The companion reports success
+only after reconnecting to the expected healthy version. If the firmware needs
+a newer companion, update the companion first; this does not automatically
+approve a later firmware update.
+
+Managed companion updates use a temporary helper outside the application. It
+waits for the current app to exit, swaps in the verified native package, and
+restores the previous app if the new process does not confirm healthy startup.
+For source or unwritable installs, the UI offers the verified extracted package
+for manual installation. Installed login startup uses a separate recovery
+launcher and durable swap journal, so an interrupted replacement rolls back on
+the next startup after the app exits or the computer restarts. macOS framework
+symlinks are accepted only when their complete chain remains within the app; traversal, cycles, dangling links and
+file writes through links are rejected.
+
+The [release guide](docs/RELEASING.md) covers signed assets, native build commands,
+recovery, signing limitations and the distinction between CI software checks and
+physical hardware acceptance. Battery and cross-platform hardware results are
+reported as untested until separately exercised.
 
 ## Data and compatibility
 
@@ -156,6 +210,10 @@ python -m unittest discover -s tests -v
 python scripts/render_example.py
 python scripts/generate_screen_font.py
 ```
+
+Trusted primary CI runs in an isolated Linux ARM64 VM on the configured Mac mini;
+untrusted pull requests and native Windows/macOS/x64 build checks use GitHub
+hosted workers. See [CI setup and isolation](docs/CI.md).
 
 These tests and rendering commands use synthetic data. They do not contact real
 accounts or the device. The hardware diagnostic scripts under `scripts/` are

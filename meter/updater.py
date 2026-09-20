@@ -1,0 +1,443 @@
+"""Signed GitHub releases and explicit user decisions. Never auto-install."""
+from __future__ import annotations
+import base64
+import json
+import os
+import platform
+import queue
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from urllib.parse import urljoin
+import requests
+from .protocol import (BOARD_ID, MAX_MANIFEST_SIZE, select_artifact, validate_asset_url,
+                       validate_download_url, verify_manifest, verify_artifact,
+                       verify_envelope, match_firmware_artifact, firmware_image_version)
+from .version import Version, get_version
+
+RELEASE_API = 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest'
+INTERVAL = 6 * 3600
+
+def save_json(path, value):
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    temp.replace(path)
+
+def platform_id():
+    system = {'Darwin': 'macos', 'Windows': 'windows', 'Linux': 'linux'}.get(platform.system())
+    arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x86_64', 'AMD64': 'x86_64'}.get(platform.machine())
+    return system, arch
+
+class RateLimited(RuntimeError):
+    def __init__(self, retry_at):
+        self.retry_at = retry_at
+        super().__init__('Update server rate limit; retry later')
+
+class NoPublishedRelease(RuntimeError):
+    pass
+
+class DownloadHTTPError(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f'Update server HTTP {status}')
+
+def retry_deadline(headers, now):
+    value = headers.get('Retry-After', '')
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            delay = parsedate_to_datetime(value).timestamp() - now
+        except (TypeError, ValueError, OverflowError):
+            delay = 60
+    try:
+        reset = float(headers.get('X-RateLimit-Reset', 0))
+    except (ValueError, TypeError):
+        reset = 0
+    return max(now + max(60, min(delay, 86400)), min(reset, now + 86400))
+
+class Downloader:
+    def __init__(self, session=None):
+        self.session = session or requests.Session()
+
+    def fetch(self, url, maximum, *, headers=None, api=False, cancel=None, destination=None):
+        if api:
+            if url != RELEASE_API:
+                raise ValueError('Unexpected update API')
+        else:
+            validate_asset_url(url)
+        for attempt in range(5):
+            response = self.session.get(url, headers=headers or {}, timeout=(10, 30),
+                                        stream=True, allow_redirects=False)
+            try:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    if api or attempt == 4:
+                        raise RuntimeError('Unexpected release redirect')
+                    url = validate_download_url(urljoin(url, response.headers.get('Location', '')))
+                    continue
+                if response.status_code in (403, 429):
+                    raise RateLimited(retry_deadline(response.headers, time.time()))
+                if response.status_code == 304 and api:
+                    return None, dict(response.headers)
+                if response.status_code == 404 and api:
+                    raise NoPublishedRelease()
+                if response.status_code != 200:
+                    raise DownloadHTTPError(response.status_code)
+                length = response.headers.get('Content-Length')
+                if length and int(length) > maximum:
+                    raise ValueError('Download exceeds size limit')
+                result, received = bytearray(), 0
+                handle = Path(destination).open('xb') if destination is not None else None
+                try:
+                    for block in response.iter_content(65536):
+                        if cancel is not None and cancel.is_set():
+                            raise RuntimeError('Download cancelled')
+                        received += len(block)
+                        if received > maximum:
+                            raise ValueError('Download exceeds size limit')
+                        if handle:
+                            handle.write(block)
+                        else:
+                            result.extend(block)
+                finally:
+                    if handle:
+                        handle.close()
+                return bytes(result), dict(response.headers)
+            finally:
+                response.close()
+        raise RuntimeError('Too many redirects')
+
+    def artifact(self, artifact, directory, cancel=None):
+        # Only called on the Install path. The size comes from a verified manifest.
+        path = Path(directory) / artifact['asset']
+        try:
+            self.fetch(artifact['url'], artifact['size'], cancel=cancel, destination=path)
+            verify_artifact(path, artifact)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return path
+
+@dataclass(frozen=True)
+class Offer:
+    kind: str
+    current: str
+    target: str
+    notes: str
+    artifact: dict
+    manifest: dict
+    blocked: str = ''
+
+class UpdateService:
+    def __init__(self, state_dir, radio, emit, *, downloader=None, version=None, trusted_keys=None):
+        self.state_dir, self.radio, self.emit = Path(state_dir), radio, emit
+        self.version = version or get_version()
+        self.downloader = downloader or Downloader()
+        self.trusted_keys = trusted_keys
+        self.path = self.state_dir / 'updates.json'
+        try:
+            self.state = json.loads(self.path.read_text(encoding='utf-8'))
+            if not isinstance(self.state, dict):
+                self.state = {}
+        except (OSError, ValueError):
+            self.state = {}
+        # A damaged local preference file must not kill the scheduler or UI.
+        for key in ('retry_at', 'checked_at'):
+            if not isinstance(self.state.get(key, 0), (int, float)):
+                self.state.pop(key, None)
+        if not isinstance(self.state.get('choices', {}), dict):
+            self.state.pop('choices', None)
+        else:
+            self.state['choices'] = {kind: value for kind, value in self.state.get('choices', {}).items()
+                                     if kind in ('firmware', 'companion') and isinstance(value, dict)
+                                     and isinstance(value.get('later', 0), (int, float))}
+        pending = self.state.get('pending')
+        if pending is not None:
+            try:
+                if not isinstance(pending, dict) or pending.get('kind') not in ('firmware', 'companion'):
+                    raise ValueError('Invalid pending operation')
+                Version.parse(pending.get('target'))
+            except ValueError:
+                self.state.pop('pending', None)
+        self.manifest, self.device, self.offers = None, {}, {}
+        self.device_id = None
+        self.connected = False
+        self.busy = False
+        self.lock = threading.RLock()
+        self.requests = queue.Queue()
+        self.stop, self.cancel_download = threading.Event(), threading.Event()
+        self.thread = None
+        self.awaiting_until = None
+        self._reconciled = False
+        self.prompted = set()
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name='sweetmeter-updates', daemon=True)
+        self.thread.start()
+        self.requests.put('automatic')
+
+    def check(self):
+        self.requests.put('check')
+
+    def _save(self):
+        save_json(self.path, self.state)
+
+    def _run(self):
+        next_check = time.monotonic() + INTERVAL
+        while not self.stop.is_set():
+            try:
+                manual = self.requests.get(timeout=1) == 'check'
+            except queue.Empty:
+                manual = False
+                if time.monotonic() < next_check:
+                    self.tick()
+                    continue
+            self.check_now(manual=manual)
+            next_check = time.monotonic() + INTERVAL
+
+    def check_now(self, *, manual=False):
+        with self.lock:
+            if self.busy:
+                return
+            if time.time() < self.state.get('retry_at', 0):
+                self.emit({'event': 'update_notice', 'message': 'Update checks are waiting for the server retry time.'})
+                return
+        try:
+            headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'Sweetmeter/' + self.version,
+                       'X-GitHub-Api-Version': '2022-11-28'}
+            if self.state.get('etag'):
+                headers['If-None-Match'] = self.state['etag']
+            raw, response_headers = self.downloader.fetch(RELEASE_API, 1024*1024, headers=headers, api=True)
+            if raw is None:
+                manifest_raw = base64.b64decode(self.state['manifest'], validate=True)
+                signature = base64.b64decode(self.state['signature'], validate=True)
+            else:
+                release = json.loads(raw)
+                if release.get('draft') or release.get('prerelease'):
+                    raise ValueError('Release is not stable')
+                assets = release.get('assets', [])
+                def asset_url(name):
+                    matches = [a['browser_download_url'] for a in assets if a.get('name') == name]
+                    if len(matches) != 1:
+                        raise ValueError('Release is missing unique signed metadata')
+                    return matches[0]
+                manifest_raw, _ = self.downloader.fetch(asset_url('manifest.json'), MAX_MANIFEST_SIZE)
+                signature, _ = self.downloader.fetch(asset_url('manifest.json.sig'), 72)
+            manifest = verify_manifest(manifest_raw, signature, trusted_keys=self.trusted_keys)
+            with self.lock:
+                self.manifest = manifest
+                self.state.update(manifest=base64.b64encode(manifest_raw).decode(),
+                                  signature=base64.b64encode(signature).decode(),
+                                  etag=response_headers.get('ETag', self.state.get('etag', '')),
+                                  checked_at=time.time(), retry_at=0)
+                self._save()
+                self._offers(manual)
+            self.emit({'event': 'update_checked', 'version': manifest['version']})
+        except NoPublishedRelease:
+            with self.lock:
+                self.manifest, self.offers = None, {}
+            self.emit({'event': 'update_notice', 'message': 'No published updates yet.'})
+        except RateLimited as error:
+            with self.lock:
+                self.state['retry_at'] = error.retry_at
+                self._save()
+            self.emit({'event': 'update_error', 'error': str(error)})
+        except DownloadHTTPError as error:
+            self.emit({'event': 'update_error', 'error': str(error) + '. Try checking again later.'})
+        except requests.RequestException as error:
+            self.emit({'event': 'update_error', 'error': 'Cannot reach the update server (' +
+                       type(error).__name__ + '). Check the Internet connection and retry.'})
+        except Exception as error:
+            # Response bodies never become executable HTML or diagnostic dumps.
+            self.emit({'event': 'update_error', 'error': 'Update check failed: ' + type(error).__name__})
+
+    def _offers(self, manual=False):
+        if self.manifest is None or self.busy:
+            return
+        manifest, offers = self.manifest, {}
+        os_name, arch = platform_id()
+        package = select_artifact(manifest, 'companion', os=os_name, arch=arch)
+        if package and Version.parse(package['version']) > Version.parse(self.version):
+            offers['companion'] = self._offer(package, self.version)
+        firmware = select_artifact(manifest, 'firmware', board=self.device.get('board'))
+        if self.device.get('protocol') == 4 and firmware:
+            try:
+                current = Version.parse(self.device['firmware'])
+                if Version.parse(firmware['version']) > current:
+                    blocked = ''
+                    if Version.parse(firmware['minimum_companion']) > Version.parse(self.version):
+                        blocked = 'Update the companion first (requires ' + firmware['minimum_companion'] + ').'
+                    offers['firmware'] = self._offer(firmware, str(current), blocked)
+            except ValueError:
+                pass
+        self.offers = offers
+        for kind, offer in offers.items():
+            key = kind, offer.target
+            choice = self.state.get('choices', {}).get(kind, {})
+            if not manual and (choice.get('skip') == offer.target or time.time() < choice.get('later', 0)):
+                continue
+            if not manual and key in self.prompted:
+                continue
+            self.prompted.add(key)
+            self.emit({'event': 'update_offer', 'offer': offer})
+
+    def _offer(self, artifact, current, blocked=''):
+        notes = []
+        for change in self.manifest['changes']:
+            if Version.parse(change['version']) > Version.parse(current):
+                notes.append(change['version'] + '\n' + '\n'.join('• ' + n for n in change['notes']))
+        return Offer(artifact['kind'], current, artifact['version'], '\n\n'.join(notes),
+                     artifact, self.manifest, blocked)
+
+    def decide(self, offer, decision):
+        if decision not in ('later', 'skip'):
+            raise ValueError('Install must use the explicit install operation')
+        with self.lock:
+            choice = {'skip': offer.target} if decision == 'skip' else {'later': time.time()+INTERVAL}
+            self.state.setdefault('choices', {})[offer.kind] = choice
+            self.prompted.discard((offer.kind, offer.target))
+            self._save()
+
+    def set_device(self, status, connected=None, device_id=None):
+        with self.lock:
+            self.device = dict(status)
+            if device_id is not None:
+                self.device_id = device_id
+            if connected is not None:
+                self.connected = connected
+            pending = self.state.get('pending')
+            if (pending and pending.get('kind') == 'firmware'
+                    and pending.get('device_id') == self.device_id):
+                target = pending['target']
+                if (status.get('firmware') == target and status.get('boot_health') == 'valid'
+                        and status.get('last_update') == 'success'):
+                    self.state['completed'] = {**pending, 'completed_at': time.time()}
+                    self.state.pop('pending', None)
+                    self.busy, self.awaiting_until = False, None
+                    self._save()
+                    self.emit({'event': 'firmware_verified', 'version': target})
+                elif status.get('ota_target') == target and status.get('last_update') in ('rollback', 'failed'):
+                    self.state['failed'] = {**pending, 'outcome': status['last_update']}
+                    self.state.pop('pending', None)
+                    self.busy, self.awaiting_until = False, None
+                    self._save()
+                    self.emit({'event': 'update_error', 'error': 'Device reported ' + status['last_update'] + '; current firmware ' + status.get('firmware', '--')})
+                elif not self.busy and not self._reconciled:
+                    self._reconciled = True
+                    self.emit({'event': 'update_unconfirmed', 'message': 'A previous update has no verified outcome yet. Target: ' + target + '. Installation will not retry automatically.'})
+            self._offers()
+
+    def transfer_event(self, event):
+        with self.lock:
+            kind = event['event']
+            if kind in ('ota_rebooting', 'ota_unconfirmed'):
+                self.awaiting_until = time.monotonic() + 120
+                self.emit({'event': 'update_notice', 'message': 'Reconnecting and checking the installed firmware…'})
+            elif kind == 'ota_error':
+                self.busy = False
+                self.state.pop('pending', None)
+                self._save()
+            elif kind == 'ota_progress' and event.get('cancellable') is False:
+                pending = self.state.get('pending')
+                if pending:
+                    pending['phase'] = 'commit'
+                    self._save()
+
+    def tick(self):
+        with self.lock:
+            if self.awaiting_until is not None and time.monotonic() >= self.awaiting_until:
+                self.awaiting_until = None
+                self.busy = False
+                self.emit({'event': 'update_unconfirmed', 'message': 'No verified boot result after 120 seconds. Pending target is saved; reconnect to check it.'})
+
+    def confirm_companion_startup(self):
+        """Called only after local startup health and actual VERSION are checked."""
+        with self.lock:
+            pending = self.state.get('pending')
+            if pending and pending.get('kind') == 'companion' and pending.get('target') == self.version:
+                self.state['completed'] = {**pending, 'completed_at': time.time()}
+                self.state.pop('pending', None)
+                self._save()
+                self.emit({'event': 'update_notice', 'message': 'Companion ' + self.version + ' installed and startup verified.'})
+
+    def install(self, offer, *, usb_power=False):
+        with self.lock:
+            if self.busy or self.offers.get(offer.kind) != offer:
+                raise RuntimeError('Update offer expired or another update is running')
+            if offer.blocked:
+                raise RuntimeError(offer.blocked)
+            if offer.kind == 'firmware':
+                if usb_power is not True:
+                    raise ValueError('Confirm the device is connected to USB power')
+                if not self.connected or self.device.get('menu') or self.device.get('critical'):
+                    raise RuntimeError('Connect the selected device and close its menu first')
+                if self.device.get('battery_percent', -1) in range(0, 20):
+                    raise RuntimeError('Battery is below 20%; charge before updating')
+            self.busy = True
+            self.cancel_download.clear()
+        threading.Thread(target=self._install, args=(offer, usb_power), name='sweetmeter-install', daemon=True).start()
+
+    def _install(self, offer, usb_power):
+        try:
+            self.emit({'event': 'ota_progress', 'phase': 'Downloading verified update', 'percent': 0, 'cancellable': True})
+            staging = self.state_dir / 'downloads'
+            staging.mkdir(exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix='update-', dir=staging))
+            artifact = offer.artifact
+            image = self.downloader.artifact(artifact, directory, self.cancel_download)
+            if offer.kind == 'firmware':
+                metadata_asset = {'asset': artifact['metadata_asset'], 'url': artifact['metadata_url'],
+                                  'size': artifact['metadata_size'], 'sha256': artifact['metadata_sha256']}
+                metadata_path = self.downloader.artifact(metadata_asset, directory, self.cancel_download)
+                envelope = metadata_path.read_bytes()
+                metadata = verify_envelope(envelope, trusted_keys=self.trusted_keys,
+                                           current_version=offer.current, companion_version=self.version)
+                match_firmware_artifact(metadata, artifact)
+                if firmware_image_version(image) != metadata.version:
+                    raise ValueError('Firmware compiled version disagrees with signed metadata')
+                with self.lock:
+                    if self.cancel_download.is_set():
+                        raise RuntimeError('Update cancelled')
+                    if not self.connected or self.device.get('firmware') != offer.current:
+                        raise RuntimeError('Device changed while downloading; check the update again')
+                    self.state['pending'] = {'kind': 'firmware', 'target': offer.target,
+                                             'device_id': self.device_id, 'previous': offer.current,
+                                             'phase': 'transfer', 'started_at': time.time()}
+                    self._save()
+                    self.radio.install_firmware(image_path=image, envelope=envelope,
+                                                companion_version=self.version, usb_power=usb_power)
+            else:
+                from .self_update import stage_update
+                staged = stage_update(image, artifact, self.state_dir)
+                if self.cancel_download.is_set():
+                    raise RuntimeError('Update cancelled')
+                if staged.supported:
+                    with self.lock:
+                        self.state['pending'] = {'kind': 'companion', 'target': offer.target,
+                                                 'previous': self.version, 'started_at': time.time()}
+                        self._save()
+                    staged.launch()
+                    self.emit({'event': 'companion_restart'})
+                else:
+                    self.emit({'event': 'companion_manual', 'message': staged.reason, 'path': str(staged.manual_path)})
+                    self.busy = False
+        except Exception as error:
+            with self.lock:
+                self.busy = False
+                pending = self.state.get('pending')
+                if pending and pending.get('kind') == offer.kind and pending.get('target') == offer.target:
+                    self.state.pop('pending', None)
+                self._save()
+            self.emit({'event': 'update_error', 'error': str(error)[:200]})
+
+    def cancel(self):
+        self.cancel_download.set()
+        self.radio.cancel_update()
+
+    def close(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=2)

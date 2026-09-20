@@ -1,0 +1,125 @@
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <vector>
+uint32_t crc32(const uint8_t *bytes,size_t n) {
+  uint32_t crc=0xffffffff;
+  for(size_t i=0;i<n;++i) { crc^=bytes[i];for(int bit=0;bit<8;++bit)crc=(crc>>1)^((crc&1)?0xedb88320:0); }
+  return ~crc;
+}
+#define SWEETMETER_NATIVE_TEST
+#include "../firmware/src/ota_runtime.h"
+#include "../firmware/src/discovery.h"
+#include "../firmware/src/disconnect_sleep.h"
+#include "fixtures/protocol4_fixture.h"
+using namespace sweetmeter;
+static OtaInputs context;
+static std::vector<OtaStatus> events;
+static bool wantCancel=false;
+static OtaInputs input() { return context; }
+static void output(const OtaStatus &s,bool) { events.push_back(s); }
+static bool cancelled(uint32_t) { bool yes=wantCancel;wantCancel=false;return yes; }
+struct Fixture {
+ Preferences storage; BootHealth boot; OtaManager manager;
+ Fixture():manager(boot,input,output,cancelled) {
+  fake::reset(); context=OtaInputs{};context.authorized=context.connected=true;context.generation=1;
+  events.clear();wantCancel=false;boot.initialize(storage,true);memcpy(fake::digest,protocol4_fixture_header+92,32);
+ }
+ void op(char c) { uint8_t p[5]={uint8_t(c)};put32(p+1,123);manager.control(p,sizeof(p)); }
+ void begin() { uint8_t p[20]={'M'};put32(p+1,123);p[5]=sizeof(protocol4_fixture_envelope);put32(p+7,2026);put32(p+11,9);put32(p+15,1);p[19]=1;manager.control(p,20); }
+ void metadata() {
+  begin();
+  for(size_t at=0;at<sizeof(protocol4_fixture_envelope);) {
+   size_t count=sizeof(protocol4_fixture_envelope)-at;if(count>11)count=11;
+   uint8_t p[20]={'m'};put32(p+1,123);put32(p+5,at);memcpy(p+9,protocol4_fixture_envelope+at,count);manager.control(p,count+9);at+=count;
+  }
+ }
+ void prepared() { metadata();op('S');assert(manager.status.state==OtaState::Image); }
+ void image() {
+  prepared();
+  for(size_t at=0;at<sizeof(protocol4_fixture_image);) {
+   size_t count=sizeof(protocol4_fixture_image)-at;if(count>12)count=12;
+   uint8_t p[20];put32(p,123);put32(p+4,at);memcpy(p+8,protocol4_fixture_image+at,count);manager.data(p,count+8);at+=count;
+  }
+ }
+};
+static void parserTests() {
+ Metadata m;assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,"release-1",m)==OtaError::Ok);
+ assert(m.size==512 && m.version.sequence==2);
+ assert(strictSignature(protocol4_fixture_signature,sizeof(protocol4_fixture_signature)));
+ uint8_t bad[234];memcpy(bad,protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope));
+ bad[15]=1;assert(parseEnvelope(bad,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,"release-1",m)==OtaError::Metadata);
+ memcpy(bad,protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope));bad[60]=1;
+ assert(parseEnvelope(bad,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,"release-1",m)==OtaError::Board);
+ assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,2},{2026,9,1},0x330000,"release-1",m)==OtaError::Version);
+ assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,8,100},0x330000,"release-1",m)==OtaError::Companion);
+ assert(compare({2026,10,1},{2026,9,999})>0);assert(compare({2027,1,1},{2026,12,999})>0);
+ assert(!strictSignature((const uint8_t*)"12345678",8));
+ const uint8_t nonminimal[]={0x30,7,2,2,0,1,2,1,1};assert(!strictSignature(nonminimal,sizeof(nonminimal)));
+ OtaStatus status;status.state=OtaState::Image;status.session=0x12345678;status.offset=65538;status.total=100000;status.opcode='d';status.signature=true;
+ uint8_t wire[20];status.encode(wire);assert(!memcmp(wire,protocol4_fixture_status,20));
+}
+static void otaTests() {
+ { Fixture f;f.begin();assert(f.manager.status.state==OtaState::Metadata);f.op('S');assert(f.manager.status.error==OtaError::Incomplete && fake::begins==0); }
+ { Fixture f;f.metadata();fake::validSignature=false;f.op('S');assert(f.manager.status.error==OtaError::Signature && fake::begins==0); }
+ { Fixture f;context.battery=19;f.begin();assert(events.back().error==OtaError::Power && !f.manager.active()); }
+ { Fixture f;f.prepared();uint8_t p[9]={};put32(p,123);put32(p+4,1);f.manager.data(p,9);assert(f.manager.status.error==OtaError::Offset && fake::aborts==1 && fake::writes==0); }
+ { Fixture f;f.prepared();uint8_t p[9]={};put32(p,321);f.manager.data(p,9);assert(f.manager.status.state==OtaState::Image && events.back().error==OtaError::Session && fake::aborts==0); }
+ { Fixture f;f.prepared();uint8_t p[9]={};put32(p,123);fake::writeError=1;f.manager.data(p,9);assert(f.manager.status.offset==0 && fake::aborts==1); }
+ { Fixture f;f.image();fake::digest[0]^=1;f.op('F');assert(f.manager.status.error==OtaError::Digest && fake::ends==0 && fake::aborts==1 && fake::selections==0); }
+ { Fixture f;f.image();fake::endError=ESP_ERR_OTA_VALIDATE_FAILED;f.op('F');assert(f.manager.status.error==OtaError::Image && fake::ends==1 && fake::aborts==0 && fake::selections==0); }
+ { Fixture f;f.image();strcpy(fake::imageVersion,"2026.9.3");f.op('F');assert(f.manager.status.error==OtaError::Version && fake::selections==0); }
+ { Fixture f;f.prepared();context.connected=false;f.manager.tick();assert(f.manager.status.error==OtaError::Disconnected && fake::aborts==1); }
+ { Fixture f;f.prepared();++context.generation;f.manager.tick();assert(f.manager.status.error==OtaError::Disconnected && fake::aborts==1); }
+ { Fixture f;f.prepared();fake::now+=30000;f.manager.tick();assert(f.manager.status.error==OtaError::Timeout && fake::aborts==1); }
+ { Fixture f;f.prepared();context.critical=true;f.manager.tick();assert(f.manager.status.error==OtaError::Power && fake::aborts==1); }
+ { Fixture f;f.prepared();f.op('X');assert(f.manager.status.state==OtaState::Cancelled && fake::aborts==1); }
+ { Fixture f;f.metadata();fake::onBegin=[] {wantCancel=true;};f.op('S');assert(f.manager.status.state==OtaState::Cancelled && fake::aborts==1); }
+ { Fixture f;f.metadata();fake::onBegin=[] {fake::now+=60000;};f.op('S');assert(f.manager.status.error==OtaError::Timeout && fake::aborts==1); }
+ { Fixture f;f.image();fake::onEnd=[] {wantCancel=true;};f.op('F');assert(f.manager.status.state==OtaState::Cancelled && fake::aborts==0 && fake::selections==0); }
+ { Fixture f;f.image();f.storage.fail=true;f.op('F');assert(f.manager.status.error==OtaError::Flash && fake::selections==0); }
+ { Fixture f;f.image();fake::selectError=1;f.op('F');assert(f.manager.status.error==OtaError::Flash && fake::selected==0 && !strcmp(f.boot.lastUpdate,"failed")); }
+ { Fixture f;f.image();fake::selectError=1;fake::selectionChangesOnError=true;f.op('F');assert(f.manager.status.error==OtaError::Flash && f.boot.recovery && !strcmp(f.boot.lastUpdate,"pending")); }
+ { Fixture f;f.image();f.storage.failWrite=2;f.op('F');assert(f.manager.status.error==OtaError::Flash && fake::selected==0 && fake::marks==1); }
+ { Fixture f;f.image();bool rebooted=false;try {f.op('F');}catch(Restart&){rebooted=true;} assert(rebooted && fake::selected==1 && f.manager.status.state==OtaState::Rebooting && f.boot.record.stage==UpdateStage::Selected); }
+ // Q may inspect progress but does not keep a stalled session alive.
+ { Fixture f;f.begin();fake::now+=29000;f.op('Q');fake::now+=1000;f.manager.tick();assert(f.manager.status.error==OtaError::Timeout); }
+}
+static void bootTests() {
+ // Resolve the reset window after mark-valid but before persisting success.
+ { Fixture f;Metadata m;m.version={2026,9,1};assert(f.boot.intent(m,&fake::slots[0]));BootHealth after;after.initialize(f.storage,true);assert(!strcmp(after.lastUpdate,"success")); }
+ // Version mismatch alone or Intent alone is insufficient rollback evidence.
+ { Fixture f;Metadata m;m.version={2026,9,2};assert(f.boot.intent(m,&fake::slots[1]));fake::states[1]=ESP_OTA_IMG_ABORTED;BootHealth after;after.initialize(f.storage,true);assert(!strcmp(after.lastUpdate,"pending")); }
+ { Fixture f;Metadata m;m.version={2026,9,2};assert(f.boot.intent(m,&fake::slots[1]));assert(f.boot.save(UpdateStage::Selected));fake::states[1]=ESP_OTA_IMG_ABORTED;BootHealth after;after.initialize(f.storage,true);assert(!strcmp(after.lastUpdate,"rollback"));BootHealth next;next.initialize(f.storage,true);assert(!strcmp(next.lastUpdate,"rollback")); }
+ // Every pending image must fail without a matching durable record.
+ { Fixture f;fake::states[0]=ESP_OTA_IMG_PENDING_VERIFY;bool reset=false;try{BootHealth after;after.initialize(f.storage,true);}catch(Restart&){reset=true;}assert(reset && fake::states[0]==ESP_OTA_IMG_INVALID); }
+ { Fixture f;Metadata m;m.version={2026,9,1};assert(f.boot.intent(m,&fake::slots[0]));fake::states[0]=ESP_OTA_IMG_PENDING_VERIFY;BootHealth after;after.initialize(f.storage,true);assert(after.pending);after.finish(true);assert(fake::marks==1 && !strcmp(after.lastUpdate,"success")); }
+ // A failed success persistence retry must not relabel a newer transaction.
+ { Fixture f;Metadata m;m.version={2026,9,1};assert(f.boot.intent(m,&fake::slots[0]));f.storage.fail=true;BootHealth after;after.initialize(f.storage,true);assert(!strcmp(after.lastUpdate,"pending"));f.storage.fail=false;m.version={2026,9,2};assert(after.intent(m,&fake::slots[1]));after.retry(6000);assert(after.record.stage==UpdateStage::Intent && !strcmp(after.lastUpdate,"pending")); }
+}
+static void radioTests() {
+ OtaRadioPolicy radio;
+ assert(radio.update(false,true)==RadioChange::None);
+ assert(radio.update(true,true)==RadioChange::Fast);
+ assert(radio.update(true,true)==RadioChange::None);
+ assert(radio.update(false,true)==RadioChange::Idle);
+ assert(radio.update(false,true)==RadioChange::None);
+ assert(radio.update(true,true)==RadioChange::Fast);
+ assert(radio.update(false,false)==RadioChange::None);
+ assert(radio.update(false,true)==RadioChange::None);
+ assert(radio.update(true,true)==RadioChange::Fast);
+}
+static void discoveryTests() {
+ Discovery d;const char *id="7a1e1000-ff1b-4d9f-a023-0123456789ab";
+ d.begin(100,123,"","");uint8_t body[40];memcpy(body,id,36);body[36]=3;memcpy(body+37,"Mac",3);
+ uint8_t begin[11]={'J'};put32(begin+1,456);put32(begin+5,123);begin[9]=40;uint32_t sid,next;
+ assert(d.handle(begin,11,100,sid,next)==0 && next==0);
+ for(size_t at=0;at<40;) {uint8_t p[20]={'j'};put32(p+1,456);put32(p+5,at);size_t n=40-at;if(n>11)n=11;memcpy(p+9,body+at,n);assert(d.handle(p,n+9,101,sid,next)==0);at+=n;}
+ uint8_t commit[5]={'K'};put32(commit+1,456);assert(d.handle(commit,5,102,sid,next)==0 && next==40 && d.count==1 && !strcmp(d.computers[0].id,id));
+ assert(d.remaining(60100)==0);d.tick(60100);assert(!d.open);
+ d.begin(10,7,id,"Mac");assert(d.count==1);put32(begin+5,7);assert(d.handle(begin,11,10,sid,next)==0);d.tick(5010);assert(d.handle(commit,5,5011,sid,next)==3);
+ assert(!hostId((const uint8_t*)"7a1e1000-ff1b-4d9f-a023-0123456789aZ",36));
+ DisconnectSleep sleep;sleep.freshGrace(1);assert(!sleep.counting());sleep.targetConnected();sleep.freshGrace(500);assert(!sleep.expired(30499));assert(sleep.expired(30500));
+}
+int main() { parserTests();otaTests();bootTests();radioTests();discoveryTests();puts("OTA firmware state, failure, discovery and rollback tests passed"); }

@@ -1,136 +1,106 @@
+"""Sweetmeter desktop entry point; diagnostics are strictly offline."""
 import argparse
-import fcntl
-import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
-
-from PIL import Image
-
-from .providers import parse_claude, parse_codex, refresh
-from .render import pack_frame, render
-from .tokens import TokenIndex
-from .bluetooth import Bluetooth
+from .version import get_version
 
 
-def display_snapshot(cache, index, available, now):
-    providers = cache.get('providers', {})
-    rows, dates, stale = [], [], False
-    for name, defaults in [('claude', parse_claude({})), ('codex', parse_codex({}))]:
-        provider = providers.get(name, {})
-        fetched = provider.get('fetched_at', 0)
-        if fetched:
-            dates.append(fetched)
-        stale |= bool(provider.get('error')) or now - fetched > 900
-        for original in provider.get('rows', defaults):
-            row = dict(original)
-            row['tokens'] = None
-            reset = row['reset']
-            if reset and reset <= now:
-                row['used'] = None
-                stale = True
-            if reset and reset > now and name in available:
-                row['tokens'] = index.total(name, reset - row['seconds'], now,
-                                            fable=row['key'] == 'fable')
-            rows.append(row)
-    return dict(as_of=min(dates) if dates else now, stale=stale, rows=rows)
+from .instance_lock import InstanceLock
 
 
-def save_json(path, value):
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, indent=2) + '\n')
-    temp.replace(path)
+def self_test():
+    import tkinter
+    assert tkinter.Tcl().eval('info patchlevel')
+    import bleak  # Import-only; no Bluetooth adapter, account or network access.
+    from .protocol import PROTOCOL, BOARD_ID, trusted_keys
+    from .render import render, pack_frame
+    from .providers import parse_claude, parse_codex
+    assert PROTOCOL == 4 and BOARD_ID
+    assert trusted_keys()
+    screen = render({'as_of': 1, 'clock_at': 1, 'stale': True,
+                     'rows': parse_claude({}) + parse_codex({})})
+    assert len(pack_frame(screen)) == 4000
+    return True
 
 
-def main():
-    parser = argparse.ArgumentParser(description='CrowPanel single-page quota meter')
+# Preserve the snapshot helper import used by existing tests and integrations.
+from .app import display_snapshot
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Sweetmeter Bluetooth quota dashboard')
+    parser.add_argument('--version', action='version', version=get_version())
+    parser.add_argument('--self-test', action='store_true', help='Offline imports/render/protocol check; no accounts, network or BLE')
+    parser.add_argument('--install', action='store_true', help='Install the packaged app for this user and start at login')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--preview-only', action='store_true')
-    parser.add_argument('--state-dir', type=Path, default=Path(__file__).resolve().parents[1] / 'state')
-    args = parser.parse_args()
+    parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--background', action='store_true', help='Start with the main window hidden')
+    parser.add_argument('--state-dir', type=Path)
+    args = parser.parse_args(argv)
+    if args.self_test:
+        self_test()
+        print('Sweetmeter ' + get_version() + ' offline self-test passed')
+        return 0
+    if args.install:
+        from .installation import install_current
+        install_current(start_at_login=True)
+        return 0
+    from .paths import default_state_dir
+    from .app import Application
+    state = args.state_dir or default_state_dir()
     os.umask(0o077)
-    args.state_dir.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
-    lock = (args.state_dir / 'meter.lock').open('a')
+    state.mkdir(parents=True, exist_ok=True)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise SystemExit('Quota meter is already running')
+        lock = InstanceLock(state / 'meter.lock')
+    except OSError:
+        (state / 'show-window').touch()
+        print('Sweetmeter is already running; opening its window.')
+        return 0
+    handlers = [logging.FileHandler(state / 'agent.log', encoding='utf-8')]
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', handlers=handlers)
+    app = Application(state, preview_only=args.preview_only)
+    gui = None
     try:
-        cache = json.loads((args.state_dir / 'providers.json').read_text())
-    except (OSError, ValueError):
-        cache = {}
-    index = TokenIndex(args.state_dir / 'tokens.sqlite3')
-    device_status = {}
-    radio = None if args.preview_only else Bluetooth(args.state_dir)
-    poll_at = 0
-    forced = False
-    connected = False
-    frame_due = True
-    started = time.time()
-    try:
+        self_test()
+        if not (args.headless or args.once or args.preview_only):
+            from .gui import Desktop
+            gui = Desktop(app, background=args.background)
+        app.start()
+        from .self_update import confirm_update_health
+        confirm_update_health(get_version())
+        if app.updates:
+            app.updates.confirm_companion_startup()
+        if gui:
+            gui.run()
+            return 0
+        started = time.monotonic()
         while True:
-            now = time.time()
-            event = radio.poll(timeout=0.25) if radio else None
-            if event:
-                kind = event.get('event')
-                if kind == 'status':
-                    device_status = event['status']
-                    save_json(args.state_dir / 'bluetooth.json', {**event, 'seen_at': now})
-                elif kind == 'connected':
-                    connected = True
-                    frame_due = True
-                    logging.info('BLE connected; clock sync and automatic reconnect active')
-                elif kind == 'disconnected':
-                    connected = False
-                elif kind == 'refresh':
-                    forced = True
-                    logging.info('Button: immediate provider/token refresh requested')
-                elif kind == 'ack':
-                    logging.info('BLE ACK %s %s %s', event['sequence'], event['crc32'], event['ack'])
-                    save_json(args.state_dir / 'last-ack.json', {**event, 'received_at': now})
-                    if args.once:
-                        return 0
-                elif kind == 'error':
-                    logging.warning('Bluetooth: %s', event['error'])
-                elif kind == 'advertising':
-                    logging.info('Computer discovery is advertising as %s', event['name'])
-                elif kind == 'exit':
-                    raise RuntimeError('Bluetooth helper exited; launchd will restart the companion')
-            if now >= poll_at or forced:
-                interval = 300 if device_status.get('interval') == 300 else 60
-                cache = refresh(cache, now, force=forced, interval=interval)
-                save_json(args.state_dir / 'providers.json', cache)
-                for provider, status in cache['providers'].items():
-                    if status.get('error'):
-                        logging.warning('%s: %s; preserving last known quotas', provider, status['error'])
-                available = index.scan()
-                snapshot = display_snapshot(cache, index, available, time.time())
-                snapshot['device'] = device_status
-                snapshot['clock_at'] = time.time()
-                save_json(args.state_dir / 'snapshot.json', snapshot)
-                screen = render(snapshot)
-                screen.save(args.state_dir / 'screen.png')
-                screen.resize((1000, 488), Image.Resampling.NEAREST).save(args.state_dir / 'screen-4x.png')
-                frame = pack_frame(screen)
-                poll_at = now + interval
-                forced = False
-                frame_due = True
-                if args.preview_only and args.once:
+            for event in app.pump():
+                if args.once and event['event'] == ('snapshot' if args.preview_only else 'ack'):
                     return 0
-            if radio and connected and frame_due and not device_status.get('critical'):
-                radio.send(frame)
-                frame_due = False
-            if args.once and now - started > 90:
-                logging.error('Timed out waiting for a display acknowledgment')
+                if event['event'] == 'exit':
+                    logging.error('Worker stopped: %s', event.get('error', event['event']))
+                    return 1
+                if event['event'] == 'provider_error':
+                    logging.warning('%s', event['error'])
+                if event['event'] == 'update_offer':
+                    offer = event['offer']
+                    logging.info('%s update %s available; open Sweetmeter to review and confirm.', offer.kind, offer.target)
+            if args.once and time.monotonic()-started > 90:
+                logging.error('Timed out waiting for a display acknowledgement')
                 return 1
-            if not radio:
-                time.sleep(1)
+            time.sleep(.1)
+    except KeyboardInterrupt:
+        return 0
     finally:
-        if radio:
-            radio.close()
-        index.db.close()
+        app.close()
+        lock.close()
 
 
 if __name__ == '__main__':

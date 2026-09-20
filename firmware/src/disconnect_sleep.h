@@ -12,6 +12,8 @@ class DisconnectSleep {
   void targetDisconnected(uint32_t now) {
     if (armed_ && !counting_) { counting_ = true; lostAt_ = now; }
   }
+  void freshGrace(uint32_t now) { if (armed_) { counting_ = true; lostAt_ = now; } }
+  bool armed() const { return armed_; }
   bool counting() const { return counting_; }
   uint32_t elapsed(uint32_t now) const { return uint32_t(now - lostAt_); }
   bool expired(uint32_t now) const { return counting_ && elapsed(now) >= graceMs; }

@@ -1,12 +1,19 @@
 """Incrementally count usage records, without persisting conversations."""
 import hashlib
 import json
-import os
 import sqlite3
 import time
 from pathlib import Path
 
-from .providers import epoch
+from .providers import claude_config_dir, codex_home, epoch
+
+
+def log_roots():
+    """Use the same native profile roots as each CLI; do not inspect WSL homes."""
+    claude = claude_config_dir()
+    codex = codex_home()
+    return [(claude / 'projects', 'claude'), (codex / 'sessions', 'codex'),
+            (codex / 'archived_sessions', 'codex')]
 
 
 def count(value):
@@ -91,7 +98,10 @@ class TokenIndex:
         st = path.stat()
         previous = self.db.execute('SELECT inode,offset,state FROM files WHERE path=?', (str(path),)).fetchone()
         offset, state = 0, {}
-        if previous and previous[0] == st.st_ino and previous[1] <= st.st_size:
+        # Windows can expose 128-bit file IDs, beyond SQLite's signed INTEGER.
+        # A tagged decimal string stays exact even in the legacy INTEGER column.
+        inode = 'inode:' + str(st.st_ino)
+        if previous and previous[0] in (st.st_ino, inode) and previous[1] <= st.st_size:
             offset, state = previous[1], json.loads(previous[2])
         if offset == st.st_size:
             return
@@ -139,13 +149,10 @@ class TokenIndex:
                     cache_read=MAX(events.cache_read,excluded.cache_read)''', event)
             offset = handle.tell()
         self.db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?)',
-                        (str(path), st.st_ino, offset, json.dumps(state)))
+                        (str(path), inode, offset, json.dumps(state)))
 
     def scan(self, roots=None):
-        ch = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home()/'.claude')))
-        cx = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
-        roots = roots or [(ch/'projects', 'claude'), (Path.home()/'.config/claude/projects', 'claude'),
-                          (cx/'sessions', 'codex'), (cx/'archived_sessions', 'codex')]
+        roots = log_roots() if roots is None else roots
         available, files, metadata = set(), [], {}
         cutoff = time.time() - 8 * 86400
         for root, provider in roots:

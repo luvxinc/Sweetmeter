@@ -123,6 +123,15 @@ the project's original work, not to all linked or packaged dependencies.
   notices, including FreeType when included in a binary package.
 - [Requests](https://github.com/psf/requests): Apache-2.0; its dependencies keep
   their respective licenses.
+- [Bleak](https://github.com/hbldh/bleak): MIT; its native platform dependencies
+  retain their own licenses (PyObjC on macOS, WinRT on Windows, D-Bus on Linux).
+- [cryptography](https://github.com/pyca/cryptography): Apache-2.0 or BSD-3-Clause;
+  the wheel's native-library notices remain included.
+- [PyInstaller](https://github.com/pyinstaller/pyinstaller): GPL-2.0-or-later with
+  its bootloader/distribution exception; see the exact installed package's
+  license. Packaging the application does not change its original license.
+- Python, Tcl and Tk retain their respective PSF/permissive licenses. Builds
+  include the actual Python license and Tcl/Tk terms in their `NOTICES` folder.
 
 Release packages must include the license notices for the actual pinned
 dependencies they contain. This source notice is not a substitute for collecting

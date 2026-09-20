@@ -16,7 +16,9 @@ jobs:
   version-policy:
     name: version-policy
     if: github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
+    # Privileged trusted-base validation stays on a GitHub-hosted runner for
+    # every PR, including external forks. It never executes candidate source.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
       statuses: write
@@ -41,7 +43,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Validate PR objects without executing PR source
         id: validate
         env:
@@ -70,7 +72,14 @@ jobs:
   version-policy-push:
     name: version-policy-push
     if: github.event_name != 'pull_request_target' && !github.event.deleted
-    runs-on: ubuntu-latest
+    # Only owner-triggered main/codex branch push/manual jobs use the isolated
+    # Sweetmeter VM pool. Tags and all other events remain GitHub-hosted.
+    runs-on: >-
+      ${{ fromJSON(github.repository == 'luvxinc/Sweetmeter' &&
+          github.actor == 'luvxinc' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/codex/')) &&
+          '["self-hosted","Linux","ARM64","sweetmeter-ci"]' || '["ubuntu-22.04"]') }}
     # Push/manual checks cannot write statuses. Only the protected-base PR job
     # supplies the required trusted status on the candidate commit.
     steps:
@@ -82,7 +91,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Validate selected history with the accepted checker
         env:
           CANDIDATE_SHA: ${{ github.sha }}

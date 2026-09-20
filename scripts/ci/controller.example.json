@@ -1,0 +1,14 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "actor": "OWNER",
+  "credential_file": "/absolute/private/path/to/github-admin-token",
+  "ssh_key": "/absolute/private/path/to/dedicated-vm-key",
+  "golden": "sweetmeter-ci-golden",
+  "work": "sweetmeter-ci-work",
+  "guest_user": "admin",
+  "guard_repositories": [],
+  "minimum_available_percent": 35,
+  "emergency_available_percent": 15,
+  "maximum_job_seconds": 3600,
+  "poll_seconds": 30
+}

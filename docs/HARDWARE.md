@@ -91,6 +91,24 @@ pio run -d firmware
 pio run -d firmware -t upload --upload-port <YOUR_PORT>
 ```
 
+A published release also includes `Sweetmeter-YYYY.M.N-firmware-build.zip`.
+This is the exact CI artifact used for acceptance, with matching firmware,
+bootloader, partitions, OTA bootstrap bytes, application objects and build
+receipt. Extract it, change into `firmware/.pio/build/crowpanel213`, and use
+esptool 5 for a first installation on this exact board:
+
+```sh
+python -m pip install 'esptool>=5,<6'
+python -m esptool --chip esp32s3 --port <YOUR_PORT> write-flash --flash-mode keep --flash-freq keep --flash-size keep 0x0 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
+```
+
+These offsets come from the pinned Arduino ESP32-S3 build and `default_8MB.csv`.
+They leave the NVS range `0x9000–0xdfff` intact; do **not** use `erase-flash`.
+The bootstrap resets OTA slot selection to app0, so use it only for initial USB
+installation or deliberate recovery after keeping your own backup. Routine
+confirmed BLE updates write the inactive application slot and preserve NVS.
+Do not use this layout on another display/revision or flash size.
+
 Typical port families are `COM…` on Windows, `/dev/cu.…` on macOS and
 `/dev/ttyUSB…` on Linux. Serial is for initial flashing and diagnostics;
 dashboard data travels through BLE. Where required, install the USB serial

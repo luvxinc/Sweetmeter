@@ -1,0 +1,4 @@
+-r requirements.txt
+pyinstaller==6.22.3
+platformio==6.1.18
+pyserial>=3.5,<4

@@ -118,6 +118,8 @@ bool displayFrame(bool forceFull = false) {
 
 #include "bluetooth_meter.h"
 
+extern "C" bool verifyRollbackLater() { return true; }
+
 void setup() {
   setCpuFrequencyMhz(80);
   Serial.begin(115200);
@@ -133,9 +135,11 @@ void setup() {
   for (int pin : {SCK_PIN, MOSI_PIN, RST, DC, CS, POWER, LED})
     gpio_hold_dis(gpio_num_t(pin));
   pinMode(BUSY_PIN, INPUT);
-  setupBluetooth();
+  if (xTaskCreate(meterWorker, "sweetmeter", 16384, nullptr, 2, nullptr) != pdPASS) {
+    Serial.println("ERR WORKER_ALLOCATION"); esp_restart();
+  }
 }
 
 void loop() {
-  bluetoothLoop();
+  delay(1000);
 }

@@ -1,0 +1,32 @@
+# Continuous integration
+
+Trusted owner pushes and manual runs on `main` or `codex/*` use a dedicated Linux ARM64 VM on an Apple Silicon Mac mini. The runner labels are `[self-hosted, Linux, ARM64, sweetmeter-ci]`. Version policy, Python tests, C++ tests, and ESP32 builds can use this runner. Native macOS ARM64/x86_64, Windows x86_64, and Linux x86_64 application packages use the native GitHub-hosted matrix; PyInstaller does not cross-compile those applications from the ARM64 Linux guest.
+
+Pull requests, including owner PRs and `pull_request_target` validation, run on GitHub-hosted Ubuntu. Other actors, tags, and branches also use hosted runners. Outside contributors require workflow approval. The public repository contains no host addresses, SSH private keys, tokens, or private infrastructure names.
+
+## Host boundary
+
+Each accepted job gets a new Tart clone with 4 virtual CPUs and 4 GiB RAM. The controller creates a repository-scoped, one-job [JIT runner](https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-a-repository), passes only its short-lived JIT configuration over SSH stdin, waits for the runner to exit, and deletes that VM. The GitHub administrative credential stays on the host; the VM receives no host directories or host credential. A separate SSH key, template, work VM, and LaunchAgent keep this service independent of other projects.
+
+The host checks available memory and configured neighboring repositories' busy runners before starting a VM. During a job, severe host memory pressure or the maximum lifetime stops only this project's VM. The controller never stops, deletes, or reconfigures another project's VM/service. Queued jobs within both `queued` and `in_progress` workflow runs are considered, so dependencies and hosted matrix jobs do not strand the next self-hosted job.
+
+The Linux template has a root-owned [job-start hook](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/run-scripts) outside the checkout and runner application directory. Before user steps, it verifies repository, actor, triggering actor, event, branch, and GitHub event payload against a root-owned policy. Only the configured owner's `push` and `workflow_dispatch` on `main` or `codex/*` pass. A PR that changes `runs-on` to these labels fails this independent gate.
+
+The verified runner version is `2.336.0`. In that version, [JobExtension](https://github.com/actions/runner/blob/v2.336.0/src/Runner.Worker/JobExtension.cs) selects the hook from the runner process environment; [JobHookProvider](https://github.com/actions/runner/blob/v2.336.0/src/Runner.Worker/JobHookProvider.cs) supplies a fresh environment and [ScriptHandler](https://github.com/actions/runner/blob/v2.336.0/src/Runner.Worker/Handlers/ScriptHandler.cs) adds runner-generated GitHub context. Workflow `env` cannot replace the hook path or its GitHub context. Revalidate this behavior before updating the golden runner. The hook uses absolute executables, isolated Python mode, and a 15-second deadline.
+
+This is a trusted-owner build environment, not a sandbox for arbitrary contributions. Tart's default shared NAT does not isolate the local network; VM isolation and the pre-job gate reduce exposure but do not claim complete network isolation. A compromised trusted owner or approved trusted workflow remains privileged inside the disposable guest. Outside code must remain on hosted runners.
+
+## Installation
+
+An administrator needs a Mac with Tart, GitHub CLI, Python 3, a prepared Ubuntu 24.04 ARM64 Tart template containing an unregistered Actions runner, and a repository-admin credential that can create JIT configurations. The credential file must be private to the host account. Do not put it in this repository or the guest.
+
+1. Copy `scripts/ci/` to a private directory on the host. Create a dedicated SSH key and clone an existing **stopped** clean Linux template to `sweetmeter-ci-golden`; never prepare an existing project's template in place. Set the clone to 4 CPUs and 4096 MiB with `tart set`.
+2. Boot only the new clone. Copy `job_guard.py`, `job-started.sh`, `start-runner.sh`, `prepare-guest.sh`, a public key named `authorized_keys`, and `policy.json` into its `/tmp/sweetmeter-ci/`. The policy is `{"repository":"OWNER/REPOSITORY","actor":"OWNER"}`. Run `sudo bash /tmp/sweetmeter-ci/prepare-guest.sh` there. The preparation refuses a template with existing runner registration and installs Python 3.12/Tk and the C++ toolchain. Shut the new template down cleanly.
+3. Copy `controller.example.json` to a private host `controller.json`. Set the repository, actor, private credential/key paths, and any neighboring repositories whose active jobs should defer a new VM. Preserve the distinct `sweetmeter-ci-` VM names. Restrict this host configuration and directory to its owner.
+4. Run `python3 controller.py --config /absolute/private/controller.json --probe` to verify registration. It registers one idle runner for up to three minutes, then deletes its VM and registration. Do not enable shell tracing or log API response bodies.
+5. Run `python3 install-launchd.py --config /absolute/private/controller.json`. The `dev.sweetmeter.ci` LaunchAgent starts at **user login** and restarts if its process exits; it is not a pre-login system daemon. Inspect `launchctl print gui/$(id -u)/dev.sweetmeter.ci` and the private `controller.log`.
+6. Push or dispatch a trusted branch workflow. Verify that its job uses a `sweetmeter-*` runner, the host gate passes, and the work VM disappears after completion. Read `controller.log` locally; avoid publishing private host paths or configuration.
+
+To pause this broker, use `launchctl bootout gui/$(id -u)/dev.sweetmeter.ci`. It cleans up only `sweetmeter-ci-work`; the stopped golden remains. To resume after pausing, bootstrap this project's plist again. Other projects' services and credentials are not changed.
+
+Run the local gate/controller checks with `python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v`. A production release must additionally pass the signed artifact and clean-build checks in [RELEASING.md](RELEASING.md).
