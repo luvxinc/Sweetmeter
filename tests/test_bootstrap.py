@@ -29,6 +29,7 @@ class BootstrapTests(unittest.TestCase):
         self.home.mkdir()
         self.mark = self.root / 'launched'
         self.system = {'darwin': 'macos', 'win32': 'windows'}.get(sys.platform, 'linux')
+        self.linux_arch = 'x86_64'
         self.arch = 'arm64' if sys.platform == 'darwin' and platform.machine() == 'arm64' else 'x86_64'
         self.version = '2026.9.999'
         self.asset = f'Sweetmeter-{self.version}-{self.system}-{self.arch}.zip'
@@ -94,6 +95,10 @@ function Start-Process($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThr
             script = (ROOT / 'install.sh').read_text().replace(PUBLIC, self.public)
             installer = self.root / 'install.sh'
             installer.write_text(script)
+            # The Mac mini runs Linux ARM64 CI. Exercise the supported x64
+            # target using a shell executable fixture, not a host-native binary.
+            if self.system == 'linux':
+                self.shell_tool('uname', 'case "$1" in -s) echo Linux ;; -m) echo ' + self.linux_arch + ' ;; esac')
             self.shell_tool('id', 'echo 501')
             self.shell_tool('apt-get', 'exit 0')
             self.shell_tool('bluetoothctl', 'exit 0')
@@ -121,6 +126,14 @@ esac''')
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.mark.read_text().strip(), '--install')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux platform guard')
+    def test_unsupported_linux_arm_stops_before_install(self):
+        self.linux_arch = 'aarch64'
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires x86_64', result.stderr)
+        self.assertFalse(self.mark.exists())
 
     def test_changed_manifest_cannot_execute(self):
         path = self.root / 'manifest.json'

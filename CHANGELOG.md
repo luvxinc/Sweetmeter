@@ -54,3 +54,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.11] - 2026-09-20
 
 - Keep Windows package verification and extraction working when PowerShell optional module paths are unavailable by using the built-in .NET runtime.
+
+## [2026.9.12] - 2026-09-20
+
+- Exercise Linux installer fixtures correctly on the Mac mini ARM64 CI runner, while continuing to reject unsupported Linux ARM64 installations.
