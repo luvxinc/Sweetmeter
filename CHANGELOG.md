@@ -33,3 +33,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.6] - 2026-09-20
 
 - Fix release verification of Windows public-key files with CRLF line endings while continuing to reject different signing keys; record owner-confirmed display and wake/reconnect checks.
+
+## [2026.9.7] - 2026-09-20
+
+- Prefix the upper-left running firmware version with "v " on the meter and matching preview.

@@ -302,7 +302,7 @@ void drawScreen() {
       textAt(4,55,"Hold bottom 3s to select it.");
       textAt(4,77,"github.com/luvxinc/Sweetmeter");
     }
-    box(0,0,250,13,true); textAt(3,1,SWEETMETER_VERSION,false);
+    box(0,0,250,13,true); textAt(3,1,"v " SWEETMETER_VERSION,false);
     textAt(90,1,connected&&authorized?"BT":"--",false);
     if(refreshRequestedAt && millis()-refreshRequestedAt<10000) textAt(112,1,"*",false);
     char stamp[24]="----/--/-- --:--";
