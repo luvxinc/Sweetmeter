@@ -302,8 +302,9 @@ void drawScreen() {
       textAt(4,55,"Hold bottom 3s to select it.");
       textAt(4,77,"github.com/luvxinc/Sweetmeter");
     }
-    box(0,0,250,13,true); textAt(3,1,connected&&authorized?"BT":"--",false); textAt(22,1,"USED%",false);
-    if(refreshRequestedAt && millis()-refreshRequestedAt<10000) textAt(58,1,"*",false);
+    box(0,0,250,13,true); textAt(3,1,SWEETMETER_VERSION,false);
+    textAt(90,1,connected&&authorized?"BT":"--",false);
+    if(refreshRequestedAt && millis()-refreshRequestedAt<10000) textAt(112,1,"*",false);
     char stamp[24]="----/--/-- --:--";
     if(clockSynced) { time_t now=time(nullptr)+timezoneOffset; tm local; gmtime_r(&now,&local); strftime(stamp,sizeof(stamp),"%Y/%m/%d %H:%M",&local); }
     textAt(124,1,stamp,false); batteryIcon();

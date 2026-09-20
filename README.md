@@ -41,6 +41,7 @@ initial flashing; it is not the normal dashboard data connection.
   PENDING`, not a promise that a new quota has already been fetched.
 - The date and `HH:mm` clock synchronize with the selected computer. Seconds
   are intentionally omitted to reduce e-paper refresh work.
+- The upper-left version is the firmware actually running on the meter.
 - `BT` indicates the selected computer is connected. The battery icon shows
   `?` until a working gauge supplies a valid value. `!` marks stale data.
 - Data normally refreshes every 60 seconds; the top button requests a refresh.

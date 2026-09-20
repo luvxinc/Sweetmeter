@@ -9,7 +9,7 @@
       "used": 38,
       "tokens": 1280000,
       "reset": 1789935300.0,
-      "subscription_label": "MAX 20×"
+      "subscription_label": "MAX 20\u00d7"
     },
     {
       "key": "seven_day",
@@ -17,7 +17,7 @@
       "used": 64,
       "tokens": 182600000,
       "reset": 1790078520.0,
-      "subscription_label": "MAX 20×"
+      "subscription_label": "MAX 20\u00d7"
     },
     {
       "key": "fable",
@@ -25,7 +25,7 @@
       "used": 82,
       "tokens": 96300000,
       "reset": 1790078520.0,
-      "subscription_label": "MAX 20×"
+      "subscription_label": "MAX 20\u00d7"
     },
     {
       "key": "codex",
@@ -37,7 +37,8 @@
     }
   ],
   "device": {
-    "battery_percent": -1
+    "battery_percent": -1,
+    "firmware": "2026.9.5"
   },
   "example_data": true,
   "example_note": "Illustrative quotas, token totals and subscription labels; not live account data."

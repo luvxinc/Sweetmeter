@@ -25,3 +25,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 
 - Document verified BLE firmware upgrades, rejection and rollback behavior, and the one-time legacy macOS pairing-cache recovery.
 - Install GitHub CLI in the isolated Mac mini runner template so release validation and publishing can run.
+
+## [2026.9.5] - 2026-09-20
+
+- Show the device’s running firmware version in the dashboard’s upper-left corner, alongside Bluetooth status.
