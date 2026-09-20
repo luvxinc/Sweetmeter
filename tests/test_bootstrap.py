@@ -79,8 +79,11 @@ function Invoke-WebRequest($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec
   Copy-Item -LiteralPath (Join-Path '{folder}' ($Uri.Split('/')[-1])) -Destination $OutFile
 }}
 function Start-Process($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru) {{
+  if ($Wait) {{ throw 'Do not wait for the background companion process tree.' }}
   Set-Content -LiteralPath '{folder}\\launched' -Value $ArgumentList
-  return @{{ExitCode=0}}
+  $process = [PSCustomObject]@{{ExitCode=0}}
+  $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{}}
+  return $process
 }}
 & '{folder}\\install.ps1'
 """

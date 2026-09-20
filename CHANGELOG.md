@@ -46,3 +46,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 
 - Add one-command macOS/Linux and Windows installers that verify signed release packages, prepare dependencies, start Sweetmeter and preserve existing installations.
 - Add a first-open native setup screen and live connection guidance; mark setup ready only after the meter acknowledges its dashboard. First binding still requires confirmation on the device.
+
+## [2026.9.10] - 2026-09-20
+
+- Let the Windows setup command finish while the companion keeps running, and avoid slow PowerShell download progress rendering.

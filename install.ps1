@@ -1,6 +1,7 @@
 # Run in Windows PowerShell 5.1+ as the desktop user; no Python or Espressif app.
 & {
     $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
     if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'Use install.sh on macOS/Linux.' }
     $architecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     if ($architecture -ne 'AMD64') { throw 'The Windows release currently requires x64.' }
@@ -74,7 +75,9 @@
             Write-Host 'Opening your existing Sweetmeter. Use its updater for new versions.'
             Start-Process -FilePath $installed
         } else {
-            $process = Start-Process -FilePath (Join-Path $extracted 'Sweetmeter\Sweetmeter.exe') -ArgumentList '--install' -Wait -PassThru
+            $process = Start-Process -FilePath (Join-Path $extracted 'Sweetmeter\Sweetmeter.exe') -ArgumentList '--install' -PassThru
+            # Wait only for setup, not the long-running companion it starts.
+            $process.WaitForExit()
             if ($process.ExitCode -ne 0) { throw 'Sweetmeter installation failed.' }
         }
         Write-Host 'Sweetmeter is opening. Allow Bluetooth if asked, then confirm this computer on the meter.'
