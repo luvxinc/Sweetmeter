@@ -50,3 +50,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.10] - 2026-09-20
 
 - Let the Windows setup command finish while the companion keeps running, and avoid slow PowerShell download progress rendering.
+
+## [2026.9.11] - 2026-09-20
+
+- Keep Windows package verification and extraction working when PowerShell optional module paths are unavailable by using the built-in .NET runtime.

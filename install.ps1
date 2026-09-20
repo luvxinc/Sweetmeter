@@ -66,9 +66,15 @@
         $package = Join-Path $temporary 'package.zip'
         Write-Host "Downloading Sweetmeter $version for Windows..."
         Invoke-WebRequest -UseBasicParsing -Uri "$release/$asset" -OutFile $package -TimeoutSec 600
-        if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.sha256 -or (Get-Item -LiteralPath $package).Length -ne $artifact.size) { throw 'Package verification failed. Nothing was installed.' }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $stream = [IO.File]::OpenRead($package)
+        try {
+            $digest = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+            if ($digest -cne $artifact.sha256 -or $stream.Length -ne $artifact.size) { throw 'Package verification failed. Nothing was installed.' }
+        } finally { $stream.Dispose(); $sha.Dispose() }
         $extracted = Join-Path $temporary 'extracted'
-        Expand-Archive -LiteralPath $package -DestinationPath $extracted
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory($package, $extracted)
         $null = New-Item -ItemType Directory -Path $state -Force
         $null = New-Item -ItemType File -Path (Join-Path $state 'show-window') -Force
         if (Test-Path -LiteralPath $installed) {
