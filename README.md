@@ -80,6 +80,8 @@ The companion targets **Windows 11 x64**, **macOS 15+ arm64 / Intel**, and
 **Ubuntu 22.04+ x64 with a graphical desktop and BlueZ 5.55+**. These are build
 and software-compatibility targets; Windows/Linux physical Bluetooth and battery
 acceptance have not been performed. Read each release's validation record.
+See the [2026.9.3 firmware acceptance record](docs/releases/2026.9.3.md) for the
+exact tested image and recovery results.
 Native builds include Python, Tk, BLE libraries, fonts, the public update key and
 third-party notices. Claude Code and Codex themselves must already be installed
 and logged in as the same OS user.

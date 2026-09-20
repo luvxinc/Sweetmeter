@@ -18,7 +18,7 @@ This is a trusted-owner build environment, not a sandbox for arbitrary contribut
 
 ## Installation
 
-An administrator needs a Mac with Tart, GitHub CLI, Python 3, a prepared Ubuntu 24.04 ARM64 Tart template containing an unregistered Actions runner, and a repository-admin credential that can create JIT configurations. The credential file must be private to the host account. Do not put it in this repository or the guest.
+An administrator needs a Mac with Tart, GitHub CLI, Python 3, a prepared Ubuntu 24.04 ARM64 Tart template containing an unregistered Actions runner and the GitHub CLI (`gh`, installed by `prepare-guest.sh`), and a repository-admin credential that can create JIT configurations. The credential file must be private to the host account. Do not put it in this repository or the guest.
 
 1. Copy `scripts/ci/` to a private directory on the host. Create a dedicated SSH key and clone an existing **stopped** clean Linux template to `sweetmeter-ci-golden`; never prepare an existing project's template in place. Set the clone to 4 CPUs and 4096 MiB with `tart set`.
 2. Boot only the new clone. Copy `job_guard.py`, `job-started.sh`, `start-runner.sh`, `prepare-guest.sh`, a public key named `authorized_keys`, and `policy.json` into its `/tmp/sweetmeter-ci/`. The policy is `{"repository":"OWNER/REPOSITORY","actor":"OWNER"}`. Run `sudo bash /tmp/sweetmeter-ci/prepare-guest.sh` there. The preparation refuses a template with existing runner registration and installs Python 3.12/Tk and the C++ toolchain. Shut the new template down cleanly.

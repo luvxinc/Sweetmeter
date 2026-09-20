@@ -134,3 +134,13 @@ were exercised on one V1.2 JD79661 unit. The imported implementation is the
 baseline, not certification of a new release. Cross-platform pairing, OTA
 failure recovery, physical wake/power-cycle acceptance and battery operation
 must be recorded separately for the release that was actually tested.
+
+## One-time migration from the macOS prototype
+
+After replacing legacy QM3 firmware by USB, macOS may retain the old three-
+characteristic GATT cache. Dashboard reads can work while OTA reports a missing
+characteristic. In System Settings → Bluetooth, forget **only the Sweetmeter
+device**, then let the companion reconnect and pair again. This preserves the
+computer selection stored on the meter. Do not erase NVS or reset the Mac's
+entire Bluetooth configuration. Subsequent protocol-4 updates keep the same
+six-characteristic service. This migration recovery was exercised on one Mac.

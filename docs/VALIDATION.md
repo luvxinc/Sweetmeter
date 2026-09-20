@@ -6,13 +6,17 @@ An offline plan, passing unit test, firmware build, GATT write response or
 The final version, healthy boot, durable update result and selected host must
 agree after reconnect.
 
+The executed 2026.9.3 firmware results, exact image digest and limitations are
+recorded in [its acceptance report](releases/2026.9.3.md). The procedures below
+remain required for future firmware candidates.
+
 ## Current evidence boundary
 
 | Area | Evidence | Remaining acceptance |
 | --- | --- | --- |
-| Imported macOS prototype | One V1.2 JD79661 unit previously displayed the approved dashboard, clock and BLE data; short/long disconnect sleep was exercised | Repeat against the actual protocol-4 release |
+| Imported macOS prototype | One V1.2 JD79661 unit previously displayed the approved dashboard, clock and BLE data; short/long disconnect sleep was exercised | Protocol-4 BLE/clock/frame ACK repeated for 2026.9.3; owner optical/button confirmation still pending |
 | Version/changelog governance | Temporary Git repositories exercise hooks, UTC rollover, staging, retries, invalid history and trusted-base checking; GitHub checks run on reviewed commits | Keep required checks enabled for each accepted commit |
-| Protocol-4 BLE and OTA | Implementation and automated checks are recorded by their actual test/build results | Physical happy path and all failure cases below are not yet accepted |
+| Protocol-4 BLE and OTA | Implementation and automated checks are recorded by their actual test/build results | 2026.9.3 happy path, rejection, interruption and rollback passed on one Mac/unit; see the linked report |
 | Display | Approved 250×122 monochrome reference exists | Human inspection of orientation, legibility, row alignment and residual images |
 | Windows/Linux | Portable implementation and platform CI can test software behavior | Actual BLE adapter, OS permission, pairing and reconnect tests on each OS |
 | Battery | Unknown battery shown honestly without a working gauge | Wiring, charging, gauge accuracy, low-battery behavior and runtime untested |

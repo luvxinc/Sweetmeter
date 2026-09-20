@@ -20,3 +20,8 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.3] - 2026-09-20
 
 - Fix Windows startup updates and archive validation, and isolate native builds so Intel Mac packages load their cryptography runtime correctly.
+
+## [2026.9.4] - 2026-09-20
+
+- Document verified BLE firmware upgrades, rejection and rollback behavior, and the one-time legacy macOS pairing-cache recovery.
+- Install GitHub CLI in the isolated Mac mini runner template so release validation and publishing can run.
