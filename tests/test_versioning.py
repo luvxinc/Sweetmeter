@@ -44,7 +44,7 @@ class VersionTests(unittest.TestCase):
             env["GIT_COMMITTER_DATE"] = stamp
         result = subprocess.run(["git", "-C", str(self.repo), *args], env=env, capture_output=True)
         if success:
-            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
         return result
 
     def save(self, name, text):
@@ -53,7 +53,7 @@ class VersionTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8", newline="\n")
 
     def head(self):
-        return self.run_git("rev-parse", "HEAD").stdout.decode().strip()
+        return self.run_git("rev-parse", "HEAD").stdout.decode("ascii").strip()
 
     def commit(self, message="Implement a visible change", date=SEPTEMBER, *extra):
         return self.run_git("commit", *extra, "-m", message, date=date)
@@ -76,36 +76,36 @@ class VersionTests(unittest.TestCase):
     def install_hooks(self):
         shutil.copytree(ROOT / ".githooks", self.repo / ".githooks")
         (self.repo / "scripts").mkdir(exist_ok=True)
-        script = (ROOT / "scripts/versioning.py").read_text()
+        script = (ROOT / "scripts/versioning.py").read_text(encoding="utf-8")
         self.save("scripts/versioning.py", script.replace(policy.BOOTSTRAP_SHA, self.bootstrap))
         shutil.copyfile(ROOT / "scripts/install_hooks.py", self.repo / "scripts/install_hooks.py")
         result = subprocess.run([sys.executable, str(self.repo / "scripts/install_hooks.py")], capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
         return self.repo / ".githooks"
 
     def test_bootstrap_and_exact_same_month_increment(self):
         self.assertEqual(self.validate(), 0)
         self.valid_commit()
-        self.assertEqual((self.repo / "VERSION").read_text(), "2026.9.1\n")
-        original = (self.repo / "CHANGELOG.md").read_text()
+        self.assertEqual((self.repo / "VERSION").read_text(encoding="utf-8"), "2026.9.1\n")
+        original = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
         self.valid_commit(message="Keep the previous quota visible during a reconnect.")
-        self.assertEqual((self.repo / "VERSION").read_text(), "2026.9.2\n")
-        self.assertTrue((self.repo / "CHANGELOG.md").read_text().startswith(original))
+        self.assertEqual((self.repo / "VERSION").read_text(encoding="utf-8"), "2026.9.2\n")
+        self.assertTrue((self.repo / "CHANGELOG.md").read_text(encoding="utf-8").startswith(original))
         self.assertEqual(self.validate(), 2)
 
     def test_month_and_year_rollover_reset_sequence(self):
         self.valid_commit()
         self.valid_commit(datetime(2026, 10, 1, tzinfo=timezone.utc))
-        self.assertEqual((self.repo / "VERSION").read_text(), "2026.10.1\n")
+        self.assertEqual((self.repo / "VERSION").read_text(encoding="utf-8"), "2026.10.1\n")
         self.valid_commit(datetime(2027, 1, 1, tzinfo=timezone.utc))
-        self.assertEqual((self.repo / "VERSION").read_text(), "2027.1.1\n")
+        self.assertEqual((self.repo / "VERSION").read_text(encoding="utf-8"), "2027.1.1\n")
         self.assertEqual(self.validate(), 3)
 
     def test_utc_month_uses_instant_not_local_month(self):
         offset_time = datetime.fromisoformat("2026-10-01T00:15:00+09:00")
         self.valid_commit(offset_time)
-        self.assertEqual((self.repo / "VERSION").read_text(), "2026.9.1\n")
-        self.assertIn("2026-09-30", (self.repo / "CHANGELOG.md").read_text())
+        self.assertEqual((self.repo / "VERSION").read_text(encoding="utf-8"), "2026.9.1\n")
+        self.assertIn("2026-09-30", (self.repo / "CHANGELOG.md").read_text(encoding="utf-8"))
         self.assertEqual(self.validate(), 1)
 
     def test_backwards_month_and_wrong_commit_clock_are_rejected(self):
@@ -133,7 +133,7 @@ class VersionTests(unittest.TestCase):
         self.note("蓝牙断线重连时继续保留上次的额度显示。")
         self.prepare()
         self.commit()
-        self.assertIn("蓝牙断线重连", (self.repo / "CHANGELOG.md").read_text())
+        self.assertIn("蓝牙断线重连", (self.repo / "CHANGELOG.md").read_text(encoding="utf-8"))
         self.assertEqual(self.validate(), 1)
 
     def test_duplicate_and_multiline_notes_fail(self):
@@ -155,7 +155,7 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(before, policy.get_metadata(self.repo, ""))
         self.note("Display the actual subscription below the provider name.")
         self.prepare()
-        log = (self.repo / "CHANGELOG.md").read_text()
+        log = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertEqual(log.count("## ["), 1)
         self.assertIn("reset countdowns", log)
         self.assertIn("actual subscription", log)
@@ -170,14 +170,14 @@ class VersionTests(unittest.TestCase):
         self.save("README.md", "Unstaged source description.\n")
         self.note()
         self.prepare()
-        self.assertEqual((self.repo / "README.md").read_text(), "Unstaged source description.\n")
+        self.assertEqual((self.repo / "README.md").read_text(encoding="utf-8"), "Unstaged source description.\n")
         self.assertEqual(policy.blob(self.repo, "", "README.md"), b"Staged source description.\n")
         self.save("VERSION", "2026.9.999\n")
         before = policy.get_metadata(self.repo, "")
         with self.assertRaisesRegex(policy.PolicyError, "VERSION has unstaged"):
             self.prepare()
         self.assertEqual(before, policy.get_metadata(self.repo, ""))
-        self.assertEqual((self.repo / "VERSION").read_text(), "2026.9.999\n")
+        self.assertEqual((self.repo / "VERSION").read_text(encoding="utf-8"), "2026.9.999\n")
 
     def test_unstaged_changelog_or_notes_never_get_overwritten(self):
         self.valid_commit()
@@ -217,7 +217,7 @@ class VersionTests(unittest.TestCase):
         # Repair tip files without repairing history; the bad middle must remain visible.
         previous = policy.get_metadata(self.repo, first)
         self.save("VERSION", "2026.9.2\n")
-        self.save("CHANGELOG.md", previous[policy.CHANGELOG_PATH].decode() + policy.entry((2026, 9, 2), SEPTEMBER, ["Repair the visible quota percentage alignment."]))
+        self.save("CHANGELOG.md", previous[policy.CHANGELOG_PATH].decode("utf-8") + policy.entry((2026, 9, 2), SEPTEMBER, ["Repair the visible quota percentage alignment."]))
         self.run_git("add", "VERSION", "CHANGELOG.md")
         self.commit("Repair only the tip")
         with self.assertRaisesRegex(policy.PolicyError, bad[:12]):
@@ -262,8 +262,8 @@ class VersionTests(unittest.TestCase):
         feature = self.valid_commit(message="Make the Bluetooth picker easier to navigate.")
         self.run_git("checkout", "main")
         self.valid_commit(message="Improve wording in the first-time setup instructions.")
-        tree = self.run_git("rev-parse", "HEAD^{tree}").stdout.decode().strip()
-        merged = self.run_git("commit-tree", tree, "-p", self.head(), "-p", feature, "-m", "Synthetic merge", date=SEPTEMBER).stdout.decode().strip()
+        tree = self.run_git("rev-parse", "HEAD^{tree}").stdout.decode("ascii").strip()
+        merged = self.run_git("commit-tree", tree, "-p", self.head(), "-p", feature, "-m", "Synthetic merge", date=SEPTEMBER).stdout.decode("ascii").strip()
         with self.assertRaisesRegex(policy.PolicyError, "merge/root"):
             self.validate(merged)
         self.assertNotEqual(main, feature)
@@ -327,10 +327,10 @@ class VersionTests(unittest.TestCase):
         os.chmod(hooks / "commit-msg", 0o755)
         failed = self.run_git("commit", "-m", "Later hook fails", date=now, success=False)
         self.assertNotEqual(failed.returncode, 0)
-        prepared = (self.repo / "VERSION").read_text()
+        prepared = (self.repo / "VERSION").read_text(encoding="utf-8")
         (hooks / "commit-msg").unlink()
         self.commit("Retry succeeds", now)
-        self.assertEqual((self.repo / "VERSION").read_text(), prepared)
+        self.assertEqual((self.repo / "VERSION").read_text(encoding="utf-8"), prepared)
         self.assertEqual(self.validate(), 1)
 
     def test_no_verify_bypass_is_detected_by_post_commit_and_pre_push(self):
@@ -355,7 +355,7 @@ class VersionTests(unittest.TestCase):
         self.assertIn(b"today's UTC date", result.stderr)
         self.assertEqual(self.head(), self.bootstrap)
         self.assertFalse((self.repo / "VERSION").exists())
-        self.assertIn("monthly version", (self.repo / policy.NOTES_PATH).read_text())
+        self.assertIn("monthly version", (self.repo / policy.NOTES_PATH).read_text(encoding="utf-8"))
 
     def test_hook_rejects_path_only_commit_that_omits_staged_notes(self):
         self.install_hooks()
@@ -393,12 +393,12 @@ class VersionTests(unittest.TestCase):
         self.note(message)
         self.prepare()
         self.assertFalse((self.repo / "injected-file").exists())
-        self.assertIn(message, (self.repo / "CHANGELOG.md").read_text())
+        self.assertIn(message, (self.repo / "CHANGELOG.md").read_text(encoding="utf-8"))
 
     def test_base_checker_rejects_head_that_replaces_checker_and_skips_version(self):
         # Reproduce the trusted workflow: keep the base worktree, fetch/read the
         # candidate as Git data, and never import or execute its replacement code.
-        trusted_script = (ROOT / "scripts/versioning.py").read_text().replace(policy.BOOTSTRAP_SHA, self.bootstrap)
+        trusted_script = (ROOT / "scripts/versioning.py").read_text(encoding="utf-8").replace(policy.BOOTSTRAP_SHA, self.bootstrap)
         self.save("scripts/versioning.py", trusted_script)
         self.run_git("add", "scripts/versioning.py")
         base = self.valid_commit()

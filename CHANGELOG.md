@@ -16,3 +16,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 - Improve computer selection, reconnect and e-paper frame transfer while keeping the approved four-quota dashboard.
 - Recover interrupted companion updates and preserve existing local device identities during installation.
 - Run trusted primary CI in disposable Mac mini VMs and publish only the exact hardware-accepted firmware artifact.
+
+## [2026.9.3] - 2026-09-20
+
+- Fix Windows startup updates and archive validation, and isolate native builds so Intel Mac packages load their cryptography runtime correctly.

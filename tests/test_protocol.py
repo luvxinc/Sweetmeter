@@ -525,19 +525,23 @@ class BuildInjectionTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("firmware_build_test", ROOT / "scripts/firmware_build.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        # This unit test clears the environment to exercise only override flags;
+        # provenance capture has its own integration tests and needs Git's OS env.
+        build_state = {"source_commit": "a" * 40, "source_tree": "b" * 40,
+                       "source_fingerprint": "c" * 64, "dirty": False}
         with tempfile.TemporaryDirectory() as temp:
             target = Path(temp) / "release.h"
             with patch.dict(os.environ, {}, clear=True):
-                module.generate(ROOT, target)
+                module.generate(ROOT, target, build_state=build_state)
                 text = target.read_text()
                 self.assertIn(f'#define SWEETMETER_VERSION "{get_version()}"', text)
                 self.assertIn('#define SWEETMETER_PROJECT_NAME "Sweetmeter"', text)
                 self.assertNotIn("PRIVATE KEY", text)
             with patch.dict(os.environ, {"SWEETMETER_TEST_VERSION": "2026.9.99"}, clear=True), self.assertRaises(ValueError):
-                module.generate(ROOT, target)
+                module.generate(ROOT, target, build_state=build_state)
             with patch.dict(os.environ, {"SWEETMETER_TEST_BUILD": "1", "SWEETMETER_TEST_VERSION": "2026.9.99",
                                          "SWEETMETER_TEST_VARIANT": "health-fail"}, clear=True):
-                module.generate(ROOT, target)
+                module.generate(ROOT, target, build_state=build_state)
                 text = target.read_text()
                 self.assertIn('#define SWEETMETER_PROJECT_NAME "Sweetmeter-test-health"', text)
                 self.assertIn("#define SWEETMETER_TEST_HEALTH_FAIL 1", text)

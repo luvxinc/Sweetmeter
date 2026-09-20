@@ -10,8 +10,7 @@ fast-forward that same head into main. See [CONTRIBUTING.md](../CONTRIBUTING.md)
 Use Python 3.12 with Tcl/Tk 8.6 and a clean environment on each native platform:
 
 ```sh
-python -m venv .venv
-.venv/bin/python -m pip install -r requirements-build.txt
+python scripts/setup_native_env.py
 .venv/bin/python scripts/build_companion.py
 ```
 
@@ -24,6 +23,18 @@ Trusted primary tests, firmware and release orchestration run on the isolated
 Mac mini Linux ARM64 runner; native bundles use hosted workers because they
 require their target OS/architecture. Pull requests never use the private
 runner. See [CI.md](CI.md) for routing and isolation.
+
+The setup helper creates a new venv and refuses to overwrite an existing one;
+use `--path` to choose another directory. It installs pinned requirements without
+reusing pip's build cache. Most platforms use the upstream cryptography wheel.
+Upstream [removed Intel macOS wheels/support in 49.0.0](https://cryptography.io/en/latest/changelog/#v49-0-0).
+Sweetmeter retains its pinned 50.0.1 on Intel by compiling it with Rust and
+Homebrew `openssl@3` static libraries, using the documented
+[`OPENSSL_STATIC=1` build option](https://cryptography.io/en/latest/installation/#building-cryptography-on-macos).
+The builder rejects an Intel crypto extension linked to external libssl/libcrypto
+before packaging. Intel compatibility is validated by Sweetmeter's native CI
+tests and frozen-app smoke checks; it is not an upstream-supported wheel target.
+Do not claim the corrected Intel build passed until that CI job succeeds.
 
 The output is `dist/Sweetmeter-YYYY.M.N-OS-ARCH.zip`, containing a complete
 `Sweetmeter.app` or `Sweetmeter/` directory. It includes the runtime, Tk,

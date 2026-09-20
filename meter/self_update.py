@@ -269,7 +269,9 @@ def _inspect_archive(archive):
     if not entries or len(entries) > MAX_FILES:
         raise ValueError('Invalid archive file count')
     for item in entries:
-        path = _entry_path(item.filename)
+        # On Windows ZipInfo normalizes backslashes in filename. Inspect the
+        # original archive spelling so normalization cannot hide invalid input.
+        path = _entry_path(item.orig_filename)
         canonical = str(path).casefold()
         if canonical in seen:
             raise ValueError('Duplicate/case-colliding archive entry')
@@ -548,7 +550,9 @@ def apply_update(plan_path):
         shutil.copytree(candidate, incoming, symlinks=True)
         for item in incoming.rglob('*'):
             if item.is_file() and not item.is_symlink():
-                with item.open('rb') as source:
+                # Windows CRT _commit (os.fsync) requires a writable handle.
+                # r+b preserves the bytes while allowing durable flush there.
+                with item.open('r+b') as source:
                     os.fsync(source.fileno())
         _write(journal, recovery)
         root.rename(backup)

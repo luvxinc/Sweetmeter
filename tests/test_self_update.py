@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import stat
@@ -36,7 +37,11 @@ class UpdateTests(unittest.TestCase):
     def write_package(self, entries=None):
         with zipfile.ZipFile(self.package, 'w') as archive:
             for name, content in entries or [(self.name + '/' + self.relative_exe, b'new app')]:
-                archive.writestr(name, content)
+                # ZipInfo(name) normalizes backslashes on Windows. Preserve the
+                # raw bytes so malicious-name fixtures are identical on all OSes.
+                entry = zipfile.ZipInfo()
+                entry.filename = entry.orig_filename = name
+                archive.writestr(entry, content)
 
     def test_source_mode_offers_verified_manual_folder(self):
         self.write_package()
@@ -60,9 +65,12 @@ class UpdateTests(unittest.TestCase):
     def test_zip_traversal_links_duplicates_and_windows_aliases(self):
         for name in ['../escape', '/escape', 'Sweetmeter/../escape', 'C:/escape',
                      'Sweetmeter\\escape', 'Sweetmeter/CON', 'Sweetmeter/a.']:
-            self.write_package([(name, b'bad')])
-            with self.assertRaises(ValueError):
-                update.extract_package(self.package, self.root / 'extract')
+            with self.subTest(name=name):
+                self.write_package([(name, b'bad')])
+                with zipfile.ZipFile(self.package) as archive:
+                    self.assertEqual(archive.infolist()[0].orig_filename, name)
+                with self.assertRaises(ValueError):
+                    update.extract_package(self.package, self.root / 'extract')
         with zipfile.ZipFile(self.package, 'w') as archive:
             link = zipfile.ZipInfo('Sweetmeter/link')
             link.create_system = 3
@@ -129,6 +137,13 @@ class UpdateTests(unittest.TestCase):
 
     def test_success_requires_matching_new_process_health(self):
         installed, plan, plan_path = self.plan()
+        real_fsync = os.fsync
+        def windows_fsync(descriptor):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                # A zero-byte write changes no content but rejects read-only
+                # descriptors, reproducing Windows CRT flush requirements.
+                os.write(descriptor, b'')
+            real_fsync(descriptor)
         class Process:
             pid = 444
             def poll(self): return None
@@ -139,11 +154,25 @@ class UpdateTests(unittest.TestCase):
         with patch.object(update, 'install_root', return_value=installed), \
                 patch.object(update, 'data_dir', return_value=self.root), \
                 patch.object(update, '_alive', return_value=False), \
+                patch.object(update.os, 'fsync', side_effect=windows_fsync), \
                 patch.object(update.subprocess, 'Popen', side_effect=launch):
             update.apply_update(plan_path)
         self.assertEqual((installed / self.relative_exe).read_text(), 'new app')
         self.assertEqual(json.loads((self.state / 'companion-update-result.json').read_text())['status'], 'success')
         self.assertFalse(list(self.root.glob('*.previous-*')))
+
+    def test_windows_normalization_cannot_hide_archive_backslash(self):
+        self.write_package([('Sweetmeter\\escape', b'bad')])
+        # Simulate only ZipInfo's platform separator, without changing pathlib
+        # or the host filesystem, so this regression also runs on macOS/Linux.
+        with patch.object(zipfile.os, 'sep', '\\'):
+            with zipfile.ZipFile(self.package) as archive:
+                entry = archive.infolist()[0]
+                self.assertEqual(entry.filename, 'Sweetmeter/escape')
+                self.assertEqual(entry.orig_filename, 'Sweetmeter\\escape')
+            with self.assertRaises(ValueError):
+                update.extract_package(self.package, self.root / 'extract')
+        self.assertFalse((self.root / 'extract').exists())
 
     def test_failed_start_restores_previous_package(self):
         installed, plan, plan_path = self.plan()

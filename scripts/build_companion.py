@@ -23,6 +23,14 @@ def run(*args):
     subprocess.run(list(map(str, args)), cwd=ROOT, check=True)
 
 
+def check_crypto_linkage():
+    if sys.platform == 'darwin' and platform.machine().lower() == 'x86_64':
+        from cryptography.hazmat.bindings import _rust
+        dependencies = subprocess.check_output(['otool', '-L', _rust.__file__], text=True)
+        if any('/libssl' in line or '/libcrypto' in line for line in dependencies.splitlines()[1:]):
+            raise RuntimeError('Intel cryptography must link OpenSSL statically; use scripts/setup_native_env.py')
+
+
 def archive_tree(root, archive):
     validate_tree(root)
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as output:
@@ -41,6 +49,7 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT / 'dist')
     parser.add_argument('--sign-identity', default=os.environ.get('MACOS_SIGN_IDENTITY'))
     args = parser.parse_args()
+    check_crypto_linkage()
     provenance = capture_build_state(ROOT)
     os_name = {'darwin': 'macos', 'win32': 'windows'}.get(sys.platform, 'linux')
     architecture = {'aarch64': 'arm64', 'amd64': 'x86_64'}.get(platform.machine().lower(), platform.machine().lower())

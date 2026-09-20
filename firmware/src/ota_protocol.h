@@ -69,7 +69,7 @@ inline OtaError parseEnvelope(const uint8_t *p, size_t n, const Version &running
   if(n<170 || n>maxEnvelope || memcmp(p,magic,8) || u16(p+8)!=1 ||
      u16(p+10)!=headerSize || u16(p+14) || !zeroes(p+140,20)) return OtaError::Metadata;
   uint16_t signature = u16(p+160);
-  if(signature<8 || signature>72 || n!=162+signature) return OtaError::Metadata;
+  if(signature<8 || signature>72 || n!=size_t(162)+signature) return OtaError::Metadata;
   if(u16(p+12)!=protocol) return OtaError::Protocol;
   if(!padded(p+16,48,boardId)) return OtaError::Board;
   if(!padded(p+124,16,keyId)) return OtaError::Signature;
