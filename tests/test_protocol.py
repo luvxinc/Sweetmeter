@@ -457,7 +457,11 @@ class SigningToolsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             package = Path(temp) / "app.zip"
             public = (ROOT / "meter/assets/keys/release-1.pem").read_bytes()
+            other_public = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
             for version, key, accepted in (("2026.9.2", public, True), ("2026.9.1", public, False),
+                                           ("2026.9.2", public.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"), True),
+                                           ("2026.9.2", other_public, False),
                                            ("2026.9.2", b"wrong trust", False)):
                 native_package_fixture(package, version=version, public_key=key)
                 args = dict(os_name="linux", arch="x86_64", source_commit="a" * 40, source_tree="b" * 40)

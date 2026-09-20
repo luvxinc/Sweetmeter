@@ -29,3 +29,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.5] - 2026-09-20
 
 - Show the device’s running firmware version in the dashboard’s upper-left corner, alongside Bluetooth status.
+
+## [2026.9.6] - 2026-09-20
+
+- Fix release verification of Windows public-key files with CRLF line endings while continuing to reject different signing keys; record owner-confirmed display and wake/reconnect checks.

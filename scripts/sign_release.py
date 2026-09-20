@@ -119,12 +119,16 @@ def verify_companion_package(path, version, *, os_name, arch, source_commit, sou
         key_paths = [name for name in regular_names if name.endswith("/meter/assets/keys/release-1.pem")]
         if not version_paths or not key_paths:
             raise ValueError("Companion package lacks bundled VERSION or public trust resource")
-        expected_public = (ROOT / "meter/assets/keys/release-1.pem").read_bytes()
+        def public_identity(raw):
+            return serialization.load_pem_public_key(raw).public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+        expected_public = public_identity((ROOT / "meter/assets/keys/release-1.pem").read_bytes())
         for name in version_paths:
             if archive.getinfo(name).file_size > 20 or archive.read(name).decode("ascii").removesuffix("\n") != str(version):
                 raise ValueError("Companion package VERSION differs from release")
         for name in key_paths:
-            if archive.getinfo(name).file_size > 4096 or archive.read(name) != expected_public:
+            if archive.getinfo(name).file_size > 4096 or public_identity(archive.read(name)) != expected_public:
                 raise ValueError("Companion package signing trust differs from release")
 
 

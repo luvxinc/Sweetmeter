@@ -14,7 +14,7 @@ remain required for future firmware candidates.
 
 | Area | Evidence | Remaining acceptance |
 | --- | --- | --- |
-| Imported macOS prototype | One V1.2 JD79661 unit previously displayed the approved dashboard, clock and BLE data; short/long disconnect sleep was exercised | Protocol-4 BLE/clock/frame ACK repeated for 2026.9.3; owner optical/button confirmation still pending |
+| Imported macOS prototype | One V1.2 JD79661 unit previously displayed the approved dashboard, clock and BLE data; short/long disconnect sleep was exercised | Protocol-4 BLE/clock/frame ACK repeated for 2026.9.3; owner confirmed dashboard and top-button wake/reconnect; computer selection buttons pending |
 | Version/changelog governance | Temporary Git repositories exercise hooks, UTC rollover, staging, retries, invalid history and trusted-base checking; GitHub checks run on reviewed commits | Keep required checks enabled for each accepted commit |
 | Protocol-4 BLE and OTA | Implementation and automated checks are recorded by their actual test/build results | 2026.9.3 happy path, rejection, interruption and rollback passed on one Mac/unit; see the linked report |
 | Display | Approved 250×122 monochrome reference exists | Human inspection of orientation, legibility, row alignment and residual images |
