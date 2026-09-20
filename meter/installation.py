@@ -6,6 +6,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from .paths import app_command, data_dir, default_state_dir, install_root, resource_root
 
@@ -52,6 +53,8 @@ def native_startup_command():
 
 
 def startup(command, *, enable=True):
+    child_environment = os.environ.copy()
+    child_environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
     if sys.platform == 'darwin':
         destination = Path.home() / 'Library/LaunchAgents' / (LABEL + '.plist')
         domain = f'gui/{os.getuid()}'
@@ -88,7 +91,7 @@ def startup(command, *, enable=True):
                 lines.append(f'shell.Environment("PROCESS")("{key}") = "{value}"')
         lines.append(f'shell.Run "{quoted}", 0, False')
         destination.write_text('\n'.join(lines) + '\n', encoding='utf-16')
-        subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, env=child_environment)
     else:
         destination = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'autostart/sweetmeter.desktop'
         if not enable:
@@ -104,7 +107,24 @@ def startup(command, *, enable=True):
         desktop_command = ['env', *assignments, *command] if assignments else command
         destination.write_text('[Desktop Entry]\nType=Application\nName=Sweetmeter\n'
                                'Exec=' + ' '.join(map(quote, desktop_command)) + '\nTerminal=false\n', encoding='utf-8')
-        subprocess.Popen(command, start_new_session=True)
+        subprocess.Popen(command, start_new_session=True, env=child_environment)
+
+
+def open_installed():
+    """Bring an existing managed installation forward without replacing it."""
+    destination = install_root().absolute()
+    record = json.loads((data_dir() / 'install.json').read_text())
+    if record.get('kind') != 'native' or record.get('root') != str(destination):
+        raise ValueError('Existing installation is not managed by Sweetmeter.')
+    if not Path(app_command(destination)[0]).is_file():
+        raise ValueError('Existing Sweetmeter installation is incomplete.')
+    state = default_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    (state / 'show-window').touch()
+    environment = os.environ.copy()
+    environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    subprocess.Popen(app_command(destination), env=environment)
+    return destination
 
 
 def install_native(application, *, start_at_login=True):
@@ -116,18 +136,25 @@ def install_native(application, *, start_at_login=True):
     if any(p.is_symlink() for p in (destination, *destination.parents)):
         raise ValueError('Refusing symlinked installation path.')
     if destination.exists():
-        raise ValueError('Installation already exists; use the app updater or move the old copy aside after quitting.')
+        return open_installed()
     from .self_update import validate_tree
     validate_tree(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination, symlinks=True)
+    # Never leave a half-copied application at the managed destination.
+    with tempfile.TemporaryDirectory(prefix='.sweetmeter-install-', dir=destination.parent) as temporary:
+        staged = Path(temporary) / expected
+        shutil.copytree(source, staged, symlinks=True)
+        staged.rename(destination)
     root = data_dir()
     default_state_dir().mkdir(parents=True, exist_ok=True)
     (root / 'install.json').write_text(json.dumps({'kind': 'native', 'root': str(destination)}) + '\n')
     command = native_startup_command()
+    (default_state_dir() / 'show-window').touch()
     if start_at_login:
         retire_legacy_startup()
         startup(command + ['--background', '--state-dir', str(default_state_dir())])
+    else:
+        open_installed()
     return destination
 
 

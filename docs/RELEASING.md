@@ -7,6 +7,19 @@ fast-forward that same head into main. See [CONTRIBUTING.md](../CONTRIBUTING.md)
 
 ## Native companion builds
 
+First-install entry points are root-level `install.sh` and `install.ps1`, linked
+from README. They resolve the latest published stable release, verify its exact
+manifest bytes with the embedded P-256 public key, then check the native ZIP size
+and SHA-256 before running `--install`. They support existing 2026.9.8 packages;
+the direct-open welcome screen requires a native package built from the new
+onboarding revision. Do not claim an unreleased native change is already shipped.
+The bootstrap is HTTPS-trusted repository code, separate from authenticated
+release payloads. Key rotation must update both installers and the app together.
+`test_bootstrap.py` exercises real signature verification/extraction with local
+signed fixtures on each native CI platform; network and process launch are
+mocked. It does not certify physical Bluetooth or clean-machine OS prompts.
+
+
 Use Python 3.12 with Tcl/Tk 8.6 and a clean environment on each native platform:
 
 ```sh

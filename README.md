@@ -5,7 +5,11 @@ usage. One screen shows Claude 5-hour, Claude weekly, Fable weekly and Codex
 weekly quotas, reset countdowns and local Token totals.
 
 面向 Claude Code / Codex 的蓝牙墨水屏额度仪表盘：四项额度同屏，电脑端读取数据，
-ESP32 显示；首次使用需要配套程序和 USB 刷写，正常使用通过蓝牙传输。
+ESP32 显示；已刷好固件的设备只需在电脑上运行一次安装入口并授权，
+确认目标电脑后自动同步。空白开发板首次刷写需要 USB，正常使用通过蓝牙传输。
+
+**[Get started / 一次安装，自动配置](#quick-setup)** ·
+[Downloads](https://github.com/luvxinc/Sweetmeter/releases/latest) · [Hardware](docs/HARDWARE.md)
 
 ![Synthetic dashboard preview](docs/assets/dashboard.png)
 
@@ -87,10 +91,50 @@ Native builds include Python, Tk, BLE libraries, fonts, the public update key an
 third-party notices. Claude Code and Codex themselves must already be installed
 and logged in as the same OS user.
 
+### Quick setup
+
+For a **preflashed Sweetmeter**, run the matching command once as your normal
+desktop user. No Espressif client, Git checkout, pip commands or separate Python
+installation is needed. The installer selects the latest stable native release,
+verifies its signed manifest and package hash, installs for your user, registers
+login startup and opens Sweetmeter. Repeating it opens your existing installation
+without overwriting it; subsequent updates remain **Install / Later / Skip**.
+
+**macOS / Ubuntu desktop — paste into Terminal:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/luvxinc/Sweetmeter/main/install.sh | sh
+```
+
+**Windows 11 — paste into PowerShell:**
+
+```powershell
+irm https://raw.githubusercontent.com/luvxinc/Sweetmeter/main/install.ps1 | iex
+```
+
+These commands execute this repository's [shell installer](install.sh) or
+[PowerShell installer](install.ps1). Payloads are authenticated with Sweetmeter's
+pinned release key before extraction and execution. The bootstrap script itself
+is obtained over HTTPS from this repository; inspect it first if desired.
+Ubuntu/Debian may request your password to install missing system packages and
+start BlueZ. Do not run the entire installer with `sudo` or from WSL.
+
+**首次使用只需：运行上述对应命令 → 允许蓝牙 → 在设备上确认这台电脑。**
+电脑端窗口会引导连接：长按设备下方按钮 3 秒，用摇杆选中电脑并按下确认。
+系统设置中的蓝牙配对本身不会启动安装程序，也不能替代这次设备绑定。
+已登录的 Claude Code / Codex 不需要重新登录；未登录时，请在官方客户端登录。
+之后时间同步、每分钟刷新和重新连接自动完成，关闭窗口仍在后台运行。
+设备显示 OFF 时按顶部按钮唤醒。
+
+### Download instead of using a command
+
 Download the matching ZIP from [Releases](https://github.com/luvxinc/Sweetmeter/releases)
 when a tested release is available. Extract the ZIP **before** running it. On
 macOS use Archive Utility or another extractor that preserves framework links.
-Install the extracted app for your user with its own `--install` option:
+New native builds from this revision show **Install and continue** when you open
+the extracted app, then open the managed copy automatically. Existing published
+packages without that welcome screen can use the one-command setup above, or
+their own `--install` option:
 
 | System | From the extracted folder |
 | --- | --- |
@@ -102,8 +146,8 @@ The installer registers login startup and starts the managed companion. The
 managed locations are `~/Applications/Sweetmeter.app`,
 `%LOCALAPPDATA%/Programs/Sweetmeter`, and `~/.local/lib/Sweetmeter`. Running directly
 from Downloads is possible, but automatic application replacement requires the
-managed installation. Existing installs are not overwritten by the first-install
-command; use the confirmed updater for subsequent releases.
+managed installation. The quick installer preserves existing installs; use the
+confirmed updater for subsequent releases.
 
 **Current macOS development builds are ad-hoc signed, not Developer ID signed or
 notarized. Windows builds are not Authenticode signed.** OS warnings must not be

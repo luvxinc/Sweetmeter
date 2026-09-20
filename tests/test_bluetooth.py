@@ -1,11 +1,13 @@
 import asyncio
 import json
+import queue
 import struct
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 from meter.bluetooth import (Bluetooth, Session, companion_identity, parse_status,
                              value_budget, CONTROL_UUID, DATA_UUID, DiscoveryOpened)
 
@@ -82,6 +84,34 @@ class BluetoothTests(unittest.TestCase):
         with self.assertRaises(ValueError): radio.send(b'bad')
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_binding_instruction_survives_discovery_disconnect(self):
+        radio = Bluetooth.__new__(Bluetooth)
+        radio.pinned = None
+        radio.host_id, radio.name = HOST, 'Test PC'
+        radio.stop, radio.ready = threading.Event(), threading.Event()
+        radio.events = queue.Queue()
+        class Scanner:
+            def __init__(self, detection_callback, **_): self.found = detection_callback
+            async def __aenter__(self): self.found(SimpleNamespace(address='meter'), None)
+            async def __aexit__(self, *_): pass
+        class Client:
+            def __init__(self, *_, **__): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+            async def read_gatt_char(self, _):
+                return b'{"protocol":4,"firmware":"2026.9.8","selected_host":""}'
+        delays = []
+        async def sleep(seconds):
+            delays.append(seconds)
+            if len(delays) == 2: radio.stop.set()
+        radio.scanner_factory, radio.client_factory, radio._sleep = Scanner, Client, sleep
+        with patch.object(Session, 'subscribe', new_callable=AsyncMock):
+            await radio._run()
+        events = []
+        while not radio.events.empty(): events.append(radio.events.get()['event'])
+        self.assertEqual(events, ['status', 'selection_required'])
+        self.assertLessEqual(delays[-1], 5)
+
     async def asyncSetUp(self):
         self.client = FakeClient()
         self.events = []

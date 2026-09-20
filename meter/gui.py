@@ -28,11 +28,13 @@ class Desktop:
         for variable in (self.connection, self.provider_status, self.update_status):
             ttk.Label(frame, textvariable=variable, wraplength=560).pack(anchor='w', pady=(12, 0))
         ttk.Separator(frame).pack(fill='x', pady=16)
-        ttk.Label(frame, text='First connection', font=('', 12, 'bold')).pack(anchor='w')
-        ttk.Label(frame, text='1. Sign in to Claude Code and Codex on this computer.\n'
-                  '2. Hold the meter’s lower button for 3 seconds.\n'
-                  '3. Select this computer with the wheel, then press the wheel.\n'
-                  'Keep Sweetmeter running to refresh every minute.', wraplength=560).pack(anchor='w', pady=8)
+        self.setup_heading = tk.StringVar(value='Connect your meter')
+        self.setup_help = tk.StringVar(value='Allow Bluetooth if asked. Turn on the meter.\n'
+                  'Hold its lower button for 3 seconds, then select this computer\n'
+                  'with the wheel and press to confirm.\n'
+                  'Already signed in to Claude Code / Codex? No extra login is needed.')
+        ttk.Label(frame, textvariable=self.setup_heading, font=('', 12, 'bold')).pack(anchor='w')
+        ttk.Label(frame, textvariable=self.setup_help, wraplength=560).pack(anchor='w', pady=8)
         buttons = ttk.Frame(frame)
         buttons.pack(side='bottom', fill='x', pady=(12, 0))
         ttk.Button(buttons, text='Refresh quotas', command=lambda: app.provider.force.set()).pack(side='left')
@@ -134,12 +136,28 @@ class Desktop:
         kind = event['event']
         if kind == 'connected':
             self.connection.set('Bluetooth connected. Dashboard refreshes every 60 seconds.')
+            self.setup_heading.set('Sending your dashboard…')
+            self.setup_help.set('Time and usage are synchronized automatically. Waiting for the meter to confirm its display.')
+        elif kind == 'ack':
+            self.setup_heading.set('Ready')
+            self.setup_help.set('Your meter confirmed the dashboard. You can close this window;\n'
+                                'Sweetmeter keeps running in the background.\n'
+                                'If the meter goes to sleep, press its top button to reconnect.')
         elif kind == 'disconnected':
             self.connection.set('Bluetooth disconnected. Reconnecting automatically…')
+            self.setup_heading.set('Waiting for your meter')
+            self.setup_help.set('Keep the meter nearby. If it shows OFF, press its top button.\n'
+                                'Sweetmeter reconnects automatically; no reinstall is needed.')
         elif kind == 'selection_required':
             self.connection.set('On the meter, select this computer: ' + event['name'])
+            self.setup_heading.set('Confirm this computer')
+            self.setup_help.set('Hold the meter’s lower button for 3 seconds.\n'
+                                'Choose ' + event['name'] + ' with the wheel and press to confirm.')
         elif kind == 'registered':
             self.connection.set('Computer listed on meter: ' + event['name'] + '. Select it with the wheel.')
+            self.setup_heading.set('Confirm this computer')
+            self.setup_help.set('On the meter, choose ' + event['name'] + '\n'
+                                'and press the wheel. Everything else is automatic.')
         elif kind == 'status' and event['status'].get('protocol') == 3:
             self.update_status.set('Legacy QM3 firmware: one USB bootstrap is required before wireless updates.')
         elif kind == 'snapshot':

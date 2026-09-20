@@ -41,3 +41,8 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.8] - 2026-09-20
 
 - Show four Bluetooth signal bars after BT using live peer RSSI; clear stale/disconnected readings and reuse normal e-ink refreshes.
+
+## [2026.9.9] - 2026-09-20
+
+- Add one-command macOS/Linux and Windows installers that verify signed release packages, prepare dependencies, start Sweetmeter and preserve existing installations.
+- Add a first-open native setup screen and live connection guidance; mark setup ready only after the meter acknowledges its dashboard. First binding still requires confirmation on the device.

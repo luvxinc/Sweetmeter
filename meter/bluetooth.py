@@ -195,6 +195,7 @@ class Bluetooth:
         registered = {}
         while not self.stop.is_set():
             delay = random.uniform(2, 5)
+            was_connected = False
             try:
                 devices = {}
                 def found(device, advertisement):
@@ -221,21 +222,24 @@ class Bluetooth:
                             continue
                         selected = status.get('selected_host', '')
                         if (selected and selected != self.host_id) or (status['protocol'] == 4 and not selected):
-                            delay = random.uniform(30, 45)
+                            delay = random.uniform(30, 45) if selected else random.uniform(3, 5)
                             self.events.put({'event': 'selection_required', 'name': self.name})
                             continue
                         await session.hello()
                         self.pinned = device.address
+                        was_connected = True
                         self.events.put({'event': 'connected', 'device_id': device.address})
                         await self._connected(session, device.address, status)
             except DiscoveryOpened:
                 delay = random.uniform(2, 5)
             except PermissionError:
+                self.events.put({'event': 'error', 'error': 'Bluetooth permission denied. Allow Sweetmeter in system Bluetooth/privacy settings, then confirm this computer on the meter.'})
                 delay = random.uniform(30, 45)
             except Exception as error:
                 self.events.put({'event': 'error', 'error': 'Bluetooth: ' + type(error).__name__})
             finally:
-                self.events.put({'event': 'disconnected'})
+                if was_connected:
+                    self.events.put({'event': 'disconnected'})
             await self._sleep(delay)
 
     async def _connected(self, session, address, status):

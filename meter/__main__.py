@@ -49,6 +49,10 @@ def main(argv=None):
         from .installation import install_current
         install_current(start_at_login=True)
         return 0
+    from .onboarding import needs_install, welcome
+    if needs_install(args):
+        welcome()
+        return 0
     from .paths import default_state_dir
     from .app import Application
     state = args.state_dir or default_state_dir()
