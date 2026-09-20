@@ -1,0 +1,44 @@
+{
+  "as_of": 1789925400.0,
+  "clock_at": 1789925400.0,
+  "stale": false,
+  "rows": [
+    {
+      "key": "five_hour",
+      "label": "CLAUDE 5H",
+      "used": 38,
+      "tokens": 1280000,
+      "reset": 1789935300.0,
+      "subscription_label": "MAX 20×"
+    },
+    {
+      "key": "seven_day",
+      "label": "CLAUDE 7D",
+      "used": 64,
+      "tokens": 182600000,
+      "reset": 1790078520.0,
+      "subscription_label": "MAX 20×"
+    },
+    {
+      "key": "fable",
+      "label": "FABLE 7D",
+      "used": 82,
+      "tokens": 96300000,
+      "reset": 1790078520.0,
+      "subscription_label": "MAX 20×"
+    },
+    {
+      "key": "codex",
+      "label": "CODEX 7D",
+      "used": 46,
+      "tokens": 24800000,
+      "reset": 1790284200.0,
+      "subscription_label": "PRO"
+    }
+  ],
+  "device": {
+    "battery_percent": -1
+  },
+  "example_data": true,
+  "example_note": "Illustrative quotas, token totals and subscription labels; not live account data."
+}

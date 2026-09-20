@@ -1,0 +1,38 @@
+# Runtime data is private and must never be distributed.
+state/
+backups/
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Python, firmware and app build output.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pio/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+*.app/
+*.dmg
+*.exe
+*.bin
+*.elf
+*.map
+.DS_Store
+.coverage
+coverage.xml
+htmlcov/
+.idea/
+.vscode/
+
+# Only deliberately synthetic screenshots belong in docs/assets.
+screen*.png

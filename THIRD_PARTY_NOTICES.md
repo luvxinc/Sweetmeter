@@ -1,0 +1,129 @@
+# References and notices
+
+Reviewed upstream implementations on 2026-09-19. The dashboard layout and Mac companion are specific to this project.
+
+## CodexBar
+
+https://github.com/steipete/CodexBar
+
+Reference revision: `7d70c0de949b4ea29f85d79c245298dd9af9cf83`
+
+MIT License
+
+Copyright (c) 2026 Peter Steinberger
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## ccusage
+
+https://github.com/ccusage/ccusage
+
+Reference revision: `71e232610d6e53ca3f9660d254ee9b53fb65bcd7`
+
+MIT License
+
+Copyright (c) 2025 ryoppippi
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## CodexIsland
+
+https://github.com/ericjypark/codex-island
+
+Reference revision: `810b8ac0c45e1fd191c3b37e6dc37f943b71cba1`
+
+MIT License
+
+Copyright (c) 2026 Eric Park
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## ELECROW CrowPanel 2.13
+
+https://github.com/Elecrow-RD/CrowPanel-ESP32-2.13-E-paper-HMI-Display-with-122-250
+
+Reference revision: `adf27048da2482b4ba4aa3514a6cd085ea4cb9b5`
+
+The published ELECROW example has no repository-level license file. Hardware register values, pin assignments, framebuffer orientation, and the GC waveform parameters follow its `example/arduino-v1.2/main` files. Preserve this attribution; no grant of rights to redistribute unrelated vendor assets is assumed. The scope of permission for example-derived initialization/waveform material remains unresolved; this notice is not a license grant from ELECROW. Do not describe vendor material as Apache-2.0 licensed merely because it appears alongside this project's original code.
+
+## Liberation fonts and Sweetmeter UI
+
+Unmodified Liberation Sans Regular/Bold and Liberation Mono Regular 2.1.5 are
+bundled under SIL Open Font License 1.1. Copyright notices and the complete
+license are in `meter/assets/fonts/LICENSE`; exact upstream and file hashes are
+in `meter/assets/fonts/README.md`.
+
+`firmware/src/screen_font.h` is an ASCII subset and bitmap conversion of
+Liberation Mono named **Sweetmeter UI 6x11**, regenerated by
+`scripts/generate_screen_font.py`. This converted font remains OFL-1.1 and
+replaces the prototype's bitmap font whose source had not been recorded.
+The font notice and license must accompany binary firmware and app packages.
+No Apple/Microsoft system font is copied or required by this repository.
+
+## Runtime and build dependencies
+
+Dependencies retain their own licenses; the root Apache-2.0 license applies to
+the project's original work, not to all linked or packaged dependencies.
+
+- [Arduino-ESP32](https://github.com/espressif/arduino-esp32) core: LGPL-2.1;
+  component-specific notices also apply. Distribution of firmware must satisfy
+  applicable LGPL source/relinking obligations, rather than replacing that
+  license with Apache-2.0.
+- [ESP-IDF](https://github.com/espressif/esp-idf): Apache-2.0 with separately
+  licensed components.
+- [Pillow](https://github.com/python-pillow/Pillow): HPND and bundled library
+  notices, including FreeType when included in a binary package.
+- [Requests](https://github.com/psf/requests): Apache-2.0; its dependencies keep
+  their respective licenses.
+
+Release packages must include the license notices for the actual pinned
+dependencies they contain. This source notice is not a substitute for collecting
+those package notices at build time.

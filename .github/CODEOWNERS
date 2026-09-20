@@ -1,0 +1,12 @@
+# Ownership identifies the maintainer; no new mandatory approver is introduced.
+/.github/CODEOWNERS @luvxinc
+/.github/workflows/ @luvxinc
+/.githooks/ @luvxinc
+/.gitattributes @luvxinc
+/.changes/ @luvxinc
+/scripts/versioning.py @luvxinc
+/scripts/install_hooks.py @luvxinc
+/tests/test_versioning.py @luvxinc
+/VERSION @luvxinc
+/CHANGELOG.md @luvxinc
+/CONTRIBUTING.md @luvxinc

@@ -1,0 +1,128 @@
+name: Version policy
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: ['**']
+    tags: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version-policy:
+    name: version-policy
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Mark the candidate head pending
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: 'version-policy/trusted',
+              description: 'Validating candidate history with the protected base checker',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+      - name: Check out trusted base only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate PR objects without executing PR source
+        id: validate
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags origin "$PR_HEAD_SHA"
+          python scripts/versioning.py check-history --head "$PR_HEAD_SHA" --base "$BASE_SHA"
+      - name: Report validation result on the candidate head
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          VALIDATION_OUTCOME: ${{ steps.validate.outcome }}
+        with:
+          script: |
+            const passed = process.env.VALIDATION_OUTCOME === 'success';
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: passed ? 'success' : 'failure',
+              context: 'version-policy/trusted',
+              description: passed ? 'Every commit satisfies the protected base version policy' : 'Version policy failed; see the trusted workflow run',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+  version-policy-push:
+    name: version-policy-push
+    if: github.event_name != 'pull_request_target' && !github.event.deleted
+    runs-on: ubuntu-latest
+    # Push/manual checks cannot write statuses. Only the protected-base PR job
+    # supplies the required trusted status on the candidate commit.
+    steps:
+      - name: Check out accepted main policy (previous main for a main push)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'refs/heads/main' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate selected history with the accepted checker
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
+          REPOSITORY_NAME: ${{ github.repository }}
+          ACTOR_NAME: ${{ github.actor }}
+          BOOTSTRAP_SHA: a2a4898eb5a3d1f2e2d9043cba82e59b33b8970b
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_sha=$(git rev-parse HEAD)
+          git fetch --no-tags origin "$CANDIDATE_SHA"
+          checker=scripts/versioning.py
+          if [[ ! -f "$checker" ]]; then
+            # One-time owner-reviewed seed. Never used in pull_request_target;
+            # no write credentials and no required status are available here.
+            [[ "$trusted_sha" == "$BOOTSTRAP_SHA" ]]
+            [[ "$REPOSITORY_NAME" == "luvxinc/Sweetmeter" && "$ACTOR_NAME" == "luvxinc" ]]
+            [[ "$(git show -s --format=%P "$CANDIDATE_SHA")" == "$BOOTSTRAP_SHA" ]]
+            [[ "$(git show "$CANDIDATE_SHA:VERSION")" == "2026.9.1" ]]
+            checker="$RUNNER_TEMP/sweetmeter-reviewed-bootstrap-checker.py"
+            git show "$CANDIDATE_SHA:scripts/versioning.py" > "$checker"
+            echo 'One-time governance seed: using the owner-reviewed first implementation checker.'
+          fi
+          if [[ "$EVENT_NAME" == push ]]; then
+            if [[ "$REF_NAME" == refs/tags/* ]]; then
+              # A release may select an older accepted main commit, but an
+              # existing tag cannot be moved to any other commit.
+              [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" == 0000000000000000000000000000000000000000 ]]
+              git merge-base --is-ancestor "$CANDIDATE_SHA" "$trusted_sha"
+              python "$checker" check-history --head "$CANDIDATE_SHA"
+            else
+              if [[ -n "$BEFORE_SHA" && "$BEFORE_SHA" != 0000000000000000000000000000000000000000 ]]; then
+                git fetch --no-tags origin "$BEFORE_SHA"
+                git merge-base --is-ancestor "$BEFORE_SHA" "$CANDIDATE_SHA"
+              fi
+              python "$checker" check-history --head "$CANDIDATE_SHA" --base "$trusted_sha"
+            fi
+          else
+            python "$checker" check-history --head "$CANDIDATE_SHA"
+          fi

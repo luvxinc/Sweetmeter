@@ -1,0 +1,4 @@
+VERSION text eol=lf
+CHANGELOG.md text eol=lf
+.changes/*.md text eol=lf
+.githooks/* text eol=lf
