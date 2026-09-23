@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import os
 from pathlib import Path
 import sys
@@ -21,6 +22,9 @@ class OnboardingTests(unittest.TestCase):
         self.exe = Path(installation.app_command(self.source)[0])
         self.exe.parent.mkdir(parents=True)
         self.exe.write_bytes(b'fixture executable')
+        version = self.source / ('Contents/Resources/VERSION' if sys.platform == 'darwin' else '_internal/VERSION')
+        version.parent.mkdir(parents=True, exist_ok=True)
+        version.write_text('2026.9.1\n')
         self.data = self.root / 'data'
         self.state = self.data / 'state'
         # Any path function not patched below must still resolve inside the
@@ -51,7 +55,8 @@ class OnboardingTests(unittest.TestCase):
         with patch.object(installation, 'startup') as startup, \
                 patch.object(installation, 'retire_legacy_startup'), \
                 patch.object(installation, 'native_startup_command', return_value=['helper']), \
-                patch.object(installation.subprocess, 'Popen') as launch:
+                patch.object(installation.subprocess, 'Popen') as launch, \
+                patch.object(installation.subprocess, 'run', return_value=Mock(returncode=0)) as self_test:
             installation.install_native(self.source)
             self.assertTrue((self.state / 'show-window').exists())
             startup.assert_called_once()
@@ -59,8 +64,10 @@ class OnboardingTests(unittest.TestCase):
             (self.state / 'companion.json').write_text('keep identity')
             (self.state / 'show-window').unlink()
             self.exe.write_bytes(b'different download')
-            # A rerun repairs registration and starts the existing app again.
+            # A rerun of the same version finds the installed copy healthy
+            # (its own self-test passes): it only repairs registration.
             installation.install_native(self.source)
+            self.assertEqual(self_test.call_args.args[0][-1], '--self-test')
             self.assertEqual(startup.call_count, 2)
             self.assertTrue(startup.call_args.kwargs['start_now'])
             self.assertTrue((self.state / 'show-window').exists())
@@ -74,7 +81,7 @@ class OnboardingTests(unittest.TestCase):
                 patch.object(installation.subprocess, 'Popen') as launch, \
                 patch('meter.self_update.subprocess.Popen') as app_launch:
             installation.install_native(self.source, start_at_login=False)
-        startup.assert_not_called()
+        startup.assert_not_called()  # Login startup off and none registered: nothing to create or remove.
         launch.assert_not_called()
         app_launch.assert_called_once()
         self.assertEqual(app_launch.call_args.kwargs['env']['PYINSTALLER_RESET_ENVIRONMENT'], '1')

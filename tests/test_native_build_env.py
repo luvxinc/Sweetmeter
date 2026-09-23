@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 from pathlib import Path
 import sys
 import tempfile

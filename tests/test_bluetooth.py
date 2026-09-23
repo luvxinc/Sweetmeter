@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import asyncio
 import json
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from meter.bluetooth import (Bluetooth, Session, PairingStore, PairingRejected, companion_identity,
-                             parse_status, pairing_proof, classify_error, value_budget,
+                             parse_status, pairing_proof, classify_error, value_budget, advertised_kind,
                              CONTROL_UUID, DATA_UUID, DiscoveryOpened)
 
 HOST = '7a1e1000-ff1b-4d9f-a023-0123456789ab'
@@ -86,6 +87,7 @@ class FakeMeter:
         self.frames = []
         self.menu_name = False
         self.challenge = '00' * 16
+        self.writes = []
     def status(self):
         if self.legacy_status:
             return {'protocol': 4, 'firmware': '2026.9.13', 'selected_host': self.selected or '',
@@ -118,6 +120,7 @@ class FakeMeter:
                 self.is_connected = False
             async def write_gatt_char(self, characteristic, data, response):
                 m, data = self.meter, bytes(data)
+                m.writes.append(data)
                 if characteristic == DATA_UUID:
                     self.frame.extend(data[2:])
                     return
@@ -178,7 +181,14 @@ class FakeMeter:
         self.menu_nonce = 0
 
 
-def radio_for(folder, meters, *, hints=()):
+def advertisement(meter, hinted, *, marker=True, name=True):
+    """What the firmware advertises: pairing firmware adds the capability marker."""
+    data = {} if meter.legacy_status or not marker else {0xFFFF: b'SM' + bytes([1 | (2 if hinted else 0)])}
+    local = ('Sweetmeter-ABCD' + ('-PAIR' if hinted and not meter.legacy_status else '')) if name else None
+    return SimpleNamespace(local_name=local, manufacturer_data=data)
+
+
+def radio_for(folder, meters, *, hints=(), marker=True, name=True):
     (Path(folder) / 'companion.json').write_text(json.dumps({'host_id': HOST}))
     radio = Bluetooth(folder, start=False)
     class Scanner:
@@ -186,8 +196,8 @@ def radio_for(folder, meters, *, hints=()):
             self.found = detection_callback
         async def __aenter__(self):
             for meter in meters:
-                name = 'Sweetmeter-ABCD' + ('-PAIR' if meter.address in hints else '')
-                self.found(SimpleNamespace(address=meter.address), SimpleNamespace(local_name=name))
+                self.found(SimpleNamespace(address=meter.address),
+                           advertisement(meter, meter.address in hints, marker=marker, name=name))
         async def __aexit__(self, *_):
             pass
     radio.scanner_factory = Scanner
@@ -261,33 +271,74 @@ class BluetoothTests(unittest.TestCase):
 
 
 class PairingStoreTests(unittest.TestCase):
-    def test_private_file_secret_reuse_and_forget(self):
+    def test_pending_secrets_are_fresh_and_promoted_only_explicitly(self):
         with tempfile.TemporaryDirectory() as folder:
             store = PairingStore(folder)
-            secret = store.secret_for('serial:' + SERIAL, 'addr-1')
-            self.assertEqual(len(secret), 32)
-            self.assertEqual(store.secret_for('serial:' + SERIAL, 'addr-2'), secret)
-            self.assertFalse(store.trusted('serial:' + SERIAL, 'addr-2'))
-            store.mark_paired('serial:' + SERIAL, 'addr-2')
+            key = 'serial:' + SERIAL
+            first = store.new_pending(key, 'addr-1')
+            second = store.new_pending(key, 'addr-1')
+            self.assertEqual(len(first), 32)
+            self.assertNotEqual(first, second)  # every registration sends a new secret
+            self.assertEqual(store.pending(key, 'addr-1'), second)
+            self.assertIsNone(store.secret(key))
+            self.assertFalse(store.trusted(key, 'addr-1'))
+            self.assertTrue(store.related('addr-1') and not store.related('addr-9'))
+            self.assertTrue(store.promote(key, 'addr-1', second))
+            self.assertEqual(store.secret(key), second)
+            self.assertIsNone(store.pending(key, 'addr-1'))
             reloaded = PairingStore(folder)
-            self.assertTrue(reloaded.trusted('serial:' + SERIAL, 'anything'))
-            self.assertEqual(reloaded.secret('serial:' + SERIAL), secret)
+            self.assertTrue(reloaded.trusted(key, 'anything'))
+            self.assertEqual(reloaded.secret(key), second)
+            self.assertFalse(reloaded.needs_registration(key))
             if os.name == 'posix':
                 self.assertEqual(stat.S_IMODE((Path(folder) / 'pairings.json').stat().st_mode), 0o600)
+            generation = reloaded.generation
             reloaded.forget_all()
-            self.assertIsNone(PairingStore(folder).secret('serial:' + SERIAL))
+            self.assertIsNone(PairingStore(folder).secret(key))
+            # Writers that started before Forget cannot resurrect anything.
+            self.assertIsNone(reloaded.new_pending(key, 'addr-1', generation=generation))
+            self.assertFalse(reloaded.promote(key, 'addr-1', second, generation=generation))
+            self.assertFalse(reloaded.mark_paired(key, 'addr-1', generation=generation))
+            self.assertEqual(reloaded.meters, {})
+
+    def test_pending_secrets_are_bounded_per_address(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = PairingStore(folder)
+            for index in range(PairingStore.MAX_PENDING + 2):
+                store.new_pending('serial:' + SERIAL, f'addr-{index}')
+            self.assertEqual(len(store.meters['serial:' + SERIAL]['pending']), PairingStore.MAX_PENDING)
+            self.assertIsNone(store.pending('serial:' + SERIAL, 'addr-0'))
+
     def test_legacy_pin_is_imported_once(self):
         with tempfile.TemporaryDirectory() as folder:
             (Path(folder) / 'bluetooth.json').write_text(json.dumps({'device_id': 'old-meter'}))
             store = PairingStore(folder)
             self.assertTrue(store.trusted('address:old-meter', 'old-meter'))
+            self.assertTrue(store.legacy_record('old-meter') and store.related('old-meter'))
+            self.assertFalse(store.legacy_record('another-meter'))
             store.forget_all()
             # After forgetting, the old pin cannot resurrect itself.
             self.assertFalse(PairingStore(folder).trusted('address:old-meter', 'old-meter'))
+
     def test_corrupt_file_is_ignored(self):
         with tempfile.TemporaryDirectory() as folder:
-            (Path(folder) / 'pairings.json').write_text('{"schema":1,"meters":{"serial:x":{"secret":"zz"}}}')
-            self.assertIsNone(PairingStore(folder).secret('serial:x'))
+            (Path(folder) / 'pairings.json').write_text(
+                '{"schema":1,"meters":{"serial:x":{"secret":"zz"},'
+                '"serial:y":{"secret":"' + '00' * 32 + '"},'
+                '"serial:z":{"pending":{"a":{"secret":"bad"}}}}}')
+            store = PairingStore(folder)
+            self.assertIsNone(store.secret('serial:x'))
+            self.assertIsNone(store.secret('serial:y'))
+            self.assertIsNone(store.pending('serial:z', 'a'))
+
+
+def confirm(radio, meter, key=None):
+    """This computer and ``meter`` share a confirmed secret (as after pairing)."""
+    key = key or 'serial:' + meter.serial
+    secret = bytes([len(meter.address)]) * 32
+    radio.store.promote(key, meter.address, secret)
+    meter.paired[HOST] = secret
+    return secret
 
 
 class FlowTests(unittest.IsolatedAsyncioTestCase):
@@ -312,22 +363,25 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             meter.menu_nonce = 77
             await self.visit(radio, meter, hinted=True)
             self.assertIn(HOST, meter.candidates)
-            secret = radio.store.secret('serial:' + SERIAL)
-            self.assertEqual(meter.candidates[HOST], secret)
+            pending = radio.store.pending('serial:' + SERIAL, 'meter')
+            self.assertEqual(meter.candidates[HOST], pending)
+            self.assertIsNone(radio.store.secret('serial:' + SERIAL))  # not confirmed yet
             self.assertEqual(events_of(radio)[-1], {'event': 'registered', 'name': radio.name})
             meter.select(HOST)
             self.assertEqual(await self.visit(radio, meter), 0)
-            kinds = [e['event'] for e in events_of(radio)]
-            self.assertEqual(kinds[:2], ['status', 'connected'])
-            self.assertIn('disconnected', kinds)
-            self.assertTrue(radio.store.trusted('serial:' + SERIAL, 'x'))
+            events = events_of(radio)
+            self.assertEqual([e['event'] for e in events][:3], ['status', 'status', 'connected'])
+            self.assertEqual([e['trusted'] for e in events[:2]], [False, True])
+            self.assertIn('disconnected', [e['event'] for e in events])
+            self.assertEqual(radio.store.secret('serial:' + SERIAL), pending)  # proven, now confirmed
+            self.assertIsNone(radio.store.pending('serial:' + SERIAL, 'meter'))
             self.assertEqual(radio.pinned, 'meter')
             # The owner switches the meter to another paired computer.
             meter.paired[OTHER] = b'\x05' * 32
             meter.select(OTHER)
             delay = await self.visit(radio, meter)
             events = events_of(radio)
-            self.assertTrue(events[0]['trusted'])
+            self.assertFalse(any(e.get('trusted') for e in events))  # never trusted without our authorization
             self.assertEqual(events[-1]['reason'], 'other_computer')
             self.assertLessEqual(delay, 12)  # prompt return when switched back
             self.assertTrue(radio.store.trusted('serial:' + SERIAL, 'x'))
@@ -335,26 +389,97 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.visit(radio, meter), 0)
             self.assertIn('connected', [e['event'] for e in events_of(radio)])
 
+    async def test_paired_computer_does_not_reregister_in_an_open_menu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter])
+            confirm(radio, meter)
+            meter.selected = HOST
+            self.assertEqual(await self.visit(radio, meter), 0)
+            meter.menu_nonce = 5
+            await self.visit(radio, meter, hinted=True)
+            self.assertNotIn(HOST, getattr(meter, 'candidates', {}))
+
+    async def test_copied_serial_in_menu_never_receives_the_confirmed_secret(self):
+        """A rogue peripheral copying the serial and claiming an open menu."""
+        with tempfile.TemporaryDirectory() as folder:
+            real, fake = FakeMeter('real'), FakeMeter('fake')
+            radio = radio_for(folder, [real, fake], hints={'fake'})
+            confirmed = confirm(radio, real)
+            real.selected = HOST
+            self.assertEqual(await self.visit(radio, real), 0)
+            fake.menu_nonce = 99
+            await self.visit(radio, fake, hinted=True)
+            self.assertNotIn(HOST, getattr(fake, 'candidates', {}))  # paired: nothing is sent at all
+            # Even when this computer must register again, only a fresh secret leaves it.
+            radio.store.mark_unpaired('serial:' + SERIAL, 'real')
+            fake.menu_nonce = 100
+            await self.visit(radio, fake, hinted=True)
+            leaked = fake.candidates[HOST]
+            self.assertNotEqual(leaked, confirmed)
+            # The fake's secret is useless on the real meter; ours still works there.
+            self.assertEqual(radio.store.secret('serial:' + SERIAL), confirmed)
+            self.assertEqual(await self.visit(radio, real), 0)
+            self.assertNotIn(leaked, real.paired.values())
+
+    async def test_copied_serial_claiming_unsecured_selection_gets_no_secret(self):
+        with tempfile.TemporaryDirectory() as folder:
+            real, fake = FakeMeter('real'), FakeMeter('fake')
+            radio = radio_for(folder, [real, fake])
+            confirm(radio, real)
+            fake.paired[HOST] = None  # "selected, secured: false": invites H then Y
+            fake.selected = HOST
+            await self.visit(radio, fake)
+            self.assertFalse([p for p in fake.writes if p[:1] in (b'H', b'Y')])
+            self.assertTrue(radio.store.trusted('serial:' + SERIAL, 'real'))  # our pairing is untouched
+            # Without any confirmed secret, still no TOFU unless a legacy record exists for that address.
+            radio.store.forget_all()
+            await self.visit(radio, fake)
+            self.assertFalse([p for p in fake.writes if p[:1] in (b'H', b'Y')])
+
+    async def test_status_is_untrusted_until_this_link_authenticates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fake = FakeMeter('fake')
+            radio = radio_for(folder, [fake])
+            radio.store.promote('serial:' + SERIAL, 'fake', b'\x09' * 32)
+            fake.paired[OTHER] = b'\x05' * 32
+            fake.selected = OTHER  # our proof is refused
+            await self.visit(radio, fake)
+            statuses = [e for e in events_of(radio) if e['event'] == 'status']
+            self.assertTrue(statuses and not any(e['trusted'] for e in statuses))
+
+    async def test_refused_pending_secret_falls_back_to_confirmed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter])
+            confirmed = confirm(radio, meter)
+            meter.selected = HOST
+            radio.store.new_pending('serial:' + SERIAL, 'meter')  # registered, never chosen on the meter
+            delay = await self.visit(radio, meter)
+            self.assertLess(delay, 5)  # one hello per link: retry soon with the confirmed secret
+            self.assertIsNone(radio.store.pending('serial:' + SERIAL, 'meter'))
+            self.assertTrue(radio.store.trusted('serial:' + SERIAL, 'meter'))
+            self.assertEqual(await self.visit(radio, meter), 0)
+            self.assertEqual(radio.store.secret('serial:' + SERIAL), confirmed)
+
     async def test_removed_from_meter_loses_trust_and_backs_off(self):
         with tempfile.TemporaryDirectory() as folder:
             meter = FakeMeter()
             radio = radio_for(folder, [meter])
-            radio.store.secret_for('serial:' + SERIAL, 'meter')
-            radio.store.mark_paired('serial:' + SERIAL, 'meter')
+            radio.store.promote('serial:' + SERIAL, 'meter', b'\x09' * 32)
             meter.paired[OTHER] = b'\x05' * 32
             meter.selected = OTHER
             delay = await self.visit(radio, meter)
             self.assertGreaterEqual(delay, 30)
             self.assertEqual(events_of(radio)[-1]['reason'], 'other_computer')
             self.assertFalse(radio.store.trusted('serial:' + SERIAL, 'meter'))
+            self.assertTrue(radio.store.needs_registration('serial:' + SERIAL))
 
     async def test_meter_replacement_and_second_meter(self):
         with tempfile.TemporaryDirectory() as folder:
             old, new = FakeMeter('old', serial='000000000001'), FakeMeter('new', serial='000000000002')
             radio = radio_for(folder, [old, new], hints={'new'})
-            radio.store.secret_for('serial:000000000001', 'old')
-            radio.store.mark_paired('serial:000000000001', 'old')
-            old.paired[HOST] = radio.store.secret('serial:000000000001')
+            confirm(radio, old)
             old.selected = HOST
             new.menu_nonce = 5
             await radio._cycle()
@@ -365,18 +490,31 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(radio.store.trusted('serial:000000000001', 'old'))
             self.assertNotEqual(radio.store.secret('serial:000000000001'), radio.store.secret('serial:000000000002'))
 
-    async def test_legacy_selection_migrates_with_one_hello_and_secret(self):
+    async def test_legacy_selection_migrates_with_one_hello_and_fresh_secret(self):
         with tempfile.TemporaryDirectory() as folder:
             meter = FakeMeter()
             meter.paired[HOST] = None
             meter.selected = HOST
             radio = radio_for(folder, [meter])
+            radio.store.mark_paired('address:meter', 'meter', legacy=True)  # old companion state
             self.assertEqual(await self.visit(radio, meter), 0)
             secret = radio.store.secret('serial:' + SERIAL)
             self.assertEqual(meter.paired[HOST], secret)
             self.assertTrue(radio.store.trusted('serial:' + SERIAL, 'meter'))
+            self.assertFalse(radio.store.legacy_record('meter'))  # migration happens once
             # Afterwards only the authenticated hello works.
             self.assertEqual(await self.visit(radio, meter), 0)
+
+    async def test_legacy_migration_requires_a_legacy_record_for_that_address(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            meter.paired[HOST] = None
+            meter.selected = HOST
+            radio = radio_for(folder, [meter])
+            radio.store.mark_paired('address:elsewhere', 'elsewhere', legacy=True)
+            await self.visit(radio, meter)
+            self.assertIsNone(meter.paired[HOST])
+            self.assertEqual(events_of(radio)[-1]['reason'], 'other_computer')
 
     async def test_legacy_migration_by_another_computer_is_refused(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -384,6 +522,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             meter.paired[OTHER] = None
             meter.selected = OTHER
             radio = radio_for(folder, [meter])
+            radio.store.mark_paired('address:meter', 'meter', legacy=True)
             await self.visit(radio, meter)
             self.assertEqual(events_of(radio)[-1]['reason'], 'other_computer')
             self.assertIsNone(meter.paired[OTHER])
@@ -396,11 +535,49 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.visit(radio, meter), 0)
             events = events_of(radio)
             self.assertIn('connected', [e['event'] for e in events])
+            self.assertEqual([e['trusted'] for e in events if e['event'] == 'status'][:2], [False, True])
             self.assertTrue(radio.store.trusted('address:meter', 'meter'))
             # Pre-secret firmware registers with the legacy body (no secret).
             meter.selected, meter.menu_nonce = None, 9
             await self.visit(radio, meter)
             self.assertIsNone(meter.candidates[HOST])
+
+    async def test_forget_during_authentication_is_not_undone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter])
+            confirm(radio, meter)
+            meter.selected = HOST
+            original = Session.authenticate
+            async def forget_meanwhile(session, *args):
+                await original(session, *args)
+                radio.forget()
+            with patch.object(Session, 'authenticate', forget_meanwhile):
+                await self.visit(radio, meter)
+            kinds = [e['event'] for e in events_of(radio)]
+            self.assertNotIn('connected', kinds)
+            self.assertEqual(radio.store.meters, {})
+            self.assertIsNone(radio.pinned)
+
+    async def test_unrelated_meters_are_not_contacted_unless_their_menu_is_open(self):
+        with tempfile.TemporaryDirectory() as folder:
+            stranger = FakeMeter('stranger')
+            radio = radio_for(folder, [stranger])
+            await radio._cycle()
+            self.assertEqual(stranger.connections, 0)  # no connection, so no bond on either side
+            self.assertEqual([e['event'] for e in events_of(radio)], ['bluetooth_state', 'selection_required'])
+            radio.scanner_factory = radio_for(folder, [stranger], hints={'stranger'}).scanner_factory
+            stranger.menu_nonce = 3
+            await radio._cycle()
+            self.assertEqual(stranger.connections, 1)
+            self.assertIn(HOST, stranger.candidates)
+            # Pending registration relates it: after the menu closes it is contacted to authenticate.
+            stranger.select(HOST)
+            radio.scanner_factory = radio_for(folder, [stranger]).scanner_factory
+            radio._not_before.clear()
+            await radio._cycle()
+            self.assertEqual(stranger.connections, 2)
+            self.assertTrue(radio.store.trusted('serial:' + SERIAL, 'stranger'))
 
     async def test_idle_scan_backs_off_and_rescan_resets(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -459,22 +636,29 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(codes, ['worker_restarted'])  # deduplicated
             self.assertNotIn('exit', codes)
 
+    async def connected_session(self, radio, *, cycles=1):
+        client = FakeClient()
+        session = Session(client, HOST, 'Test PC', radio.events.put)
+        await session.subscribe()
+        status = {'protocol': 4, 'firmware': '2026.9.14'}
+        async def read(_):
+            return json.dumps(status).encode()
+        loops = []
+        async def stop(_seconds):
+            loops.append(1)
+            if len(loops) >= cycles:
+                client.is_connected = False
+        client.read_gatt_char, radio._sleep = read, stop
+        return client, session, status
+
     async def test_old_notices_are_dropped(self):
         with tempfile.TemporaryDirectory() as folder:
             radio = radio_for(folder, [])
             radio.update_notice(2)
             radio.notices.put((3, time.monotonic() - 61))  # queued while disconnected
-            client = FakeClient()
-            session = Session(client, HOST, 'Test PC', radio.events.put)
-            await session.subscribe()
-            status = {'protocol': 4, 'firmware': '2026.9.14'}
-            async def read(_):
-                return json.dumps(status).encode()
+            client, session, status = await self.connected_session(radio)
             async def clock(_self):
                 pass
-            async def stop(_seconds):
-                client.is_connected = False
-            client.read_gatt_char, radio._sleep = read, stop
             with patch.object(Session, 'clock', clock):
                 await radio._connected(session, 'meter', status, 'address:meter')
             self.assertEqual([p for c, p in client.writes if p[:1] == b'u'], [b'u\x02'])
@@ -482,20 +666,69 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             radio.update_notice(6)
 
+    async def run_job(self, radio, address='meter'):
+        started = []
+        class Transfer:
+            commit_started = False
+            def __init__(self, client, emit):
+                pass
+            async def run(self, **job):
+                started.append(job)
+        client, session, status = await self.connected_session(radio)
+        async def clock(_self):
+            pass
+        with patch('meter.ota.OTATransfer', Transfer), patch.object(Session, 'clock', clock):
+            await radio._connected(session, address, status, 'address:' + address)
+        return started
+
+    async def test_firmware_job_runs_only_on_its_meter(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            job = dict(image_path='image.bin', envelope=b'env', companion_version='2026.9.15', usb_power=True)
+            radio.install_firmware(device_id='meter', **job)
+            self.assertEqual(await self.run_job(radio), [job])  # device_id is not passed to the transfer
+            self.assertIn({'event': 'ota_rebooting'}, events_of(radio))
+            # Another meter connecting first never receives it.
+            radio.install_firmware(device_id='meter', **job)
+            self.assertEqual(await self.run_job(radio, 'neighbor'), [])
+            expired = [e for e in events_of(radio) if e.get('code') == 'job_expired']
+            self.assertEqual(expired, [{'event': 'ota_error', 'code': 'job_expired',
+                                        'error': 'The meter disconnected before the update started. Try again.'}])
+            self.assertTrue(radio.jobs.empty())
+            # Older callers without device_id keep working.
+            radio.install_firmware(**job)
+            self.assertEqual(await self.run_job(radio, 'anything'), [job])
+
+    async def test_firmware_job_expires_when_not_started_or_meter_leaves(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            job = dict(image_path='image.bin', envelope=b'env', companion_version='2026.9.15', usb_power=True)
+            radio.jobs.put_nowait(({**job, 'device_id': 'meter'}, time.monotonic() - 61))
+            radio._expire_job()
+            self.assertTrue(radio.jobs.empty())
+            self.assertEqual(events_of(radio)[-1]['code'], 'job_expired')
+            radio.install_firmware(device_id='meter', **job)
+            radio._expire_job()
+            self.assertFalse(radio.jobs.empty())  # still fresh
+            radio._drop_job('neighbor')
+            self.assertFalse(radio.jobs.empty())  # someone else's disconnect
+            radio._drop_job('meter')
+            self.assertTrue(radio.jobs.empty())
+            self.assertEqual(events_of(radio)[-1]['code'], 'job_expired')
+
     async def test_forget_clears_pairings_and_announces(self):
         with tempfile.TemporaryDirectory() as folder:
             radio = radio_for(folder, [])
-            radio.store.secret_for('serial:' + SERIAL, 'meter')
-            radio.store.mark_paired('serial:' + SERIAL, 'meter')
+            radio.store.promote('serial:' + SERIAL, 'meter', b'\x09' * 32)
             radio.pinned = 'meter'
             radio.forget()
             self.assertIsNone(radio.pinned)
             self.assertIsNone(radio.store.secret('serial:' + SERIAL))
             self.assertEqual(events_of(radio)[-1], {'event': 'forgotten'})
 
-    async def test_first_binding_instruction_survives_discovery_disconnect(self):
+    async def test_first_binding_instruction_without_connecting(self):
         with tempfile.TemporaryDirectory() as folder:
-            meter = FakeMeter(legacy_status=True)
+            meter = FakeMeter()  # pairing firmware, menu closed
             radio = radio_for(folder, [meter])
             delays = []
             async def sleep(seconds):
@@ -505,8 +738,81 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             radio._sleep = sleep
             await radio._run()
             kinds = [e['event'] for e in events_of(radio)]
-            self.assertEqual(kinds, ['bluetooth_state', 'status', 'selection_required'])
+            self.assertEqual(kinds, ['bluetooth_state', 'selection_required'])
+            self.assertEqual(meter.connections, 0)
             self.assertLessEqual(delays[-1], 5)
+
+
+class AdvertisementTests(unittest.IsolatedAsyncioTestCase):
+    def test_marker_menu_flag_and_name_fallbacks(self):
+        ns = SimpleNamespace
+        self.assertEqual(advertised_kind(ns(local_name='Sweetmeter-ABCD', manufacturer_data={0xFFFF: b'SM\x03'})), 'menu')
+        self.assertEqual(advertised_kind(ns(local_name='Sweetmeter-ABCD', manufacturer_data={0xFFFF: b'SM\x01'})), 'closed')
+        self.assertEqual(advertised_kind(ns(local_name=None, manufacturer_data={0xFFFF: b'SM\x01'})), 'closed')
+        # Only the name arrived: the -PAIR suffix still reveals an open menu.
+        self.assertEqual(advertised_kind(ns(local_name='Sweetmeter-ABCD-PAIR', manufacturer_data={})), 'menu')
+        # A name without any marker is pre-secret firmware.
+        self.assertEqual(advertised_kind(ns(local_name='Sweetmeter-ABCD', manufacturer_data={})), 'legacy')
+        self.assertEqual(advertised_kind(ns(local_name='Sweetmeter-ABCD', manufacturer_data={0xFFFF: b'XY\x01'})), 'legacy')
+        self.assertEqual(advertised_kind(ns(local_name='Sweetmeter-ABCD')), 'legacy')
+        # Neither yet (scan response pending): undecided.
+        self.assertIsNone(advertised_kind(ns(local_name=None, manufacturer_data={})))
+
+    async def test_scan_merges_the_separate_scan_response(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            class Scanner:
+                def __init__(self, detection_callback, **_):
+                    self.found = detection_callback
+                async def __aenter__(self):
+                    device = SimpleNamespace(address='meter')
+                    self.found(device, SimpleNamespace(local_name='Sweetmeter-ABCD',
+                                                       manufacturer_data={0xFFFF: b'SM\x03'}))
+                    self.found(device, SimpleNamespace(local_name=None, manufacturer_data={}))  # advertisement only
+                    self.found(device, SimpleNamespace(local_name=None, manufacturer_data={0xFFFF: b'SM\x01'}))
+                async def __aexit__(self, *_):
+                    pass
+            radio.scanner_factory = Scanner
+            devices = await radio._scan()
+            merged = devices['meter'][1]
+            self.assertEqual(merged.local_name, 'Sweetmeter-ABCD')
+            self.assertEqual(advertised_kind(merged), 'closed')  # the latest flags win
+
+    async def test_undecided_advertisement_is_not_contacted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter], marker=False, name=False)
+            await radio._cycle()
+            self.assertEqual(meter.connections, 0)
+            self.assertNotIn('selection_required', [e['event'] for e in events_of(radio)])
+
+    async def test_fresh_companion_pairs_and_updates_an_unpaired_legacy_meter(self):
+        """A factory-fresh 2026.9.13 meter paired to nobody (no marker, no -PAIR)."""
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter(legacy_status=True)
+            radio = radio_for(folder, [meter])
+            await radio._cycle()
+            self.assertEqual(meter.connections, 1)  # legacy firmware is probed as before
+            events = events_of(radio)
+            self.assertEqual(events[-1]['reason'], 'unpaired')
+            # The owner opens the legacy menu (no hint in its advertisement).
+            meter.menu_nonce = 21
+            radio._not_before.clear()
+            await radio._cycle()
+            self.assertIsNone(meter.candidates[HOST])  # legacy body, no secret
+            meter.select(HOST)
+            radio._not_before.clear()
+            await radio._cycle()
+            self.assertIn('connected', [e['event'] for e in events_of(radio)])
+            self.assertTrue(radio.store.legacy_record('meter'))
+            # The OTA installs pairing firmware; the stored selection has no secret yet.
+            meter.legacy_status = False
+            meter.paired[HOST] = None
+            radio._not_before.clear()
+            await radio._cycle()  # marker, menu closed, but related: H then Y with a fresh secret
+            self.assertEqual(meter.paired[HOST], radio.store.secret('serial:' + SERIAL))
+            self.assertIsNotNone(meter.paired[HOST])
+            self.assertIn('connected', [e['event'] for e in events_of(radio)])
 
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):

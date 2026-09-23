@@ -11,14 +11,18 @@ inline bool batteryCritical(int percent, int millivolts, bool latched) {
   return latched && (percent <= 7 || millivolts <= 3450);
 }
 
-// Deep sleep keeps time on the internal RC oscillator (about +/-5%). Trust a
-// synced clock after a sleep of at most five minutes; otherwise show --:--
-// until the companion sends T again.
+// Deep sleep keeps time on the internal RC oscillator (about +/-5%). The time
+// slept since the last companion T is accumulated in RTC memory; the clock is
+// trusted only while that total stays below five minutes (so repeated
+// 300-second low-battery sleeps never keep a drifting clock); otherwise it
+// shows --:-- until T arrives. T resets the total to zero.
 constexpr int64_t clockTrustAfterSleepSeconds = 300;
-inline bool clockStillValid(bool synced, bool wokeFromSleep, int64_t now, int64_t sleptAt) {
+inline bool clockStillValid(bool synced, bool wokeFromSleep, int64_t now, int64_t sleptAt, int64_t &sleptTotal) {
   if (!synced) return false;
   if (!wokeFromSleep) return true;
-  return sleptAt > 0 && now >= sleptAt && now - sleptAt <= clockTrustAfterSleepSeconds;
+  if (sleptAt <= 0 || now < sleptAt || sleptTotal < 0) return false;
+  sleptTotal += now - sleptAt;
+  return sleptTotal < clockTrustAfterSleepSeconds;
 }
 
 // Power off when no selected computer has been authorized for a long period,
@@ -46,9 +50,4 @@ class RetryBackoff {
   uint32_t delay_ = 0, at_ = 0;
 };
 
-// Frame A result 0 = drawn now; 1 = accepted, drawn with the next minute
-// boundary (the clock redraw). Only the first dashboard after boot and a
-// dashboard answering a physical refresh press are user-visible immediately.
-constexpr uint8_t frameDisplayed = 0, frameDeferred = 1;
-inline bool drawFrameNow(bool firstFrame, bool userRefresh) { return firstFrame || userRefresh; }
 }  // namespace sweetmeter

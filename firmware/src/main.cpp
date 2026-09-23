@@ -138,7 +138,8 @@ void setup() {
   pinMode(BUSY_PIN, INPUT);
   const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   // A drifted RC clock after a long deep sleep shows --:-- until T arrives.
-  if (!sweetmeter::clockStillValid(clockSynced, wake != ESP_SLEEP_WAKEUP_UNDEFINED, int64_t(time(nullptr)), sleptAt))
+  if (!sweetmeter::clockStillValid(clockSynced, wake != ESP_SLEEP_WAKEUP_UNDEFINED, int64_t(time(nullptr)), sleptAt,
+                                   sleptTotal))
     clockSynced = false;
   // Check an optional gauge before BLE and the panel: a critical cell wakes on
   // a 300 s timer only to measure again, not to advertise and redraw.

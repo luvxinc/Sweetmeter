@@ -76,3 +76,10 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 - Sweetmeter recovers automatically from Bluetooth failures and damaged local indexes, and shows plain setup instructions for each operating system.
 - Add an uninstaller, automatic repair of a missing login item, quieter Windows startup, and Linux setup for apt, dnf, pacman and zypper.
 - Updates that lose Bluetooth access are rolled back with instructions, and releases are published only through the verified release workflow.
+
+## [2026.9.16] - 2026-09-23
+
+- Pairing is safer: a paired computer's key is never sent again, a changed key must be confirmed on the meter, and the meter shows 'Update Sweetmeter on <name>' for older apps.
+- Claude and Codex quotas refresh every minute again, a button-started update that fails is shown on the meter, and the panel refreshes at most once a minute.
+- Re-running the installer repairs or updates an older or damaged installation, uninstall never leaves a half-deleted app, and an open macOS Bluetooth prompt no longer undoes an update.
+- The self-hosted CI runner reaches its disposable VM through the Tart guest agent, so it keeps working under macOS Local Network privacy.

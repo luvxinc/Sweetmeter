@@ -11,7 +11,9 @@ enum UpdateNotice : uint8_t {
 };
 enum class NoticeChange : uint8_t { None, DrawNow, DrawLater };
 
-constexpr uint32_t noticeCheckTimeoutMs = 45000, noticeVisibleMs = 8000;
+// "Installing" stays until the companion reports the outcome (`u 2`/`u 4`),
+// the OTA transfer ends, or this long deadline passes.
+constexpr uint32_t noticeCheckTimeoutMs = 45000, noticeVisibleMs = 8000, noticeInstallTimeoutMs = 600000;
 constexpr size_t bannerMaxChars = 37;  // 226-pixel banner interior, 6-pixel glyphs
 
 class NoticeState {
@@ -25,13 +27,21 @@ class NoticeState {
     notice = selected ? UpdateNotConnected : UpdateNotSelected;
     return false;
   }
-  // Unsolicited results are ignored; only an outstanding check (or a failed
-  // install that the companion reports after "Installing") changes the banner.
+  // Unsolicited results are ignored; only an outstanding check (or the
+  // outcome that the companion reports after "Installing") changes the banner.
   bool result(uint8_t code, uint32_t now) {
     if (code < UpdateCurrent || code > UpdateCompanion) return false;
-    bool outstanding = notice == UpdateChecking || (notice == UpdateInstalling && code == UpdateFailed);
+    bool outstanding = notice == UpdateChecking ||
+                       (notice == UpdateInstalling && (code == UpdateFailed || code == UpdateCurrent));
     if (!outstanding) return false;
     notice = code; at_ = now;
+    return true;
+  }
+  // The OTA transfer ended without restarting into the new firmware. A
+  // rocker-initiated install that failed says so; a cancelled one just ends.
+  bool otaEnded(bool failed, uint32_t now) {
+    if (notice != UpdateInstalling) return false;
+    notice = failed ? UpdateFailed : NoNotice; at_ = now;
     return true;
   }
   // A new/lost link cannot deliver the answer to a check sent on the old one.
@@ -44,6 +54,10 @@ class NoticeState {
   }
   NoticeChange tick(uint32_t now) {
     if (notice == UpdateChecking && uint32_t(now - at_) >= noticeCheckTimeoutMs) {
+      notice = UpdateFailed; at_ = now; return NoticeChange::DrawNow;
+    }
+    if (notice == UpdateInstalling) {
+      if (uint32_t(now - at_) < noticeInstallTimeoutMs) return NoticeChange::None;
       notice = UpdateFailed; at_ = now; return NoticeChange::DrawNow;
     }
     if (notice > UpdateChecking && uint32_t(now - at_) >= noticeVisibleMs) {

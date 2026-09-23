@@ -21,6 +21,7 @@ remain required for future firmware candidates.
 | Windows/Linux | Portable implementation and platform CI can test software behavior | Actual BLE adapter, OS permission, pairing and reconnect tests on each OS |
 | Battery | Unknown battery shown honestly without a working gauge | Wiring, charging, gauge accuracy, low-battery behavior and runtime untested |
 | Physical power/wake | Software reset and deep sleep have distinct evidence | Physical top-button wake and real removal/restoration of power |
+| Pairing hardening (2026.9.15) | Native tests cover the per-link bond diff, NEW KEY/UPDATE APP menu rows, the 10-minute migration window, clock/refresh redraw policy and the Installing notice; companion tests cover one-time secret transmission, copied-serial meters, job binding and the Forget race | On hardware, per OS: the scan-response capability marker and its menu bit are reported by bleak; a factory-fresh pre-secret meter is selected from a fresh companion and updated; a stray central's bond is removed after it disconnects while every paired computer's bond survives a first boot with many existing bonds; a computer registered via the menu (and one losing the race with the menu closing) reconnects without forgetting the device in the OS; NEW KEY confirmation after Forget; an app ≤2026.9.14 shows "Update Sweetmeter on <name>"; legacy→2026.9.15 migration inside and outside 10 minutes; one refresh per top-button press and per minute |
 
 Do not replace a row with “passed” until its named case has completed on the
 named hardware, OS, source commit and image digest. Record test limitations in
@@ -60,8 +61,20 @@ descriptor, runtime status and signed metadata must all contain the same actual
 `scripts/accept_device.py` reuses the production `Session` and `OTATransfer`.
 It never reads Claude/Codex credentials, contacts providers, stops/starts a
 companion, changes host selection, erases NVS, flashes USB, or publishes files.
-It reads only the existing companion identity needed for the selected-host
-handshake. Reports replace Bluetooth addresses and host IDs with fingerprints.
+It reads only the existing companion identity and pairing state needed for the
+selected-host handshake, using the companion's own pairing logic. With
+`--execute` it takes the companion's instance lock in `--state-dir`, so it
+refuses to run while that companion is running. The one state change it makes
+is the one the companion would make: after the `upgrade` scenario installs
+pairing firmware over pre-secret firmware, the reconnect first proves the
+postcondition from the status read and then provisions a fresh pairing secret
+(legacy H/Y, section 2.1 of the protocol) into that companion's pairing file.
+Reports replace Bluetooth addresses and host IDs with fingerprints.
+
+`scripts/verify_device.py` proves reset recovery by ordering: exactly one serial
+`READY` line after the EN pulse, then a status the running companion saved from
+an authenticated link after that boot (selected, clock synchronized) and a frame
+ACK received after it. The firmware reports no uptime.
 
 Every invocation is **offline preflight by default**. `--execute` is required
 before any BLE connection, clock/frame write, OTA write or serial access.

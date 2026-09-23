@@ -11,18 +11,15 @@ import threading
 import time
 from pathlib import Path
 from PIL import Image
-from .providers import NotSetUp, account_fingerprints, parse_claude, parse_codex, refresh
+from .providers import NotSetUp, account_fingerprints, close_codex, parse_claude, parse_codex, refresh
 from .tokens import TokenIndex, is_corrupt
 from .render import render, pack_frame
 from .updater import save_json, UpdateService
 
-# Codex quota is read by starting `codex app-server`, which is comparatively
-# heavy. Its weekly quota only moves when Codex is used (which writes local
-# session logs that the token scan already watches) or when it resets, so it
-# is polled at the normal cadence only while there is local Codex activity or
-# a reset is near; otherwise every CODEX_IDLE_INTERVAL (to still catch usage
-# from other computers or the cloud). A forced refresh always polls it.
-CODEX_IDLE_INTERVAL = 900
+# Claude and Codex quotas are both read every render interval (about once a
+# minute). Codex is asked through one long-lived `codex app-server` process
+# (see providers.CodexSession), so a poll is a single JSON-RPC request rather
+# than a new process. A forced refresh polls both at once.
 # A provider row is stale when its data is older than the expected poll plus
 # this grace period, or its last poll failed.
 STALE_GRACE = 300
@@ -180,18 +177,6 @@ class ProviderWorker:
             logging.warning('Token scan failed (%s); quotas are still shown', type(error).__name__)
             return index, set(), False
 
-    @staticmethod
-    def _codex_wake(cache, index, now):
-        codex = cache.get('providers', {}).get('codex') or {}
-        fetched = codex.get('fetched_at', 0) if _number(codex.get('fetched_at', 0)) else 0
-        if index is not None and getattr(index, 'activity', {}).get('codex', 0) > fetched:
-            return True
-        for row in codex.get('rows') or []:
-            reset = row.get('reset') if isinstance(row, dict) else None
-            if _number(reset) and reset <= now + CODEX_IDLE_INTERVAL:
-                return True
-        return False
-
     def run(self):
         # Never construct SQLite on the UI/asyncio thread then use it here.
         index = None
@@ -215,13 +200,10 @@ class ProviderWorker:
                     time.tzset()  # Follow time-zone changes (travel, DST rules) while running.
                 try:
                     now = time.time()
-                    wake = {'codex'} if self._codex_wake(cache, index, now) else set()
-                    # Checked every cycle: a switched account is noticed at once and
-                    # its predecessor's rows, plan labels, errors and backoff dropped.
+                    # Checked every cycle: a switched account is noticed and its
+                    # predecessor's rows, plan labels, errors and backoff dropped.
                     accounts = account_fingerprints(salt)
-                    cache = refresh(cache, now, force=forced, interval=interval,
-                                    relaxed={'codex': max(interval, CODEX_IDLE_INTERVAL)}, wake=wake,
-                                    accounts=accounts)
+                    cache = refresh(cache, now, force=forced, interval=interval, accounts=accounts)
                     save_json(self.state_dir / 'providers.json', cache)
                     index, available, _ok = self._scan(index)
                     now = time.time()
@@ -250,6 +232,7 @@ class ProviderWorker:
                        'error': 'Sweetmeter stopped reading usage data. Quit and reopen Sweetmeter.'})
         finally:
             self.ready.set()
+            close_codex()
             if index is not None:
                 index.db.close()
 
@@ -484,6 +467,16 @@ class Application:
                                ' passed boot checks. Dashboard connection/refresh is still pending.'})
             result.append(event)
         return result
+
+    @property
+    def bluetooth_failed(self):
+        """True once the Bluetooth worker failed to start or stopped for good
+        (every bounded restart used up)."""
+        if self.preview_only or self.closing:
+            return False
+        if self.radio is None:
+            return self.restart_at is None and self.restarts >= BLUETOOTH_RESTARTS
+        return bool(getattr(self.radio, 'startup_error', None))
 
     def forget_meter(self):
         """Stop using the paired meter. The Bluetooth worker confirms with

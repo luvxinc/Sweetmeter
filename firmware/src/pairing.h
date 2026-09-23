@@ -175,6 +175,21 @@ class Registry {
 
 struct AuthOutcome { uint8_t result; bool drop, changed; };  // aggregate (C++11 toolchain)
 
+// Trust on first use for a selection inherited from pre-secret firmware is
+// allowed only briefly: for ten minutes after each boot (an OTA install, a reset
+// or an owner's wake), and only for the first legacy hello that names the
+// stored computer. Afterwards the owner must pair again with the physical menu.
+class LegacyWindow {
+ public:
+  static constexpr uint32_t windowMs = 10u * 60u * 1000u;
+  // `now` is milliseconds since boot; call at least every few seconds so the
+  // window latches closed long before millis() could wrap.
+  bool open(uint32_t now) { if (now >= windowMs) closed_ = true; return !closed_; }
+  void consume() { closed_ = true; }
+ private:
+  bool closed_ = false;
+};
+
 // Authorization state of one BLE link. Each link gets exactly one hello
 // attempt against its fresh challenge; any rejection closes the link.
 class LinkAuth {
@@ -188,13 +203,17 @@ class LinkAuth {
 
   // Legacy `H` is only a migration path: the selected host from pre-secret
   // firmware proves its ID once and must immediately provision a secret (Y).
-  AuthOutcome legacyHello(const uint8_t *p, size_t n, const Registry &registry, bool menu, bool ota) {
+  // `window` is the LegacyWindow; a matching hello consumes it (see there).
+  AuthOutcome legacyHello(const uint8_t *p, size_t n, const Registry &registry, bool menu, bool ota,
+                          LegacyWindow &window, uint32_t now) {
     if (ota) return current();
     if (state == State::Authorized) return {helloOk, false, false};
     bool valid = n >= 37 && n <= 57 && hostId(p + 1, 36) && (n == 37 || hostName(p + 37, n - 37));
     const PairedComputer *selected = registry.current();
     if (state != State::Open || menu || !valid || !selected || selected->hasSecret || memcmp(selected->host, p + 1, 36))
       return reject();
+    if (!window.open(now)) return reject();
+    window.consume();
     state = State::Provisioning;
     return {helloProvision, false, false};
   }

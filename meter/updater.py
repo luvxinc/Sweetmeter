@@ -194,6 +194,10 @@ class UpdateService:
         self.prompted = set()
         self.checked_monotonic = None
         self.download_dir = None
+        # A firmware install started by holding the meter's rocker: its
+        # outcome is also shown on the meter (protocol `u` codes).
+        self.device_initiated = False
+        self.installing = None  # Kind of the install this process started last.
 
     def start(self):
         self.report_companion_result()
@@ -365,7 +369,7 @@ class UpdateService:
         self._notify_device(NOTICE_INSTALLING)
         try:
             # The meter's own OTA screen asks to keep USB power connected.
-            self.install(offer, usb_power=True)
+            self.install(offer, usb_power=True, device_initiated=True)
         except (ValueError, RuntimeError) as error:
             self._notify_device(NOTICE_FAILED)
             self.emit({'event': 'update_error', 'error': str(error)})
@@ -375,6 +379,14 @@ class UpdateService:
             self.radio.update_notice(code)
         except (AttributeError, ValueError):
             pass
+
+    def _firmware_failed(self):
+        """A firmware install ended without a verified result (caller holds
+        the lock): a rocker-hold install shows the failure on the meter."""
+        self.busy, self.awaiting_until = False, None
+        if self.device_initiated:
+            self.device_initiated = False
+            self._notify_device(NOTICE_FAILED)
 
     def _offers(self, manual=False, quiet=()):
         if self.manifest is None or self.busy:
@@ -410,6 +422,10 @@ class UpdateService:
             choice = self.state.get('choices', {}).get(kind, {})
             if not manual and (choice.get('skip') == offer.target or time.time() < choice.get('later', 0)):
                 continue
+            failed = self.state.get('failed')
+            if (not manual and kind == 'companion' and isinstance(failed, dict)
+                    and failed.get('kind') == 'companion' and failed.get('target') == offer.target):
+                continue  # Rolled back on this computer; only a manual check offers it again.
             if not manual and key in self.prompted:
                 continue
             self.prompted.add(key)
@@ -448,12 +464,13 @@ class UpdateService:
                     self.state['completed'] = {**pending, 'completed_at': time.time()}
                     self.state.pop('pending', None)
                     self.busy, self.awaiting_until = False, None
+                    self.device_initiated = False
                     self._save()
                     self.emit({'event': 'firmware_verified', 'version': target})
                 elif status.get('ota_target') == target and status.get('last_update') in ('rollback', 'failed'):
                     self.state['failed'] = {**pending, 'outcome': status['last_update']}
                     self.state.pop('pending', None)
-                    self.busy, self.awaiting_until = False, None
+                    self._firmware_failed()
                     self._save()
                     self.emit({'event': 'update_error', 'error': 'Device reported ' + status['last_update'] + '; current firmware ' + status.get('firmware', '--')})
                 elif not self.busy and not self._reconciled:
@@ -468,9 +485,21 @@ class UpdateService:
                 self.awaiting_until = time.monotonic() + 120
                 self.emit({'event': 'update_notice', 'message': 'Reconnecting and checking the installed firmware…'})
             elif kind == 'ota_error':
-                self.busy = False
-                self.state.pop('pending', None)
-                self._save()
+                # Includes code 'job_expired': the Bluetooth worker dropped the
+                # job (meter disconnected, another meter, or 60 s passed).
+                pending = self.state.get('pending')
+                firmware = pending and pending.get('kind') == 'firmware'
+                if not firmware and self.installing != 'firmware':
+                    return  # Not about a firmware install (never clears a companion update).
+                if firmware:
+                    if pending.get('phase') == 'commit':
+                        # The meter may already have switched images: keep the
+                        # target so its next status report reconciles it.
+                        self._reconciled = False
+                    else:
+                        self.state.pop('pending', None)
+                    self._save()
+                self._firmware_failed()
             elif kind == 'ota_progress' and event.get('cancellable') is False:
                 pending = self.state.get('pending')
                 if pending:
@@ -480,8 +509,7 @@ class UpdateService:
     def tick(self):
         with self.lock:
             if self.awaiting_until is not None and time.monotonic() >= self.awaiting_until:
-                self.awaiting_until = None
-                self.busy = False
+                self._firmware_failed()
                 self.emit({'event': 'update_unconfirmed', 'message': 'No verified boot result after 120 seconds. Pending target is saved; reconnect to check it.'})
 
     def confirm_companion_startup(self):
@@ -494,7 +522,7 @@ class UpdateService:
                 self._save()
                 self.emit({'event': 'update_notice', 'message': 'Companion ' + self.version + ' installed and startup verified.'})
 
-    def install(self, offer, *, usb_power=False):
+    def install(self, offer, *, usb_power=False, device_initiated=False):
         with self.lock:
             if self.busy or self.offers.get(offer.kind) != offer:
                 raise RuntimeError('Update offer expired or another update is running')
@@ -508,6 +536,8 @@ class UpdateService:
                 if self.device.get('battery_percent', -1) in range(0, 20):
                     raise RuntimeError('Battery is below 20%; charge before updating')
             self.busy = True
+            self.installing = offer.kind
+            self.device_initiated = bool(device_initiated) and offer.kind == 'firmware'
             self.cancel_download.clear()
         threading.Thread(target=self._install, args=(offer, usb_power), name='sweetmeter-install', daemon=True).start()
 
@@ -542,8 +572,10 @@ class UpdateService:
                                              'device_id': self.device_id, 'previous': offer.current,
                                              'phase': 'transfer', 'started_at': time.time()}
                     self._save()
+                    # The Bluetooth worker runs the job only on this meter.
                     self.radio.install_firmware(image_path=image, envelope=envelope,
-                                                companion_version=self.version, usb_power=usb_power)
+                                                companion_version=self.version, usb_power=usb_power,
+                                                device_id=self.device_id)
             else:
                 from .self_update import stage_update
                 staged = stage_update(image, artifact, self.state_dir,
@@ -573,7 +605,8 @@ class UpdateService:
                     self.state.pop('pending', None)
                 self._save()
             if offer.kind == 'firmware':
-                self._notify_device(NOTICE_FAILED)
+                with self.lock:
+                    self._firmware_failed()  # Shown on the meter for a rocker-hold install.
             self.emit({'event': 'update_error', 'error': str(error)[:200]})
 
     def cancel(self):

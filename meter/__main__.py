@@ -83,15 +83,37 @@ def _plain_failure(action, error):
 def _run_install():
     from .installation import install_current
     from .paths import data_dir
+    for name in ('install-error.txt', 'install-result.txt'):
+        try:
+            (data_dir() / name).unlink(missing_ok=True)
+        except OSError:
+            pass
     try:
-        (data_dir() / 'install-error.txt').unlink(missing_ok=True)
-    except OSError:
-        pass
+        # A copy that cannot import its own runtime must not install itself
+        # (and an installed copy that fails here is replaced by the installer).
+        self_test()
+    except Exception as error:  # noqa: BLE001 - reported as one plain line
+        return _plain_failure('setup', RuntimeError('this Sweetmeter copy failed its self-test ('
+                                                    + type(error).__name__ + ')'))
     try:
-        install_current(start_at_login=True)
+        # None keeps a recorded "Start at login" choice; new installs start at login.
+        install_current(start_at_login=None, report=_report)
     except (OSError, ValueError, RuntimeError) as error:
         return _plain_failure('setup', error)
     return 0
+
+
+def _report(message):
+    """Truthful one-line setup outcome for the installer (stdout and a file,
+    since a windowed Windows app has no console)."""
+    from .paths import data_dir
+    if sys.stdout is not None:
+        print(message)
+    try:
+        data_dir().mkdir(parents=True, exist_ok=True)
+        (data_dir() / 'install-result.txt').write_text(message + '\n', encoding='utf-8')
+    except OSError:
+        pass
 
 
 def main(argv=None):
@@ -162,7 +184,9 @@ def main(argv=None):
 
         def notify(message):
             app.events.put({'event': 'update_notice', 'message': message})
-        confirm_update_health(get_version(), radio=app.radio, notify=notify,
+        # Follow app.radio: a Bluetooth worker restarted meanwhile is a new object.
+        confirm_update_health(get_version(), radio=(lambda: app.radio) if app.radio else None,
+                              radio_failed=lambda: app.bluetooth_failed, notify=notify,
                               on_confirmed=app.updates.confirm_companion_startup if app.updates else None)
         if gui:
             gui.run()

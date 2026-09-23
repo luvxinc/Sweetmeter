@@ -118,9 +118,13 @@ For a **preflashed Sweetmeter**, run the matching command once as your normal
 desktop user. No Espressif client, Git checkout, pip commands or separate Python
 installation is needed. The installer selects the latest stable native release,
 verifies its signed manifest and package hash, installs for your user, registers
-login startup and opens Sweetmeter. Repeating it opens your existing installation
-without overwriting it and re-registers login startup if that went missing;
-subsequent updates remain **Install / Later / Skip**.
+login startup and opens Sweetmeter. Running it again over an existing
+installation is safe and says what it did: a current, healthy copy (it passes
+its own offline self-test) is kept and only its login startup is repaired; an
+older, damaged or failing copy is replaced with the verified latest release in
+one atomic swap (an interrupted swap is rolled back at the next login). Without
+Internet access it checks and repairs the installed copy instead. A "Start at
+login" choice you turned off stays off. Later updates remain **Install / Later / Skip**.
 
 **macOS / Ubuntu desktop — paste into Terminal:**
 
@@ -216,8 +220,11 @@ installs the pinned `requirements.txt` there (the only dependency install),
 runs the offline self-test and registers login startup. Running it again
 reuses those dependencies and only runs pip when `requirements.txt` or the
 Python interpreter changed. A development `.venv` for running the tests is
-separate and not needed to install. `--no-startup` installs without registering
-login startup. `--remove-startup` removes Sweetmeter's current startup entry.
+separate and not needed to install. `--no-startup` installs without login
+startup (and removes an entry an earlier install created); `--remove-startup`
+removes Sweetmeter's current startup entry. Both choices are remembered, so a
+later repair does not recreate the entry. In the app, the **Start at login**
+checkbox turns login startup on or off at any time.
 Source installs receive update notices and verified manual packages; the app
 never pretends to automatically replace an arbitrary source checkout.
 
@@ -252,8 +259,14 @@ and caches (otherwise they are kept for a later reinstall).
 | Source install | `python3 scripts/install_agent.py --uninstall` |
 
 On macOS use `/Applications/Sweetmeter.app/...` if that is where the app is.
-Only Sweetmeter's own managed locations and files are removed. After an
-uninstall, select another computer on the meter or leave it asleep.
+Only Sweetmeter's own managed locations and files are removed. Every way of
+uninstalling (the app's **Uninstall…** button, the commands above and Windows
+Settings > Apps) waits for no update to be in progress: while a companion
+update is being swapped in, it stops with a plain message instead. The app is
+first moved aside in one step and only then deleted, so a failed uninstall
+never leaves a half-deleted app behind (the app and its login item are put
+back and nothing is deleted). After an uninstall, select another computer on
+the meter or leave it asleep.
 
 ## Updates and release notes
 
@@ -273,9 +286,13 @@ Managed companion updates use a temporary helper outside the application. It
 waits for the current app to exit, swaps in the verified native package, and
 restores the previous app if the new process does not confirm healthy startup.
 If Bluetooth worked before the update, the new version must also reach
-Bluetooth (being switched off is fine); if macOS withholds the Bluetooth
-permission, the previous version is kept and Sweetmeter explains how to allow
-it before retrying. After a confirmed update the recovery launcher is refreshed
+Bluetooth (being switched off is fine). While the system's Bluetooth permission
+prompt is still open, Sweetmeter waits (about two and a half minutes) and
+reminds you to allow it; an unanswered prompt does not undo the update. Only a
+denied permission or a Bluetooth service that fails to start keeps the previous
+version, and Sweetmeter explains how to allow it before retrying. A version
+that was rolled back is not offered again automatically; **Check updates**
+still shows it. After a confirmed update the recovery launcher is refreshed
 from the new version.
 For source or unwritable installs, the UI offers the verified extracted package
 for manual installation. Installed login startup uses a separate recovery

@@ -2,7 +2,6 @@
   "repository": "OWNER/REPOSITORY",
   "actor": "OWNER",
   "credential_file": "/absolute/private/path/to/github-admin-token",
-  "ssh_key": "/absolute/private/path/to/dedicated-vm-key",
   "golden": "sweetmeter-ci-golden",
   "work": "sweetmeter-ci-work",
   "guest_user": "admin",

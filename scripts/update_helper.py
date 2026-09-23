@@ -4,6 +4,7 @@ Modes: `<plan.json>` applies a staged update, `--launch [app args]` is the login
 launcher (recovery first), `--uninstall [...]` removes Sweetmeter. Failures are
 written to a small log instead of an unhandled-exception dialog.
 """
+import os
 import sys
 
 
@@ -20,6 +21,9 @@ def _cap_launchd_output():
 
 
 def main(argv):
+    # Journals, logs, launcher copies and staging written by the helper,
+    # launcher or uninstaller are private to this user.
+    os.umask(0o077)
     from meter.self_update import apply_update, helper_log, launch_installed
     try:
         if argv[:1] == ['--launch']:

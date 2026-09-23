@@ -1,4 +1,5 @@
 """Entry point: logging, self-test backend, plain setup errors, helper modes."""
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import importlib
 import io
 import logging
@@ -103,6 +104,27 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(entry.main(['--install']), 0)
         self.assertEqual(seen, [0o077])
 
+    def test_copy_that_fails_its_self_test_never_installs_itself(self):
+        error = io.StringIO()
+        with patch.object(entry, 'self_test', side_effect=ImportError('bleak backend missing')), \
+                patch('meter.installation.install_current') as install, patch.object(sys, 'stderr', error):
+            self.assertEqual(entry.main(['--install']), 2)
+        install.assert_not_called()
+        self.assertIn('failed its self-test', error.getvalue())
+        self.assertNotIn('Traceback', error.getvalue())
+
+    def test_install_outcome_is_reported_for_the_installer(self):
+        from meter.paths import data_dir
+        def install(start_at_login, report):
+            self.assertIsNone(start_at_login)  # Keeps a recorded "Start at login" choice.
+            report('Updated Sweetmeter 2026.9.1 to 2026.9.2.')
+        output = io.StringIO()
+        with patch.object(entry, 'self_test'), patch('meter.installation.install_current', side_effect=install), \
+                patch.object(sys, 'stdout', output):
+            self.assertEqual(entry.main(['--install']), 0)
+        self.assertEqual(output.getvalue(), 'Updated Sweetmeter 2026.9.1 to 2026.9.2.\n')
+        self.assertEqual((data_dir() / 'install-result.txt').read_text(), 'Updated Sweetmeter 2026.9.1 to 2026.9.2.\n')
+
     def test_uninstall_flags_are_forwarded(self):
         with patch('meter.installation.uninstall_main', return_value=0) as uninstall:
             self.assertEqual(entry.main(['--uninstall', '--remove-data']), 0)
@@ -134,14 +156,49 @@ class HelperTests(unittest.TestCase):
         self.assertIn('boom', log.call_args.args[0])
 
     def test_modes(self):
-        with patch('meter.self_update.launch_installed', return_value=0) as launch:
+        with patch('meter.self_update.launch_installed', return_value=0) as launch, \
+                patch.object(self.helper, '_cap_launchd_output') as cap:
             self.assertEqual(self.helper.main(['--launch', '--background']), 0)
         launch.assert_called_once_with(['--background'])
+        cap.assert_called_once()
         with patch('meter.installation.uninstall_main', return_value=0) as uninstall:
             self.assertEqual(self.helper.main(['--uninstall', '--remove-data']), 0)
         uninstall.assert_called_once_with(['--remove-data'])
         with patch('meter.self_update.helper_log'):
             self.assertEqual(self.helper.main([]), 2)
+
+    def test_launcher_output_cap_only_touches_the_sandboxed_state(self):
+        import isolation
+        from meter.paths import default_state_dir
+        state = default_state_dir()
+        self.assertTrue(os.path.realpath(state).startswith(os.path.realpath(isolation.SANDBOX)))
+        state.mkdir(parents=True, exist_ok=True)
+        log = state / 'launcher-output.log'
+        log.write_bytes(b'x' * (1024 * 1024 + 1))
+        self.helper._cap_launchd_output()
+        self.assertEqual(log.stat().st_size, 0)
+        log.write_bytes(b'small')
+        self.helper._cap_launchd_output()
+        self.assertEqual(log.read_bytes(), b'small')
+
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX permission mask')
+    def test_helper_launcher_and_uninstaller_use_a_private_umask(self):
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        seen = []
+
+        def record(*args, **kwargs):
+            current = os.umask(0)
+            os.umask(current)
+            seen.append(current)
+            return 0
+        for argv, target in ((['--launch'], 'meter.self_update.launch_installed'),
+                             (['--uninstall'], 'meter.installation.uninstall_main'),
+                             (['/plan.json'], 'meter.self_update.apply_update')):
+            os.umask(0o022)
+            with patch(target, side_effect=record), patch.object(self.helper, '_cap_launchd_output'):
+                self.helper.main(argv)
+        self.assertEqual(seen, [0o077] * 3)
 
 
 if __name__ == '__main__':

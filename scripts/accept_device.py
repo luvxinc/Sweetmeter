@@ -25,8 +25,9 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from meter.bluetooth import (HELLO_PROVISION, HOST_PATTERN, STATUS_UUID, PairingStore, Session,
-                             device_key, parse_status)
+from meter.bluetooth import (HOST_PATTERN, STATUS_UUID, PairingRejected, PairingStore, Session,
+                             authorize_link, parse_status)
+from meter.instance_lock import InstanceLock
 from meter.ota import OTATransfer
 from meter.protocol import (
     BOARD_ID, FirmwareMetadata, OTAError, OTAState, OTAStatus,
@@ -90,6 +91,19 @@ def identity(state_dir: Path) -> str:
     if not isinstance(host, str) or not HOST_PATTERN.fullmatch(host):
         raise AcceptanceError("Use an existing companion state directory with a valid selected host ID.")
     return host
+
+
+def companion_lock(state_dir: Path):
+    """Hold the companion's own instance lock: proves it is stopped and keeps it so.
+
+    The harness reads and, after a legacy-to-pairing upgrade, updates that
+    companion's pairing state exactly as the companion would, so the state
+    directory must belong to a companion that is not running.
+    """
+    try:
+        return InstanceLock(private_path(state_dir) / "meter.lock")
+    except OSError as exc:
+        raise AcceptanceError("The companion using --state-dir is still running; quit it before acceptance.") from exc
 
 
 def safe_status(status: dict) -> dict:
@@ -281,29 +295,42 @@ class Connection:
         self.state_dir = state_dir
         self.client = self.session = None
 
-    async def open(self):
+    async def connect(self) -> dict:
+        """Connect and read status; never selects or registers a host."""
         from bleak import BleakClient
         self.client = BleakClient(self.device, timeout=15)
         await asyncio.wait_for(self.client.connect(), 20)
         status = await self.status()
         if not selected_by(status, self.host):
             raise AcceptanceError("Device selection changed; refusing to select or register a host.")
+        return status
+
+    async def authorize(self, status: dict, *, allow_migration=False) -> str:
+        """Authorize this link as the stopped companion would, with its own state.
+
+        Only the companion's pairing logic (``authorize_link``) and its
+        PairingStore in --state-dir are used. The legacy H/Y migration, which
+        stores a fresh secret, is allowed only after the scenario's upgrade
+        from pre-secret firmware (``allow_migration``).
+        """
         self.session = Session(self.client, self.host, "Acceptance", self.record_event,
                                protocol=status["protocol"])
         await self.session.subscribe()
         if status.get("auth") != 1:
             await self.session.hello()
-            return status
-        # Reuse the companion's own pairing secret; never pair or provision a new one here.
+            return "legacy"
+        if not status.get("secured") and not allow_migration:
+            raise AcceptanceError("Let the companion finish pairing this meter before acceptance.")
         store = PairingStore(private_path(self.state_dir))
         address = getattr(self.device, "address", str(self.device))
-        secret = store.secret(device_key(address, status))
-        if status.get("secured") and secret is not None:
-            await self.session.authenticate(secret, status["challenge"], status["serial"])
-        elif not status.get("secured") and await self.session.hello() == HELLO_PROVISION:
-            raise AcceptanceError("Let the companion finish pairing this meter before acceptance.")
-        else:
-            raise AcceptanceError("This companion holds no pairing secret for the selected meter.")
+        try:
+            return await authorize_link(self.session, store, address, status)
+        except PairingRejected as exc:
+            raise AcceptanceError("The selected meter did not accept this companion's pairing state.") from exc
+
+    async def open(self):
+        status = await self.connect()
+        await self.authorize(status)
         return status
 
     def record_event(self, event):
@@ -350,11 +377,16 @@ async def reconnect_result(args, host, target, report):
     while asyncio.get_running_loop().time() < deadline:
         link = Connection(args.device, host, report, args.state_dir)
         try:
-            status = await link.open()
+            # The postcondition is proven by the status read itself: a legacy
+            # meter upgraded to pairing firmware still needs its secret, which
+            # is provisioned only afterwards, exactly as the companion would.
+            status = await link.connect()
             last = safe_status(status)
             if postcondition(status, host=host, running=args.expected_running_version,
                              target=target, scenario=args.scenario):
                 report.event("confirmed_boot", status=last)
+                method = await link.authorize(status, allow_migration=args.scenario == "upgrade")
+                report.event("authorized_after_boot", method=method)
                 return
         except (OSError, TimeoutError, ConnectionError):
             pass
@@ -500,7 +532,11 @@ def main(argv=None):
             }
         report.data["preflight_passed"] = True
         if args.execute:
-            asyncio.run(exercise(args, candidate, host, report))
+            lock = companion_lock(args.state_dir)
+            try:
+                asyncio.run(exercise(args, candidate, host, report))
+            finally:
+                lock.close()
         else:
             report.event("offline_only", note="No BLE/USB/account access performed; hardware acceptance remains untested.")
         return_code = 0

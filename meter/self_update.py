@@ -31,13 +31,18 @@ HELPER_NAME = 'sweetmeter-update-helper' + ('.exe' if sys.platform == 'win32' el
 LAUNCHER_NAME = 'sweetmeter-launcher' + ('.exe' if sys.platform == 'win32' else '')
 # Windows: never give a background process a console window.
 CREATE_NO_WINDOW = 0x08000000
-UPDATE_ENVIRONMENT = ('SWEETMETER_UPDATE_HEALTH', 'SWEETMETER_UPDATE_NONCE', 'SWEETMETER_UPDATE_BLUETOOTH')
+UPDATE_ENVIRONMENT = ('SWEETMETER_UPDATE_HEALTH', 'SWEETMETER_UPDATE_NONCE', 'SWEETMETER_UPDATE_BLUETOOTH',
+                      'SWEETMETER_UPDATE_DEADLINE')
 # Forwarded explicitly on macOS, where LaunchServices does not inherit our environment.
 FORWARDED_ENVIRONMENT = ('PATH', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'SWEETMETER_CODEX_PATH',
                          'CLAUDE_SECURESTORAGE_CONFIG_DIR', 'PYINSTALLER_RESET_ENVIRONMENT',
                          *UPDATE_ENVIRONMENT)
-BLUETOOTH_HEALTH_TIMEOUT = 90
-HEALTH_TIMEOUT = 150
+# Without a deadline from the helper (older helpers allow 150 s after start).
+BLUETOOTH_HEALTH_TIMEOUT = 110
+# Time the helper gives an updated app to confirm its health, and its cap. It
+# covers a macOS Bluetooth permission prompt the user answers slowly.
+HEALTH_TIMEOUT = 180
+HEALTH_TIMEOUT_CAP = 300
 HELPER_LOG_LIMIT = 256 * 1024
 
 
@@ -298,6 +303,11 @@ def _serialized(function):
 @_serialized
 def recover_update():
     """Stable external launcher calls this before the managed app can start."""
+    return recover_update_locked()
+
+
+def recover_update_locked():
+    """recover_update for a caller that already holds `_update_lock()`."""
     journal = data_dir() / 'companion-swap.json'
     if not journal.is_file():
         return False
@@ -329,6 +339,10 @@ def _recover_stopped(record, root, incoming, backup, journal):
                {'status': 'success', 'version': record['version']})
     else:
         if backup.exists():
+            if root.exists() and tree_pids(root):
+                # The new app hung before taking its instance lock: never
+                # delete a tree a process is still running from.
+                raise RuntimeError('Quit the running Sweetmeter before recovering its interrupted update')
             _rmtree(root)
             _retry(lambda: backup.rename(root))
             _sync_dir(root.parent)
@@ -359,6 +373,25 @@ def startup_environment():
             if key in PROFILE_ENV and isinstance(value, str) and '\0' not in value}
 
 
+def _app_running(arguments):
+    """True while a companion holds the instance lock of the state folder the
+    launcher would start it with."""
+    from .instance_lock import InstanceLock
+    from .paths import default_state_dir
+    arguments = list(arguments)
+    state = default_state_dir()
+    if '--state-dir' in arguments[:-1]:
+        state = Path(arguments[arguments.index('--state-dir') + 1])
+    lock = state / 'meter.lock'
+    if not lock.is_file():
+        return False
+    try:
+        InstanceLock(lock).close()
+    except OSError:
+        return True
+    return False
+
+
 def launch_installed(arguments=()):
     """Login launcher: finish or roll back an interrupted swap, then start the app."""
     try:
@@ -372,6 +405,10 @@ def launch_installed(arguments=()):
     if not Path(app_command(root)[0]).is_file():
         helper_log('Launcher cannot find the installed app at ' + str(root))
         return 1
+    if _app_running(arguments):
+        # E.g. the login item was reloaded after a repair: never start a
+        # second copy (it would only exit again).
+        return 0
     extra = {key: value for key, value in startup_environment().items() if key not in os.environ}
     process = start_app(root, arguments, extra_env=extra, background='--background' in arguments)
     if sys.platform == 'win32':
@@ -709,18 +746,42 @@ def cleanup_staging(state_dir, *, keep=()):
 
 
 BLUETOOTH_ACCEPTED = ('ok', 'off')
+# While macOS shows its Bluetooth permission prompt the radio reports no state
+# (health None). After this long without one, the user is asked to answer it.
+BLUETOOTH_PROMPT_NOTICE_AFTER = 10
+# The watcher must answer before the helper gives up. A helper that passes
+# SWEETMETER_UPDATE_DEADLINE says exactly when; older helpers allow 150 s from
+# the app's start, so the watcher then keeps a safe margin below that.
+BLUETOOTH_DEADLINE_MARGIN = 15
+
+
+def _health_timeout(default):
+    try:
+        deadline = float(os.environ.get('SWEETMETER_UPDATE_DEADLINE', ''))
+    except ValueError:
+        return default
+    remaining = deadline - time.time() - BLUETOOTH_DEADLINE_MARGIN
+    return max(5.0, min(remaining, float(HEALTH_TIMEOUT_CAP)))
 
 
 def confirm_update_health(version, *, radio=None, on_confirmed=None, notify=None,
-                          timeout=BLUETOOTH_HEALTH_TIMEOUT, interval=1.0):
+                          timeout=None, interval=1.0, radio_failed=None):
     """Report startup health to the update helper without blocking the UI.
 
     Called after local startup checks passed. When the helper says the
     previous version had working Bluetooth, the receipt is written only after
     this version's radio also works: an ad-hoc re-signed macOS app can lose
     its Bluetooth permission, and keeping the backup lets the helper restore a
-    version that works. Bluetooth that is merely switched off is accepted, so
-    it cannot cause a rollback. Returns the watcher thread, if any.
+    version that works.
+
+    `radio` is the radio or a callable returning the current one (the app
+    replaces its radio when Bluetooth is restarted). Bluetooth that is on or
+    switched off confirms. No state yet (None, e.g. while the macOS permission
+    prompt is open) is waiting: the user is reminded after a few seconds, and
+    if nothing is known by the deadline the update is kept. Only a denied
+    permission ('unauthorized') still present at the deadline, or a radio that
+    failed to start (`radio_failed()` / its startup_error), rolls back.
+    Returns the watcher thread, if any.
     """
     marker = os.environ.get('SWEETMETER_UPDATE_HEALTH')
     nonce = os.environ.get('SWEETMETER_UPDATE_NONCE')
@@ -744,28 +805,57 @@ def confirm_update_health(version, *, radio=None, on_confirmed=None, notify=None
     if os.environ.get('SWEETMETER_UPDATE_BLUETOOTH') != 'ok' or radio is None:
         confirm()
         return None
+    # A radio object has `health`; anything else callable returns the current radio.
+    current = radio if callable(radio) and not hasattr(radio, 'health') else (lambda: radio)
+    limit = _health_timeout(BLUETOOTH_HEALTH_TIMEOUT) if timeout is None else timeout
+
+    def failed(device):
+        if radio_failed is not None:
+            try:
+                return bool(radio_failed())
+            except Exception:  # noqa: BLE001 - a probe must not kill the watcher
+                return False
+        return bool(getattr(device, 'startup_error', None))
 
     def watch():
-        deadline = time.monotonic() + timeout
-        health, told = None, False
+        started = time.monotonic()
+        deadline = started + limit
+        health, broken, told = None, False, set()
         while time.monotonic() < deadline:
-            health = getattr(radio, 'health', None)
+            device = current()
+            health = getattr(device, 'health', None) if device is not None else None
             if health in BLUETOOTH_ACCEPTED:
                 confirm()
                 return
-            if health == 'unauthorized' and notify and not told:
-                told = True
+            broken = failed(device)
+            if broken:
+                break
+            if notify and health == 'unauthorized' and 'unauthorized' not in told:
+                told.add('unauthorized')
                 notify('Allow Bluetooth for Sweetmeter to finish the update. If you do not, '
                        'the previous version is restored automatically.')
+            elif (notify and health is None and not told
+                  and time.monotonic() - started >= BLUETOOTH_PROMPT_NOTICE_AFTER):
+                told.add('waiting')
+                notify('Allow Bluetooth for Sweetmeter to finish the update. If macOS or '
+                       'Windows asks for Bluetooth access, choose Allow.')
             time.sleep(interval)
-        if health == 'unauthorized':
+        if broken:
+            reason = 'Bluetooth did not start in the updated app. The previous version was kept.'
+        elif health == 'unauthorized':
             reason = ('Bluetooth permission is not available to the updated app. The previous '
                       'version was kept. Allow Sweetmeter in System Settings > Privacy & Security > '
                       'Bluetooth, then install the update again.')
         else:
-            reason = 'Bluetooth did not start in the updated app (' + str(health) + '). The previous version was kept.'
+            # Still waiting for an answer (or a transient adapter problem):
+            # nothing proves the new version is broken, so it is kept.
+            logging.info('Update kept: Bluetooth state still %s at the health deadline',
+                         health or 'unknown')
+            confirm()
+            return
         logging.error('Update health check failed: %s', reason)
-        _write(folder / 'unhealthy.json', dict(identity, reason=reason, bluetooth=health))
+        _write(folder / 'unhealthy.json', dict(identity, reason=reason,
+                                               bluetooth=health or ('failed' if broken else 'unknown')))
 
     thread = threading.Thread(target=watch, name='sweetmeter-update-health', daemon=True)
     thread.start()
@@ -851,6 +941,130 @@ def _refresh_launcher(root):
         helper_log('Launcher refresh failed: ' + type(error).__name__)
 
 
+def tree_pids(root):
+    """PIDs of processes whose executable lives inside `root` (never this one).
+
+    Used so a rollback or uninstall never deletes a tree that a started app,
+    even one that hangs before reporting its PID, is still running from."""
+    root = Path(root)
+    prefixes = {str(root.absolute()) + os.sep}
+    try:
+        prefixes.add(str(root.resolve()) + os.sep)
+    except OSError:
+        pass
+    pids = set()
+    if sys.platform == 'win32':
+        return pids  # Windows refuses to rename or delete a running executable.
+    if sys.platform.startswith('linux'):
+        try:
+            entries = list(Path('/proc').iterdir())
+        except OSError:
+            return pids
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                executable = os.readlink(entry / 'exe')
+            except OSError:
+                continue
+            if any(executable.startswith(prefix) for prefix in prefixes):
+                pids.add(int(entry.name))
+    else:
+        try:
+            result = subprocess.run(['/bin/ps', '-axww', '-o', 'pid=,comm='], capture_output=True,
+                                    text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return pids
+        for line in str(result.stdout or '').splitlines():
+            number, _, command = line.strip().partition(' ')
+            if number.isdigit() and any(command.strip().startswith(prefix) for prefix in prefixes):
+                pids.add(int(number))
+    pids.discard(os.getpid())
+    return pids
+
+
+class TreeSwap:
+    """Journaled replacement of the managed application tree.
+
+    The same durable stages as a companion update (`prepared`, `old_moved`,
+    `new_installed`, `confirmed`) are recorded in companion-swap.json, so the
+    login launcher (`recover_update`) finishes or rolls back an interrupted
+    swap. The caller must hold `_update_lock()` and must have stopped the app.
+    """
+
+    def __init__(self, root, *, nonce, state_dir, version):
+        self.root = Path(root)
+        self.incoming = self.root.with_name(self.root.name + '.incoming-' + nonce[:12])
+        self.backup = self.root.with_name(self.root.name + '.previous-' + nonce[:12])
+        self.journal = data_dir() / 'companion-swap.json'
+        self.recovery = dict(schema=1, root=str(self.root), nonce=nonce, state_dir=str(state_dir),
+                             version=version, stage='prepared')
+        self.moved = self.replaced = self.journaled = False
+
+    def prepare(self, candidate, *, strip_marks=False):
+        """Copy a validated candidate next to the root (same filesystem)."""
+        if self.incoming.exists() or self.backup.exists():
+            raise ValueError('Replacement paths already exist')
+        if self.journal.exists():
+            raise RuntimeError('Another update recovery journal is already present')
+        validate_tree(candidate)
+        self.root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(candidate, self.incoming, symlinks=True)
+        if strip_marks:
+            strip_download_marks(self.incoming)
+        for item in self.incoming.rglob('*'):
+            if item.is_file() and not item.is_symlink():
+                # Windows CRT _commit (os.fsync) requires a writable handle.
+                # r+b preserves the bytes while allowing durable flush there.
+                with item.open('r+b') as source:
+                    os.fsync(source.fileno())
+
+    def _stage(self, stage):
+        self.recovery['stage'] = stage
+        _write(self.journal, self.recovery)
+
+    def swap(self):
+        _write(self.journal, self.recovery)
+        self.journaled = True
+        # Antivirus, indexers or Explorer can briefly lock a file in the old app.
+        _retry(lambda: self.root.rename(self.backup))
+        self.moved = True
+        _sync_dir(self.root.parent)
+        self._stage('old_moved')
+        _retry(lambda: self.incoming.rename(self.root))
+        _sync_dir(self.root.parent)
+        self.replaced = True
+        self._stage('new_installed')
+
+    def confirm(self):
+        self._stage('confirmed')
+        try:
+            _rmtree(self.backup)
+        except OSError:
+            pass  # The launcher finishes cleanup at the next start.
+        if not self.backup.exists():
+            self.journal.unlink()
+            _sync_dir(self.journal.parent)
+
+    def rollback(self):
+        """Put the previous tree back; True when it is at the root again.
+        Never deletes a new tree that still has a running process."""
+        if self.replaced and tree_pids(self.root):
+            helper_log('Updated app is still running; the previous version is restored at the next login')
+            return False
+        restored = _restore_previous(self.root, self.backup, self.moved, self.replaced)
+        if self.journaled and restored:
+            self.journal.unlink(missing_ok=True)
+            _sync_dir(self.journal.parent)
+        return restored
+
+    def cleanup(self):
+        try:
+            _rmtree(self.incoming)
+        except OSError:
+            pass
+
+
 @_serialized
 def apply_update(plan_path):
     """Detached helper entry; replace only the managed per-user install target."""
@@ -873,64 +1087,31 @@ def apply_update(plan_path):
         time.sleep(.2)
     # From here on the previous app has exited: every failure must restart it.
     # Copy before renaming so replacement stays on the same filesystem.
-    incoming = root.with_name(root.name + '.incoming-' + plan['nonce'][:12])
-    backup = root.with_name(root.name + '.previous-' + plan['nonce'][:12])
     health = plan_path.parent / 'healthy.json'
     unhealthy = plan_path.parent / 'unhealthy.json'
     started = plan_path.parent / 'started.json'
     outcome = Path(plan['state_dir']) / 'companion-update-result.json'
-    journal = data_dir() / 'companion-swap.json'
-    recovery = dict(schema=1, root=str(root), nonce=plan['nonce'],
-                    state_dir=plan['state_dir'], version=plan['version'], stage='prepared')
+    swap = TreeSwap(root, nonce=plan['nonce'], state_dir=plan['state_dir'], version=plan['version'])
     process = None
-    moved = replaced = journaled = False
     try:
-        if incoming.exists() or backup.exists():
-            raise ValueError('Replacement paths already exist')
-        if journal.exists():
-            raise RuntimeError('Another update recovery journal is already present')
-        validate_tree(candidate)
-        shutil.copytree(candidate, incoming, symlinks=True)
-        for item in incoming.rglob('*'):
-            if item.is_file() and not item.is_symlink():
-                # Windows CRT _commit (os.fsync) requires a writable handle.
-                # r+b preserves the bytes while allowing durable flush there.
-                with item.open('r+b') as source:
-                    os.fsync(source.fileno())
-        _write(journal, recovery)
-        journaled = True
-        # Antivirus, indexers or Explorer can briefly lock a file in the old app.
-        _retry(lambda: root.rename(backup))
-        moved = True
-        _sync_dir(root.parent)
-        recovery['stage'] = 'old_moved'
-        _write(journal, recovery)
-        _retry(lambda: incoming.rename(root))
-        _sync_dir(root.parent)
-        replaced = True
-        recovery['stage'] = 'new_installed'
-        _write(journal, recovery)
-        extra = {'SWEETMETER_UPDATE_HEALTH': str(health), 'SWEETMETER_UPDATE_NONCE': plan['nonce']}
+        swap.prepare(candidate)
+        swap.swap()
+        wait = min(HEALTH_TIMEOUT_CAP, max(10, int(plan['health_timeout'])))
+        extra = {'SWEETMETER_UPDATE_HEALTH': str(health), 'SWEETMETER_UPDATE_NONCE': plan['nonce'],
+                 # Wall-clock time by which the app must have answered.
+                 'SWEETMETER_UPDATE_DEADLINE': '%.3f' % (time.time() + wait)}
         if isinstance(plan.get('bluetooth_baseline'), str):
             extra['SWEETMETER_UPDATE_BLUETOOTH'] = plan['bluetooth_baseline']
         process = start_app(root, ['--state-dir', plan['state_dir']], extra_env=extra, wait=True)
-        deadline = time.monotonic() + min(180, max(10, int(plan['health_timeout'])))
+        deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
             value = _receipt(health, plan)
             running = process.poll() is None
             same = value.get('pid') == process.pid if sys.platform != 'darwin' else _alive(value.get('pid'))
             if value.get('version') == plan['version'] and same and running:
-                recovery['stage'] = 'confirmed'
-                _write(journal, recovery)
+                swap.confirm()
                 _write(outcome, {'status': 'success', 'version': plan['version']})
                 _refresh_launcher(root)
-                try:
-                    _rmtree(backup)
-                except OSError:
-                    pass  # The launcher finishes cleanup at the next start.
-                if not backup.exists():
-                    journal.unlink()
-                    _sync_dir(journal.parent)
                 return
             failure = _receipt(unhealthy, plan)
             if failure:
@@ -940,8 +1121,8 @@ def apply_update(plan_path):
             time.sleep(.2)
         raise RuntimeError('Updated app did not confirm startup health')
     except BaseException as error:
-        _stop_candidate(process, [started, health, unhealthy], plan)
-        restored = _restore_previous(root, backup, moved, replaced)
+        _stop_candidate(process, [started, health, unhealthy], plan, root if swap.replaced else None)
+        restored = swap.rollback()
         if restored and Path(app_command(root)[0]).is_file():
             try:
                 start_app(root, ['--state-dir', plan['state_dir']])
@@ -949,21 +1130,20 @@ def apply_update(plan_path):
                 helper_log('Could not restart the previous app: ' + type(launch_error).__name__)
         reason = str(error) if restored else (str(error) + '. Recovery finishes at the next login.')
         _write(outcome, {'status': 'rollback', 'version': plan['version'], 'reason': reason[:600]})
-        if journaled and restored:
-            journal.unlink(missing_ok=True)
-            _sync_dir(journal.parent)
         raise
     finally:
-        try:
-            _rmtree(incoming)
-        except OSError:
-            pass
+        swap.cleanup()
 
 
-def _stop_candidate(process, receipts, plan):
+def _stop_candidate(process, receipts, plan, root=None):
+    """Stop the updated app: the PIDs it reported, the started process and,
+    because a macOS app started through `open` has another PID and can hang
+    before reporting it, every process running from the new tree."""
     pids = {value['pid'] for value in (_receipt(path, plan) for path in receipts) if value}
     if process is not None and sys.platform != 'darwin':
         pids.add(process.pid)
+    if process is not None and root is not None:
+        pids |= tree_pids(root)
     for pid in pids:
         if pid != os.getpid():
             terminate_pid(pid)

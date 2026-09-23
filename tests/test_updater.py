@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import copy
 import hashlib
 import json
@@ -165,6 +166,78 @@ class UpdateTests(unittest.TestCase):
         self.assertIn('pending',self.service.state)
         self.assertFalse(self.service.busy)
         self.radio.install_firmware.assert_not_called()
+    def install_from_dialog(self):
+        self.check(); offer=self.service.offers['firmware']
+        class InlineThread:
+            def __init__(self,target,args,**kwargs): self.target,self.args=target,args
+            def start(self): self.target(*self.args)
+        with patch('meter.updater.threading.Thread',InlineThread): self.service.install(offer,usb_power=True)
+    def notices(self):
+        return [c.args[0] for c in self.radio.update_notice.call_args_list]
+    def test_firmware_job_names_the_meter_it_was_offered_for(self):
+        self.install_from_dialog()
+        self.assertEqual(self.radio.install_firmware.call_args.kwargs['device_id'],'device-one')
+    def test_expired_job_clears_busy_and_pending_and_tells_the_meter(self):
+        self.device_update()
+        self.assertTrue(self.service.busy)
+        self.assertEqual(self.service.state['pending']['phase'],'transfer')
+        self.service.transfer_event({'event':'ota_error','code':'job_expired',
+                                     'error':'The meter disconnected before the update started.'})
+        self.assertFalse(self.service.busy)
+        self.assertNotIn('pending',self.service.state)
+        self.assertNotIn('pending',json.loads((self.state/'updates.json').read_text()))
+        self.assertEqual(self.notices(),[3,4])  # Installing, then failed, on the meter's screen.
+        # Nothing is left blocking a new attempt.
+        self.service.transfer_event({'event':'ota_error','code':'job_expired','error':'again'})
+        self.assertEqual(self.notices(),[3,4])
+    def test_dialog_install_failure_is_not_shown_on_the_meter(self):
+        self.install_from_dialog()
+        self.service.transfer_event({'event':'ota_error','error':'Transfer failed'})
+        self.assertFalse(self.service.busy)
+        self.assertNotIn('pending',self.service.state)
+        self.radio.update_notice.assert_not_called()
+    def test_error_after_commit_keeps_target_for_reconciliation(self):
+        self.device_update()
+        self.service.transfer_event({'event':'ota_progress','cancellable':False})
+        self.service.transfer_event({'event':'ota_error','error':'Connection lost'})
+        self.assertFalse(self.service.busy)
+        self.assertEqual(self.service.state['pending']['phase'],'commit')
+        self.assertEqual(self.notices(),[3,4])
+    def test_unconfirmed_rocker_install_shows_failure_on_the_meter(self):
+        self.device_update()
+        self.service.transfer_event({'event':'ota_unconfirmed'})
+        self.assertEqual(self.notices(),[3])  # It may still boot fine: wait first.
+        self.service.awaiting_until=time.monotonic()-1; self.service.tick()
+        self.assertFalse(self.service.busy)
+        self.assertEqual(self.notices(),[3,4])
+        self.assertIn('pending',self.service.state)
+    def test_device_reported_rollback_after_rocker_install_is_shown(self):
+        self.device_update()
+        self.service.set_device({'protocol':4,'board':BOARD_ID,'firmware':'2026.9.1','boot_health':'valid',
+                                 'last_update':'rollback','ota_target':'2026.9.2'},True,'device-one')
+        self.assertEqual(self.notices(),[3,4])
+        self.assertEqual(self.service.state['failed']['outcome'],'rollback')
+    def test_verified_rocker_install_is_not_reported_as_failed(self):
+        self.device_update()
+        self.service.set_device({'protocol':4,'board':BOARD_ID,'firmware':'2026.9.2','boot_health':'valid',
+                                 'last_update':'success'},True,'device-one')
+        self.service.transfer_event({'event':'ota_error','error':'late stray error'})
+        self.assertEqual(self.notices(),[3])
+    def test_stray_ota_error_never_clears_a_companion_update(self):
+        self.check()
+        self.service.busy=True; self.service.installing='companion'
+        self.service.state['pending']={'kind':'companion','target':'2026.9.2'}
+        self.service.transfer_event({'event':'ota_error','code':'job_expired','error':'x'})
+        self.assertTrue(self.service.busy)
+        self.assertEqual(self.service.state['pending']['kind'],'companion')
+    def test_rolled_back_companion_version_is_not_offered_again_automatically(self):
+        self.service.state['failed']={'kind':'companion','target':'2026.9.2','outcome':'rollback'}
+        self.check()
+        self.assertIn('companion',self.service.offers)
+        self.assertFalse(any(e['event']=='update_offer' and e['offer'].kind=='companion' for e in self.events))
+        with patch('meter.updater.platform_id',return_value=('macos','arm64')):
+            self.service.check_now(manual=True)  # "Check updates" still shows it.
+        self.assertTrue(any(e['event']=='update_offer' and e['offer'].kind=='companion' for e in self.events))
     def test_legacy_firmware_never_has_ota_offer(self):
         self.service.set_device({'protocol':3,'firmware':'QM3.2'},True,'device-one')
         self.check()

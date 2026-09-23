@@ -1,4 +1,5 @@
 """Exercise version policy against real, isolated Git repositories."""
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 from datetime import datetime, timezone
 import importlib.util
 import os

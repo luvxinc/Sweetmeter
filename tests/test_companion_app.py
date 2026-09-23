@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import threading
 import tempfile
 import unittest
@@ -7,6 +8,13 @@ from meter.app import ProviderWorker, Application
 from meter.__main__ import InstanceLock
 
 class AppTests(unittest.TestCase):
+    def setUp(self):
+        # The worker reads account identities every cycle; never the real
+        # keychain, ~/.claude.json or a real `codex app-server`.
+        accounts = patch('meter.app.account_fingerprints', return_value={'claude': None, 'codex': None})
+        self.accounts = accounts.start()
+        self.addCleanup(accounts.stop)
+
     def test_single_instance_lock_is_released(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'lock'

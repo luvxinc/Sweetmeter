@@ -1,6 +1,7 @@
 """Release-hardening regressions: robustness of the local index, provider
 scheduling, per-row staleness, rendering bounds and app/GUI event wiring.
 Everything is synthetic; no network, Bluetooth or real account data."""
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import json
 import logging
 import os
@@ -98,11 +99,13 @@ class CorruptIndexTests(unittest.TestCase):
 
         cache = {'providers': {'claude': {'rows': parse_claude({'five_hour': {'utilization': 40}}),
                                           'fetched_at': time.time(), 'next_poll': time.time() + 60}}}
-        with patch('meter.app.TokenIndex', Broken), patch('meter.app.refresh', return_value=cache):
+        with patch('meter.app.TokenIndex', Broken), patch('meter.app.refresh', return_value=cache), \
+                patch('meter.app.account_fingerprints', return_value={}) as accounts:
             worker = holder['worker'] = ProviderWorker(self.root, emit)
             worker.start()
             self.assertTrue(done.wait(3))
             worker.close()
+        accounts.assert_called()
         snapshot = events[-1]['snapshot']
         self.assertEqual(snapshot['rows'][0]['used'], 40)
         self.assertIsNone(snapshot['rows'][0]['tokens'])
@@ -266,16 +269,13 @@ class ProviderScheduleTests(unittest.TestCase):
         self.assertNotIn('synthetic-token', json.dumps(rows))
 
     def test_codex_signed_out_is_not_set_up(self):
-        import io
-        process = Mock()
-        process.stdin = io.StringIO()
-        process.stdout = io.StringIO(''.join(json.dumps(m) + '\n' for m in [
-            {'id': 1, 'result': {}}, {'id': 2, 'error': {'message': 'synthetic'}},
-            {'id': 4, 'result': {'account': None, 'requiresOpenaiAuth': True}}]))
-        process.poll.return_value = None
+        from test_provider_portability import FakeAppServer
+        self.addCleanup(providers.close_codex)
+        answers = {'account/rateLimits/read': {'error': {'message': 'synthetic'}},
+                   'account/read': {'account': None, 'requiresOpenaiAuth': True}}
         with patch.object(providers, 'codex_command', return_value=['codex', 'app-server']), \
                 patch.object(providers.sys, 'platform', 'linux'), \
-                patch.object(providers.subprocess, 'Popen', return_value=process):
+                patch.object(providers.subprocess, 'Popen', side_effect=lambda *a, **k: FakeAppServer(answers)):
             with self.assertRaises(NotSetUp):
                 providers.fetch_codex()
 
@@ -491,6 +491,21 @@ class AppWiringTests(unittest.TestCase):
         self.assertEqual(len(FakeRadio.instances), BLUETOOTH_RESTARTS + 1)
         self.assertTrue(all(radio.closed for radio in FakeRadio.instances))
 
+    def test_bluetooth_failed_only_after_restarts_are_used_up(self):
+        self.assertFalse(self.app.bluetooth_failed)
+        for _ in range(BLUETOOTH_RESTARTS):
+            self.app.radio.events.put({'event': 'exit'})
+            self.app.pump()
+            self.assertFalse(self.app.bluetooth_failed)  # Restarting: still waiting.
+            self.app.restart_at = 0
+            self.app.pump()
+        self.app.radio.events.put({'event': 'exit'})
+        self.app.pump()
+        self.assertTrue(self.app.bluetooth_failed)
+        self.app.radio = FakeRadio(self.tmp.name)
+        self.app.radio.startup_error = 'ImportError'
+        self.assertTrue(self.app.bluetooth_failed)
+
     def test_exit_during_shutdown_is_passed_through(self):
         self.app.closing = True
         self.app.radio.events.put({'event': 'exit'})
@@ -578,22 +593,23 @@ class GuiTextTests(unittest.TestCase):
 class AccountSwitchTests(unittest.TestCase):
     def test_changed_account_drops_cache_and_polls_immediately(self):
         read = Mock(return_value=parse_codex({'rateLimits': {'planType': 'pro'}}))
-        cache = refresh({}, 1000, {'codex': read}, relaxed={'codex': 900}, accounts={'codex': 'id:a'})
+        cache = refresh({}, 1000, {'codex': read}, accounts={'codex': 'id:a'})
         entry = cache['providers']['codex']
         self.assertEqual((entry['account'], entry['account_since']), ('id:a', 0))
-        # Same account inside the idle cadence: not polled.
-        refresh(cache, 1100, {'codex': read}, relaxed={'codex': 900}, accounts={'codex': 'id:a'})
+        # Same account inside the poll interval: not polled.
+        refresh(cache, 1030, {'codex': read}, accounts={'codex': 'id:a'})
         self.assertEqual(read.call_count, 1)
-
-        def limited():
-            raise RateLimited('Codex HTTP 429')
-        read.side_effect = None
         cache = refresh(cache, 1200, {'codex': read}, force=True, accounts={'codex': 'id:a'})
         cache['providers']['codex'].update(error='Codex HTTP 429', error_code='rate_limited', next_poll=5000)
         new = Mock(return_value=parse_codex({'rateLimits': {'planType': 'plus'}}))
-        cache = refresh(cache, 1300, {'codex': new}, relaxed={'codex': 900}, accounts={'codex': 'id:b'})
+        # First sighting of another account is only a candidate...
+        cache = refresh(cache, 1260, {'codex': new}, accounts={'codex': 'id:b'})
+        self.assertEqual(cache['providers']['codex']['account'], 'id:a')
+        new.assert_not_called()
+        # ...the second consecutive one switches, dropping the old backoff.
+        cache = refresh(cache, 1300, {'codex': new}, accounts={'codex': 'id:b'})
         entry = cache['providers']['codex']
-        new.assert_called_once()  # Backoff and idle cadence belonged to the old account.
+        new.assert_called_once()
         self.assertEqual(entry['rows'][0]['subscription_label'], 'PLUS')
         self.assertIsNone(entry['error'])
         self.assertEqual((entry['account'], entry['account_since']), ('id:b', 1300))
@@ -604,10 +620,11 @@ class AccountSwitchTests(unittest.TestCase):
         def offline():
             raise ProviderError("Can't reach Claude.")
         cache = refresh(cache, 1060, {'claude': offline}, accounts={'claude': 'id:b'})
+        cache = refresh(cache, 1120, {'claude': offline}, accounts={'claude': 'id:b'})
         entry = cache['providers']['claude']
         self.assertNotIn('rows', entry)
         self.assertEqual(entry['account'], 'id:b')
-        snapshot = display_snapshot(cache, None, set(), 1100)
+        snapshot = display_snapshot(cache, None, set(), 1130)
         self.assertTrue(all(row['used'] is None and row['subscription_label'] == '--'
                             for row in snapshot['rows'][:3]))
 
@@ -617,8 +634,36 @@ class AccountSwitchTests(unittest.TestCase):
         refresh(cache, 1010, {'claude': read}, accounts={'claude': None})
         self.assertEqual(read.call_count, 1)  # Unknown identity is not a switch.
         cache = refresh(cache, 1020, {'claude': read}, accounts={'claude': 'token:2'})
+        cache = refresh(cache, 1030, {'claude': read}, accounts={'claude': 'token:2'})
         self.assertEqual(read.call_count, 2)  # Quota is re-read...
         self.assertEqual(cache['providers']['claude']['account_since'], 0)  # ...tokens not cut.
+
+    def test_mid_write_config_and_other_kind_never_switch(self):
+        read = Mock(return_value=parse_claude({'five_hour': {'utilization': 40}}, 'MAX'))
+        cache = refresh({}, 1000, {'claude': read}, accounts={'claude': 'id:a'})
+        cache['providers']['claude']['account_since'] = 500
+        # Config unreadable (None), then a token fingerprint for one cycle
+        # (oauthAccount missing mid-write), then the id again.
+        for now, seen in ((1060, None), (1120, 'token:x'), (1180, 'id:a'), (1240, 'token:x'), (1300, 'id:a')):
+            cache = refresh(cache, now, {'claude': read}, accounts={'claude': seen})
+            entry = cache['providers']['claude']
+            self.assertEqual((entry['account'], entry['account_since']), ('id:a', 500), now)
+            self.assertIn('rows', entry)
+        self.assertNotIn('account_candidate', cache['providers']['claude'])
+
+    def test_sign_out_is_immediate_and_signing_back_in_keeps_the_count(self):
+        read = Mock(return_value=parse_claude({}))
+        cache = refresh({}, 1000, {'claude': read}, accounts={'claude': 'id:a'})
+        cache['providers']['claude']['account_since'] = 400
+        cache = refresh(cache, 1060, {'claude': read}, accounts={'claude': 'signed-out'})
+        self.assertEqual(cache['providers']['claude']['account'], 'signed-out')
+        cache = refresh(cache, 1120, {'claude': read}, accounts={'claude': 'id:a'})
+        entry = cache['providers']['claude']
+        self.assertEqual((entry['account'], entry['account_since']), ('id:a', 400))
+        # Another account after sign-out counts from its own start.
+        cache = refresh(cache, 1180, {'claude': read}, accounts={'claude': 'signed-out'})
+        cache = refresh(cache, 1240, {'claude': read}, accounts={'claude': 'id:b'})
+        self.assertEqual(cache['providers']['claude']['account_since'], 1240)
 
     def test_tokens_count_from_the_switch(self):
         now = 100_000
@@ -639,7 +684,8 @@ class AccountSwitchTests(unittest.TestCase):
             codex.mkdir()
             (codex / 'auth.json').write_text(json.dumps({'tokens': {
                 'account_id': 'chatgpt-acct', 'refresh_token': 'synthetic-refresh'}}))
-            with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home', return_value=home):
+            with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home', return_value=home), \
+                    patch.object(providers, 'codex_command', side_effect=NotSetUp('Codex is not installed')):
                 first = providers.account_fingerprints(b'a' * 32)
                 self.assertEqual(first, providers.account_fingerprints(b'a' * 32))
                 self.assertNotEqual(first, providers.account_fingerprints(b'b' * 32))
@@ -651,7 +697,7 @@ class AccountSwitchTests(unittest.TestCase):
                 (codex / 'auth.json').unlink()
                 second = providers.account_fingerprints(b'a' * 32)
                 self.assertNotEqual(first['claude'], second['claude'])
-                self.assertEqual(second['codex'], 'signed-out')
+                self.assertEqual(second['codex'], 'signed-out')  # Not installed, no login file.
 
     def test_worker_persists_salt_privately(self):
         from meter.app import account_salt
@@ -660,6 +706,49 @@ class AccountSwitchTests(unittest.TestCase):
             self.assertEqual(salt, account_salt(folder))
             if os.name == 'posix':
                 self.assertEqual((Path(folder) / 'account-salt').stat().st_mode & 0o077, 0)
+
+
+class PollCadenceTests(unittest.TestCase):
+    """The owner requirement: both quotas refresh about once a minute."""
+
+    def run_worker_once(self, folder, device=None):
+        done, holder = threading.Event(), {}
+
+        def emit(event):
+            if event['event'] == 'snapshot':
+                holder['worker'].stop.set()
+                done.set()
+
+        claude = Mock(return_value=parse_claude({'five_hour': {'utilization': 1}}))
+        codex = Mock(return_value=parse_codex({'rateLimits': {'primary': {'windowDurationMins': 10080,
+                                                                           'usedPercent': 2}}}))
+        with patch.object(providers, 'fetch_claude', claude), patch.object(providers, 'fetch_codex', codex), \
+                patch('meter.app.account_fingerprints', return_value={}), \
+                patch('meter.app.close_codex') as close:
+            worker = holder['worker'] = ProviderWorker(folder, emit, lambda: device or {})
+            worker.start()
+            self.assertTrue(done.wait(5))
+            worker.close()
+        close.assert_called_once()  # The long-lived app-server stops with the worker.
+        return json.loads((Path(folder) / 'providers.json').read_text())['providers'], claude, codex
+
+    def test_codex_is_polled_every_minute_like_claude(self):
+        with tempfile.TemporaryDirectory() as folder:
+            entries, claude, codex = self.run_worker_once(folder)
+        claude.assert_called_once()
+        codex.assert_called_once()
+        for name in ('claude', 'codex'):
+            self.assertEqual(entries[name]['next_poll'] - entries[name]['fetched_at'], 60, name)
+
+    def test_idle_codex_is_polled_again_after_a_minute(self):
+        read = Mock(return_value=parse_codex({}))
+        cache = refresh({}, 1000, {'codex': read}, interval=60)
+        refresh(cache, 1030, {'codex': read}, interval=60)
+        self.assertEqual(read.call_count, 1)
+        refresh(cache, 1061, {'codex': read}, interval=60)  # No local activity needed.
+        self.assertEqual(read.call_count, 2)
+        refresh(cache, 1065, {'codex': read}, interval=60, force=True)  # Refresh button: at once.
+        self.assertEqual(read.call_count, 3)
 
 
 class MultiComputerTests(AppWiringTests):

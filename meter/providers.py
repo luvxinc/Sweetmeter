@@ -206,26 +206,38 @@ def claude_token():
 # account: a salted SHA-256 of stable account/organization ids. Only if a CLI
 # stores no ids is a salted hash of its long-lived refresh token used. Neither
 # the ids nor any token are stored; only the salted digest is.
+#
+# A fingerprint is "<kind>:<digest>" (kinds: env, id, app, token) or
+# "signed-out". None means "unknown right now" (a config file that exists but
+# is being rewritten, a CLI that is not answering): it never causes a switch.
 
 _json_cache = {}
+_UNREADABLE = object()  # The file exists but is not (yet) a complete JSON object.
 
 
 def _read_json_cached(path):
-    """Parse a small JSON config again only when its size/mtime changes."""
+    """Parse a small JSON config again only when its size/mtime changes.
+
+    Returns the object, None when the file does not exist, or _UNREADABLE when
+    it exists but cannot be read or parsed (for example mid-write)."""
     try:
         st = path.stat()
-    except OSError:
+    except FileNotFoundError:
         _json_cache.pop(str(path), None)
         return None
+    except OSError:
+        return _UNREADABLE
     key = (st.st_size, st.st_mtime_ns)
     cached = _json_cache.get(str(path))
     if cached and cached[0] == key:
         return cached[1]
     try:
         value = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError):
-        value = None
-    value = value if isinstance(value, dict) else None
+        value = _UNREADABLE
+    value = value if isinstance(value, dict) else _UNREADABLE
     _json_cache[str(path)] = (key, value)
     return value
 
@@ -236,7 +248,10 @@ def _digest(salt, *parts):
 
 
 def claude_global_config():
-    """Claude Code's global config (holds oauthAccount ids, no secrets)."""
+    """Claude Code's global config (holds oauthAccount ids, no secrets).
+
+    Returns the object, None when no config exists, or _UNREADABLE when the
+    config in use exists but cannot be parsed right now."""
     if os.environ.get("CLAUDE_CONFIG_DIR"):
         candidates = [claude_config_dir() / ".claude.json"]
     else:
@@ -245,40 +260,65 @@ def claude_global_config():
     for path in candidates:
         document = _read_json_cached(path)
         if document is not None:
-            return document
+            return document  # The first existing file is authoritative, readable or not.
     return None
 
 
 def claude_account(salt):
-    """Fingerprint of the Claude account in use, or 'signed-out'."""
+    """Fingerprint of the Claude account in use, 'signed-out', or None (unknown)."""
     explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if explicit:
         return "env:" + _digest(salt, "env", explicit)
-    config = claude_global_config() or {}
-    account = config.get("oauthAccount")
+    config = claude_global_config()
+    if config is _UNREADABLE:
+        return None  # Mid-write or damaged: never guess another identity.
+    account = (config or {}).get("oauthAccount")
     if isinstance(account, dict) and (account.get("accountUuid") or account.get("organizationUuid")):
         return "id:" + _digest(salt, "claude", account.get("accountUuid"), account.get("organizationUuid"))
     try:
         credentials = claude_credentials()
+    except NotSetUp:
+        return "signed-out"  # No saved sign-in at all: an explicit sign-out.
     except ProviderError:
-        return "signed-out"
+        return None  # Expired or damaged sign-in: the identity is unknown, not changed.
     secret = credentials.get("refreshToken") or credentials.get("accessToken")
     return "token:" + _digest(salt, "claude-token", secret)
 
 
 def codex_account(salt):
-    """Fingerprint of the Codex login, or None when it is not observable
-    (for example credentials kept in the OS keyring)."""
-    auth = _read_json_cached(codex_home() / "auth.json")
-    if auth is None:
-        return None if (codex_home() / "auth.json").exists() else "signed-out"
-    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
-    if tokens.get("account_id"):
-        return "id:" + _digest(salt, "codex", tokens["account_id"])
-    secret = tokens.get("refresh_token") or auth.get("OPENAI_API_KEY")
-    if secret:
-        return "token:" + _digest(salt, "codex-token", secret)
-    return "signed-out"
+    """Fingerprint of the Codex login, 'signed-out', or None (unknown).
+
+    auth.json (file credential storage) provides the ChatGPT account id. When
+    Codex keeps its login in the OS keyring there is no auth.json; the
+    identity then comes from the running `codex app-server` (account/read:
+    account type and e-mail/account id, never a token). If the app-server
+    reports no identifier (for example an API-key login), the fingerprint is
+    unknown and account switches are not detected for that login; quotas are
+    still read every minute."""
+    path = codex_home() / "auth.json"
+    auth = _read_json_cached(path)
+    if auth is _UNREADABLE:
+        return None
+    if auth is not None:
+        tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+        if tokens.get("account_id"):
+            return "id:" + _digest(salt, "codex", tokens["account_id"])
+        secret = tokens.get("refresh_token") or auth.get("OPENAI_API_KEY")
+        if secret:
+            return "token:" + _digest(salt, "codex-token", secret)
+    try:
+        account = codex_session().account()
+    except NotSetUp:
+        return "signed-out"  # Codex is not installed.
+    except Exception:  # noqa: BLE001 - identity is best effort
+        return None
+    if account is None:
+        return "signed-out"
+    identifiers = [str(account.get(key)) for key in ("accountId", "account_id", "userId", "email")
+                   if isinstance(account.get(key), str) and account.get(key)]
+    if not identifiers:
+        return None
+    return "app:" + _digest(salt, "codex-app", account.get("type"), *identifiers)
 
 
 def account_fingerprints(salt):
@@ -434,94 +474,208 @@ def _stop_codex(process, command):
         process.wait(timeout=5)
 
 
-def fetch_codex(binary=None):
-    command = codex_command(binary)
-    options = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform == "win32" else {}
-    try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                                   errors="replace", shell=False, **options)
-    except OSError as error:
-        raise ProviderError("Cannot start Codex. Reinstall or update Codex; "
-                            "Sweetmeter retries automatically.") from error
-    incoming = queue.Queue()
+# `codex app-server` speaks JSON-RPC over stdio and answers any number of
+# requests, so one process is kept running and asked once a minute instead of
+# starting Codex for every poll. It is restarted when it stops, fails or stops
+# answering, when the Codex executable or its login file changes, and at least
+# every CODEX_SESSION_MAX_AGE seconds so a long-lived server never serves an
+# outdated login (a keyring login changes no file Sweetmeter can watch).
+CODEX_SESSION_MAX_AGE = 900
+CODEX_TIMEOUT = 30
 
-    def reader():
+
+class CodexSession:
+    """One long-lived `codex app-server`; every public method runs on the
+    provider worker thread (a lock also serializes stray callers)."""
+
+    def __init__(self, binary=None):
+        self.binary = binary
+        self.lock = threading.RLock()
+        self.process = self.command = self.reader = None
+        self.incoming = None
+        self.started = 0.0
+        self.signature = None
+        self.next_id = 0
+
+    # -- process lifetime --------------------------------------------------
+    @staticmethod
+    def _signature(command):
+        """Changes when the executable is replaced or the login file changes."""
+        parts = []
+        for path in (Path(command[-2]) if len(command) >= 2 else None, codex_home() / "auth.json"):
+            try:
+                st = path.stat() if path is not None else None
+                parts.append((st.st_size, st.st_mtime_ns) if st else None)
+            except OSError:
+                parts.append(None)
+        return tuple(command), tuple(parts)
+
+    def _alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def _start(self, command):
+        options = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform == "win32" else {}
         try:
-            for line in process.stdout:
-                try:
-                    incoming.put(json.loads(line))
-                except ValueError:
-                    pass
-        except (OSError, ValueError):
-            pass  # Shutdown can close the pipe while a read is completing.
-        finally:
-            incoming.put(None)
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                       errors="replace", shell=False, **options)
+        except OSError as error:
+            raise ProviderError("Cannot start Codex. Reinstall or update Codex; "
+                                "Sweetmeter retries automatically.") from error
+        incoming = queue.Queue()
 
-    reader_thread = threading.Thread(target=reader, daemon=True)
-    reader_thread.start()
+        def reader():
+            try:
+                for line in process.stdout:
+                    try:
+                        message = json.loads(line)
+                    except ValueError:
+                        continue
+                    # Only responses are kept; notifications and server
+                    # requests are not needed and must not pile up.
+                    if isinstance(message, dict) and "id" in message and ("result" in message or "error" in message):
+                        incoming.put(message)
+            except (OSError, ValueError):
+                pass  # Shutdown can close the pipe while a read is completing.
+            finally:
+                incoming.put(None)
 
-    def send(obj):
-        process.stdin.write(json.dumps(obj) + "\n")
-        process.stdin.flush()
+        self.process, self.command, self.incoming = process, command, incoming
+        self.reader = threading.Thread(target=reader, name="sweetmeter-codex", daemon=True)
+        self.reader.start()
+        self.started = time.monotonic()
+        self.next_id = 0
+        self.signature = self._signature(command)
+        self._request("initialize", {"clientInfo": {"name": "sweetmeter", "version": get_version()},
+                                     "capabilities": {"experimentalApi": True}})
+        self._send({"method": "initialized", "params": {}})
 
-    def receive(number, timeout=30):
+    def _ensure(self):
+        command = codex_command(self.binary)
+        if self._alive() and (self.command != command or self._signature(command) != self.signature
+                              or time.monotonic() - self.started > CODEX_SESSION_MAX_AGE):
+            self.close()
+        if not self._alive():
+            self.close()
+            self._start(command)
+
+    def close(self):
+        with self.lock:
+            process, command, reader = self.process, self.command, self.reader
+            self.process = self.command = self.reader = self.incoming = None
+            if process is None:
+                return
+            try:
+                _stop_codex(process, command)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            finally:
+                for stream in (process.stdin, process.stdout):
+                    try:
+                        stream.close()
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                if reader is not None:
+                    reader.join(timeout=1)
+
+    # -- JSON-RPC ------------------------------------------------------------
+    def _send(self, obj):
+        try:
+            self.process.stdin.write(json.dumps(obj) + "\n")
+            self.process.stdin.flush()
+        except (OSError, ValueError) as error:
+            raise ProviderError("Codex stopped answering. Retrying automatically.") from error
+
+    def _request(self, method, params, timeout=None):
+        timeout = CODEX_TIMEOUT if timeout is None else timeout
+        self.next_id += 1
+        number = self.next_id
+        self._send({"id": number, "method": method, "params": params})
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
-                msg = incoming.get(timeout=max(.01, end - time.monotonic()))
+                message = self.incoming.get(timeout=max(.01, end - time.monotonic()))
             except queue.Empty:
                 break
-            if msg is None:
-                break
-            if isinstance(msg, dict) and msg.get("id") == number:
-                if "error" in msg:
-                    raise ProviderError("Codex could not read its usage limits. Retrying automatically.")
-                result = msg.get("result", {})
-                return result if isinstance(result, dict) else {}
+            if message is None:
+                raise ProviderError("Codex stopped answering. Retrying automatically.")
+            if message.get("id") != number:
+                continue  # A late answer to a request that already timed out.
+            if "error" in message:
+                raise ProviderError("Codex could not read its usage limits. Retrying automatically.")
+            result = message.get("result", {})
+            return result if isinstance(result, dict) else {}
         raise ProviderError("Codex did not answer in time. Retrying automatically.")
 
-    def signed_in():
-        """Only the account's presence is inspected; identifiers are discarded."""
-        send({"id": 4, "method": "account/read", "params": {"refreshToken": False}})
-        return isinstance(receive(4, timeout=5).get("account"), dict)
+    def call(self, method, params, timeout=None):
+        """One request; on any failure the process is stopped so the next
+        call starts a fresh one."""
+        with self.lock:
+            try:
+                self._ensure()
+                return self._request(method, params, timeout)
+            except BaseException:
+                self.close()
+                raise
 
-    try:
-        send({"id": 1, "method": "initialize", "params": {
-            "clientInfo": {"name": "sweetmeter", "version": get_version()},
-            "capabilities": {"experimentalApi": True}}})
-        receive(1)
-        send({"method": "initialized", "params": {}})
-        send({"id": 2, "method": "account/rateLimits/read", "params": {}})
-        try:
-            rows = parse_codex(receive(2))
-        except ProviderError:
+    # -- queries -------------------------------------------------------------
+    def account(self):
+        """The signed-in account as reported by Codex (dict), or None when
+        signed out. Only used for a salted fingerprint; nothing is stored."""
+        account = self.call("account/read", {"refreshToken": False}, timeout=10).get("account")
+        return account if isinstance(account, dict) else None
+
+    def rate_limits(self):
+        with self.lock:
             try:
-                present = signed_in()
-            except (ProviderError, OSError, ValueError):
-                present = True  # Unknown: report the original, retryable failure.
-            if not present:
-                raise NotSetUp("Codex is installed but not signed in. Run Codex and sign in "
-                               "to show its quota.") from None
-            raise
-        if rows[0]["subscription_label"] == "--":
-            # Older app-server builds provide planType only through account/read.
-            # Keep only the plan label; never retain email/account identifiers.
-            try:
-                send({"id": 3, "method": "account/read", "params": {"refreshToken": False}})
-                account = receive(3, timeout=5).get("account")
-                if isinstance(account, dict) and account.get("type") == "chatgpt":
-                    rows[0]["subscription_label"] = parse_codex({"rateLimits": {"planType": account.get("planType")}})[0]["subscription_label"]
-            except (RuntimeError, OSError):
-                pass
-        return rows
-    finally:
-        try:
-            _stop_codex(process, command)
-        finally:
-            process.stdin.close()
-            reader_thread.join(timeout=1)
-            process.stdout.close()
+                rows = parse_codex(self.call("account/rateLimits/read", {}))
+            except ProviderError:
+                try:
+                    present = self.account() is not None
+                except (ProviderError, OSError, ValueError, RuntimeError):
+                    present = True  # Unknown: report the original, retryable failure.
+                if not present:
+                    raise NotSetUp("Codex is installed but not signed in. Run Codex and sign in "
+                                   "to show its quota.") from None
+                raise
+            if rows[0]["subscription_label"] == "--":
+                # Older app-server builds provide planType only through account/read.
+                # Keep only the plan label; never retain email/account identifiers.
+                try:
+                    account = self.account()
+                    if isinstance(account, dict) and account.get("type") == "chatgpt":
+                        rows[0]["subscription_label"] = parse_codex(
+                            {"rateLimits": {"planType": account.get("planType")}})[0]["subscription_label"]
+                except (RuntimeError, OSError):
+                    pass
+            return rows
+
+
+_codex_session = None
+_codex_session_lock = threading.Lock()
+
+
+def codex_session(binary=None):
+    global _codex_session
+    with _codex_session_lock:
+        if _codex_session is None or _codex_session.binary != binary:
+            if _codex_session is not None:
+                _codex_session.close()
+            _codex_session = CodexSession(binary)
+        return _codex_session
+
+
+def close_codex():
+    """Stop the long-lived app-server (companion shutdown)."""
+    global _codex_session
+    with _codex_session_lock:
+        session, _codex_session = _codex_session, None
+    if session is not None:
+        session.close()
+
+
+def fetch_codex(binary=None):
+    return codex_session(binary).rate_limits()
 
 
 PROVIDER_NAMES = {"claude": "Claude", "codex": "Codex"}
@@ -575,24 +729,56 @@ def is_due(entry, now, *, force=False, wake=False, interval=60):
     return False
 
 
+# Identity bookkeeping kept in a provider's cache entry across polls.
+IDENTITY_KEYS = ("account", "account_since", "account_candidate", "last_account", "last_account_since")
+
+
+def _kind(fingerprint):
+    return str(fingerprint).split(":", 1)[0] if fingerprint else None
+
+
 def switch_account(old, account, now):
-    """Return the entry to use for ``account``. A changed fingerprint drops
-    everything learned for the previous account: rows, plan labels, errors
-    and backoff (so it is polled immediately). ``account_since`` marks when
-    this account's local token counting starts (0 = no known earlier account)."""
-    if account is None or old.get("account") == account:
+    """Return the entry to use when ``account`` is observed.
+
+    A confirmed change drops everything learned for the previous account:
+    rows, plan labels, errors and backoff (so it is polled immediately).
+    ``account_since`` marks when this account's local token counting starts
+    (0 = no known earlier account).
+
+    False switches are avoided: an unknown identity (None) changes nothing, and
+    a different fingerprint must be observed twice in a row before it counts
+    (a config file caught mid-write, or a fingerprint of another kind such as
+    ``token:`` instead of ``id:``, is not proof of a new account). Only an
+    explicit sign-out (no saved sign-in at all), and signing in after one,
+    take effect at once.
+    """
+    current = old.get("account")
+    if account is None:
         return old
-    previous = old.get("account")
+    if current == account:
+        if "account_candidate" in old:
+            old = {k: v for k, v in old.items() if k != "account_candidate"}
+        return old
     known_before = "account" in old
+    if known_before and "signed-out" not in (account, current) and old.get("account_candidate") != account:
+        return {**old, "account_candidate": account}  # First sighting: confirm next cycle.
     if known_before:
         logging.info("Signed-in account changed; discarding the previous account's cached quota")
     # Local logs carry no account id, so token counting restarts at a real
     # switch. A rotated refresh token (token->token, only when a CLI stores no
     # account ids) cannot be told apart from a switch: its quota is still
-    # re-read, but token counting is not cut short.
-    rotated = str(previous).startswith("token:") and account.startswith("token:")
-    since = old.get("account_since", 0) if rotated else (now if known_before else 0)
-    return {"account": account, "account_since": since}
+    # re-read, but token counting is not cut short. Signing out and back in to
+    # the same account resumes that account's count (its own account_since).
+    remembered = {k: old[k] for k in ("last_account", "last_account_since") if k in old}
+    if current not in (None, "signed-out"):
+        remembered = {"last_account": current, "last_account_since": old.get("account_since", 0)}
+    if _kind(current) == "token" and _kind(account) == "token":
+        since = old.get("account_since", 0)
+    elif account == remembered.get("last_account"):
+        since = remembered.get("last_account_since", 0)
+    else:
+        since = now if known_before else 0
+    return {"account": account, "account_since": since, **remembered}
 
 
 def refresh(previous, now=None, readers=None, *, force=False, interval=60, relaxed=None, wake=(),
@@ -612,7 +798,7 @@ def refresh(previous, now=None, readers=None, *, force=False, interval=60, relax
         providers[name] = old
         if not is_due(old, now, force=force, wake=name in wake, interval=interval):
             continue
-        identity = {k: old[k] for k in ("account", "account_since") if k in old}
+        identity = {k: old[k] for k in IDENTITY_KEYS if k in old}
         try:
             rows = read()
             providers[name] = {"rows": rows, "fetched_at": now, "attempted_at": now,

@@ -46,9 +46,27 @@ The ESP32 is the peripheral; Windows/macOS/Linux companions are GATT centrals.
 There is one active connection. Advertise the fixed service UUID using a legacy
 advertisement of at most 31 bytes: flags (3 bytes) plus complete 128-bit service
 UUID list (18 bytes). Put the local name in the separate scan response (also at
-most 31 bytes). Do not invent a Bluetooth manufacturer company ID, put a second
-128-bit discovery UUID into the advertisement, or require computer advertising.
-Discovery state is read from GATT after connecting.
+most 31 bytes). Do not put a second 128-bit discovery UUID into the
+advertisement or require computer advertising. Discovery state is read from
+GATT after connecting.
+
+**Capability marker.** Pairing firmware (section 2.1) also puts one
+manufacturer-specific data AD into the scan response: company ID `0xFFFF`
+(little endian `ff ff`; the Bluetooth SIG value for tests and unassigned
+companies, used because Sweetmeter holds no company ID), then ASCII `SM` and a
+flags byte: bit 0 pairing secrets supported (always 1), bit 1 physical menu
+open; other bits 0. The scan response is `09`-type complete local name
+(`Sweetmeter-XXXX`, plus `-PAIR` while the menu is open) followed by the
+marker: 24 bytes, or 29 with the suffix (`firmware/src/advertising.h`, size
+asserted by tests). Pre-secret firmware (2026.9.8/2026.9.13) sends the name
+only. A computer classifies a meter from the advertisement merged over one
+scan: marker with the menu bit (or, when a scanner reports only the name, the
+`-PAIR` suffix) = pairing firmware, menu open; marker without it = pairing
+firmware, menu closed; a name without a marker = pre-secret firmware; neither
+yet = undecided (the scan response has not arrived; decide on a later scan).
+bleak 3.0.2 reports the scan response's manufacturer data on macOS
+(CoreBluetooth merges it), Windows (WinRT pairs advertisement and scan
+response) and Linux (BlueZ `ManufacturerData`) with its default active scan.
 
 The device requests MTU 185. New fragmented packets use at most 182-byte GATT
 values and must also work with MTU 23 (20-byte values). Start with a 20-byte value
@@ -109,13 +127,21 @@ companion update is never installed from the meter.
 The meter sends U only on an authorized link and then shows "Checking for
 updates..."; without one it shows "Select a computer first." (none selected) or
 "Computer not connected." (selected but not connected). It accepts `u` only while
-a check is outstanding (and `u 4` after `u 3`); unsolicited `u` is ignored. A new
-or lost link clears a pending check; no answer within 45 seconds shows "Update
-check failed." Results stay about eight seconds and disappear with the next
-minute draw. The companion drops a notice it could not deliver within 60 seconds.
+a check is outstanding (and `u 2` or `u 4` after `u 3`); unsolicited `u` is
+ignored. A new or lost link clears a pending check; no answer within 45 seconds
+shows "Update check failed." "Update found. Installing..." (`u 3`) stays until
+the companion reports `u 2`/`u 4`, the OTA transfer ends (an OTA error shows
+"Update check failed."; a cancel just removes it; success restarts the meter),
+or 10 minutes pass without either (then "Update check failed."). A lost link
+does not hide it. Other results stay about eight seconds and disappear with the
+next minute draw. The companion drops a notice it could not deliver within 60
+seconds. A firmware job that never starts on its meter (section 4) ends with a
+`job_expired` error on the computer; the companion should then send `u 4`,
+and otherwise the meter falls back to its 10-minute deadline.
 
 Hello results: `0` authorized; `2` busy (queue full, retry, link stays open);
-`7` rejected (unknown secret, replayed/second hello, menu open, legacy H refused);
+`7` rejected (unknown secret, replayed/second hello, menu open, legacy H refused
+or outside its migration window);
 `8` legacy H accepted, send Y now; `9` the proof is valid but that computer is
 not the one selected on the meter. Every result except 0 and 2 is followed by a
 disconnect. P (17 bytes) fits the minimum 20-byte value budget. H (37–57 bytes)
@@ -153,16 +179,49 @@ computer authorizes the link (`0`); a match for another paired computer returns
 reused, and a new connection gets a new one. A hello while OTA is active never
 changes or revokes authorization.
 
+**Secrets on the computer.** A secret is transmitted exactly once, in the
+registration that created it, and a computer never sends a secret the meter
+has already proven it stores. The companion keeps per meter (keyed by serial)
+at most one **confirmed** secret and, per BLE address, one **pending** secret:
+
+- Every registration generates a fresh pending secret and saves it before
+  sending it. It becomes the confirmed secret only after the meter accepts an
+  authenticated hello (`P` → `0`) with it; a refused pending secret (`7`) is
+  discarded and the confirmed one is tried on the next connection (one hello
+  per link). `9` leaves the pending secret pending.
+- A computer whose confirmed secret the meter accepted does not register again
+  in an open menu (switching back to it needs no registration). It registers
+  again only after the meter refused that secret, reported no selection, or
+  the user chose Forget.
+- A peripheral that copies a meter's public `serial` therefore never obtains a
+  secret that the real meter holds: it can at most receive a fresh pending
+  secret that the real meter never stored. The proof also binds the meter's
+  serial, so a secret is useless with any other meter.
+
 **Migration from pre-secret firmware (2026.9.8, 2026.9.13).** Those meters stored
 only a selected host ID. After updating, the status shows `"selected":true,
 "secured":false`. The selected computer sends one legacy H; if the ID matches
 the meter answers `8` and the computer must immediately send `Y` with a new
 secret (trust on first use). Y is durable in NVS before it is acknowledged and
-authorizes the link. From then on legacy H is always refused. A companion
-connecting to pre-secret firmware (status has `selected_host` and no `auth`)
-keeps using legacy H and the legacy registration body so it can still deliver
-the OTA that adds pairing secrets; firmware that adds this protocol must be
-released with a `minimum_companion` that implements it.
+authorizes the link; the companion then treats that secret as confirmed. This
+trust-on-first-use is bounded on both sides:
+
+- The meter accepts it only within **10 minutes after boot** (the OTA restart,
+  a reset or the owner's wake) and only for the **first** legacy H that names
+  the stored computer; that hello consumes the window even if Y never follows.
+  Outside the window every legacy H is refused (`7`) and the owner pairs the
+  computer again with the physical menu (the stored selection then gains a
+  secret without a confirmation prompt). From the moment a secret exists,
+  legacy H is always refused.
+- The companion runs H/Y only when it holds no confirmed secret for that
+  serial **and** a pre-secret companion record exists for that exact BLE
+  address (its earlier `bluetooth.json` pin or an `address:` pairing made
+  with pre-secret firmware). It always provisions a fresh secret.
+
+A companion connecting to pre-secret firmware (status has `selected_host` and
+no `auth`) keeps using legacy H and the legacy registration body so it can
+still deliver the OTA that adds pairing secrets; firmware that adds this
+protocol must be released with a `minimum_companion` that implements it.
 
 Host IDs are lower-case UUID text matching
 `7a1e1000-ff1b-4d9f-a023-[0-9a-f]{12}`; preserve existing installations' IDs.
@@ -199,15 +258,30 @@ packet. OTA-active frame begins return result 2. Hellos and T remain available
 when OTA is idle; dashboard data and new clock writes pause during OTA.
 
 **Display timing.** The panel uses the full clear-and-draw waveform (a DU trial
-ghosted), so each draw is a full two-pass refresh. The panel redraws at most once
-per minute on its own: a valid frame is copied into the dashboard buffer and
-acknowledged with result 1 immediately, and the dashboard (with the new clock
-minute) is drawn at the next minute boundary. Only user-visible state changes
-draw immediately: the first frame after boot or wake (A result 0), a frame that
-answers a physical refresh press (A result 0), and the menu, OTA progress,
-rocker-hold notices, low-battery and power screens. Removing a notice banner, the
-refresh marker, or a changed Bluetooth indicator waits for the next minute
-draw. A minute draw is skipped entirely if nothing visible changed.
+ghosted), so each draw is a full two-pass refresh. In steady state the panel
+refreshes **at most once per minute**: a valid frame is copied into the
+dashboard buffer and acknowledged with result 1 immediately, and the dashboard
+(with the new clock minute) is drawn at the next minute boundary. Only
+user-visible state changes draw immediately: the first frame after boot or
+wake (A result 0), a frame that answers a physical refresh press (A result 0),
+and the menu, OTA progress, rocker-hold notices, low-battery and power screens.
+Removing a notice banner, the refresh marker, or a changed Bluetooth indicator
+waits for the next minute draw. A minute draw is skipped entirely if nothing
+visible changed.
+
+- **Clock.** Once synchronized, a T that differs from the meter's clock by less
+  than 2 seconds does not step it (transport jitter). The scheduled redraw
+  happens only when the displayed local minute advances, or jumps by more than
+  one minute in either direction (a real correction or a timezone change);
+  a step back into the previous minute never redraws that minute.
+- **First T of a link.** It defers the scheduled redraw by up to 5 seconds so
+  the link's first frame, which normally follows at once, is drawn together
+  with the corrected time in a single refresh.
+- **Top-button refresh.** With an authorized computer the press itself is not
+  drawn: the meter notifies `R` and draws the answering frame at once (A
+  result 0). If no frame arrives within 10 seconds, the `*` marker is drawn to
+  acknowledge the press; a frame within 30 seconds of the press still counts
+  as its answer. Without an authorized computer the marker is drawn at once.
 
 ## 3. Device status (0004)
 
@@ -226,7 +300,7 @@ meter's stable eFuse MAC as 12 lower-case hex characters; computers key pairing
 secrets by it. `selected` says whether a computer is selected; `secured` whether
 that selection has a pairing secret (false only after migrating from pre-secret
 firmware). `challenge` is this connection's 32-hex-character challenge.
-`computers` is the number of rows in the open menu. `rssi` is an optional
+`computers` is the number of rows in the open menu (0 while it is closed). `rssi` is an optional
 diagnostic, present only while an authorized link has a recent reading and only
 if it fits. `discovery_nonce` and remaining milliseconds are zero when closed.
 Pre-secret firmware reported `selected_host` and no `auth`; companions accept
@@ -246,12 +320,22 @@ the window; packets and rocker movement cannot extend its hard deadline. The men
 lists the paired computers first (the selected one, then most recently used),
 then computers that register while it is open, at most twelve rows,
 deduplicated by host ID. Each row shows a marker (`>` selected, `+` new, `!`
-conflicting identity), the name and the last four hex characters of the host
-ID, so equal names are distinguishable. Rocker up/down highlights.
+needs attention), the name and the last four hex characters of the host
+ID, so equal names are distinguishable. `!` rows also carry a label:
+`CONFLICT` (two different secrets claimed this ID in this window; not
+selectable), `NEW KEY` (a paired computer registered a different secret) or
+`UPDATE APP` (an old companion asked to pair; see J result 9). Rocker up/down
+highlights; while an `UPDATE APP` row is highlighted the hint line reads
+"Update Sweetmeter on <name>".
 
 - **Rocker press** on a paired row switches to that computer at once; its stored
   secret is reused, nothing is re-registered. On a new row it pairs and selects
-  that computer (replacing the least recently used pairing if eight exist).
+  that computer (replacing the least recently used pairing if eight exist). On
+  a `NEW KEY` row it first shows a **NEW KEY** confirmation ("This computer sent
+  a new key. Accept only if you reset it."): a second rocker press stores the
+  new secret and selects the computer; any other key cancels and keeps the
+  stored secret. A new row from an old companion (`UPDATE APP`) cannot be
+  selected; a paired computer running an old app can still be switched to.
 - **Rocker hold (3 s)** on a row asks "REMOVE COMPUTER"; rocker press confirms,
   any other key keeps it. Removing the selected computer leaves none selected.
 - Short-bottom cancels. Short-top restarts discovery with a fresh nonce and window.
@@ -265,12 +349,15 @@ D:u8, discovery_nonce:u32, window_ms:u32
 An already connected companion stops frame submission and disconnects within one
 second of D, then enters discovery backoff. The device revokes the link's
 authorization when opening the menu and disconnects any remaining peer after two
-seconds. While the menu is open the scan-response local name gains the suffix
-`-PAIR` (`Sweetmeter-ABCD-PAIR`, 22 bytes including its AD header), so computers
-that have never paired only probe a meter whose owner is actually pairing.
+seconds. While the menu is open the capability marker's menu bit is set and the
+scan-response local name gains the suffix `-PAIR` (`Sweetmeter-ABCD-PAIR`, 22
+bytes including its AD header; kept as the fallback for scanners that report
+only the name), so computers that have never paired only probe a meter with
+pairing firmware whose owner is actually pairing.
 
 A candidate connects, reads 0004, subscribes to 0002 and registers only if menu is
-open and nonce is nonzero. Registration uses these **control** messages (distinct
+open and nonce is nonzero (and, per section 2.1, only when it holds no secret
+the meter has accepted). Registration uses these **control** messages (distinct
 from all legacy commands):
 
 | Command | Layout |
@@ -283,20 +370,26 @@ from all legacy commands):
 A nonzero random session identifies one attempt. With `"auth":1` the assembled
 body is exactly `host_id:36 ASCII bytes, name_length:u8, name:name_length ASCII
 bytes, secret:32 bytes`, **70–89 bytes**; the secret must not be all zero.
-(Pre-secret firmware accepts only the 38–57-byte body without the secret.) Total
-must match that body; name length is 1–20. At the minimum MTU each fragment
+Pre-secret firmware accepts only the 38–57-byte body without the secret, which
+companions up to 2026.9.14 send. Pairing firmware still receives such a legacy
+body (J with total 38–57) so it can name the computer, validates it, lists it
+as an `UPDATE APP` row and answers the commit with result **9**; it is never
+paired. Total must match the body; name length is 1–20. At the minimum MTU each fragment
 contains at most 11 payload bytes. One write and its J ACK precede the next write;
 ACK's next offset is zero after begin, received count after fragment, and total
 after successful commit. A duplicate ID updates its row without consuming a slot.
-A paired computer that registers again (for example after forgetting the meter)
-may replace its stored secret once per window; if a second, different secret
-then claims the same ID the row is marked as a conflict and cannot be selected.
-No registration can submit a frame.
+A paired computer that registers again with the **same** secret just updates its
+row. With a **different** secret (legitimate after it forgot the meter, or an
+impostor that learned its ID) the row is marked `NEW KEY` and the stored secret
+is replaced only after the owner's explicit second confirmation (above). If a
+second, different secret then claims the same ID in the window the row is
+marked as a conflict and cannot be selected. No registration can submit a frame.
 
 J result values: 0 success; 1 malformed length/value/name/ID/secret; 2 menu
 closed or nonce changed; 3 wrong session; 4 unexpected offset; 5 list full;
 6 busy; 7 too many registrations from this connection address in this window
-(two); 8 identity conflict. Nonzero result ends this registration; disconnect,
+(two); 8 identity conflict; 9 this companion predates pairing secrets and must
+be updated (legacy-length body; the computer is shown as `UPDATE APP`). Nonzero result ends this registration; disconnect,
 reread status on a later attempt, and start with a fresh session. Registration
 expires after five seconds without a valid packet or when its window closes; no
 partial body is persisted. Wait five seconds for a J ACK. The device disconnects
@@ -318,6 +411,32 @@ selected and this one holds no secret, back off 30–45 seconds; when no compute
 is selected, 3–5 seconds. A meter showing the `-PAIR` suffix is probed
 immediately. Meters for which this computer holds a proven secret are tried
 first. Any number of meters can be paired; one is driven at a time.
+
+Connecting makes a meter with pairing firmware bond with the computer, and
+that meter keeps only bonds that were earned (section 9), so a probe of an
+unrelated one would leave a stale key in the computer's OS. The companion
+therefore decides from the advertisement (section 1) before connecting:
+
+- Pairing firmware, menu open: connect and register.
+- Pairing firmware, menu closed: connect only if this computer is paired or
+  pairing with that meter (a confirmed secret, a pending registration or a
+  pre-secret pin for that address). Otherwise do not connect; a companion that
+  has never paired shows the selection instructions from the advertisement.
+- Pre-secret firmware (no marker; it never removes bonds): probe as before. If
+  its menu is open, register with the legacy body; if it names this computer
+  as selected, use the legacy hello; if nothing is selected, show the
+  selection instructions. A factory-fresh pre-secret meter can so be selected
+  from any computer and then updated; after the update the migration of
+  section 2.1 applies (that computer holds the pre-secret record for the
+  meter's address).
+- Undecided (no scan response yet): do not connect this scan.
+
+Status read before this link authenticated is reported to the application as
+untrusted: a copied serial proves nothing. A firmware job is bound to the BLE
+address of the meter it was checked against, starts only on that meter and is
+dropped with `job_expired` if that meter disconnects first or it has not
+started within 60 seconds. A Forget during a connection attempt is never undone
+by that attempt.
 
 Opening the menu temporarily suspends disconnect sleep for its bounded window.
 On cancel/expiry/selection, if no authorized connection exists, a meter whose
@@ -655,7 +774,9 @@ A pairing secret authenticates a computer only as well as the registration
 that delivered it: registration happens over a Just Works link while the owner's
 menu is open, so an active attacker present at that moment (not a passive
 listener) could interpose. The legacy migration path trusts the first hello
-from the previously selected host ID. The device cannot measure USB power
+from the previously selected host ID within 10 minutes of a boot (section 2.1).
+A retried registration in the same window carries a new secret and is shown
+as a conflict; the owner rescans (top button) to pair again. The device cannot measure USB power
 without additional hardware, and cannot claim complete Windows/Linux hardware
 acceptance from Mac BLE tests. These limitations are part of the product
 contract.
@@ -676,8 +797,11 @@ contract.
   again on a top-button wake); 300-second timer wakes then only measure and
   sleep. A pending-verify OTA image always finishes its health checks first.
 - **Clock:** deep sleep keeps time on the internal RC oscillator. The meter stores
-  the sleep-entry time in RTC memory; after a sleep longer than five minutes
-  `clock_synced` is false and the clock shows `--:--` until T arrives.
+  the sleep-entry time in RTC memory and accumulates the time slept since the
+  last T there; the clock is trusted only while that total is below five
+  minutes (so repeated 300-second low-battery sleeps never keep it). Otherwise
+  `clock_synced` is false and the clock shows `--:--` until T arrives, which
+  resets the total.
 - **Light/modem sleep:** not enabled. The pinned Arduino-ESP32 2.0.17 prebuilt
   ESP-IDF 4.4.7 has `CONFIG_PM_ENABLE` off (no automatic light sleep or tickless
   idle) and `CONFIG_BT_CTRL_SLEEP_MODE_EFF 0` (no controller modem sleep); both
@@ -687,11 +811,25 @@ contract.
   exponential backoff from 1 to 60 seconds, logging once per attempt.
 - **Bonds:** `CONFIG_BT_SMP_MAX_BONDS` is 15. In ESP-IDF 4.4.7 Bluedroid keeps
   bonds most-recent-first and, once more than 15 exist, silently deletes the
-  least recent ones (`btc_ble_storage.c`, `_btc_storage_save`). Stray phones and
-  menu candidates bond too, which could push out a paired computer's bond and
-  force the owner to forget the device in the OS. The meter therefore records
-  the bonded identity address (from `ESP_GAP_BLE_AUTH_CMPL_EVT`) of every link
-  that proves a pairing secret (up to eight, NVS `peers`), and at boot and after
-  each disconnect, if at least 12 bonds exist, removes every other bond with
-  `esp_ble_remove_bond_device`.
+  least recent ones (`btc_ble_storage.c`, `_btc_storage_save`). Arduino's
+  BLEServer requests encryption from every central that connects, so stray
+  phones bond too and could push out a paired computer's bond, forcing the
+  owner to forget the device in the OS. **A bond persists only for a link that
+  earned it.** The meter reads the bond list (`esp_ble_get_bond_device_list`)
+  when a link connects; when a link ends without earning its bonds, it removes
+  (`esp_ble_remove_bond_device`, before advertising again) only the bonds that
+  are in the list now but were not in the snapshot. Bonds are compared as the
+  identity addresses Bluedroid stores, so no address resolution is needed. If
+  either list cannot be read, nothing is removed; no other bond is ever
+  removed, and nothing is removed at boot. A link earns its bonds when it
+  proves a pairing secret (hello `0` or `9`, or a migration `Y`), completes a
+  menu registration (J `0`, or `9` for an old app that will register again
+  after updating), or when the physical menu closes during the link or closed
+  less than 10 seconds before it began (a computer that lost the race with the
+  owner's choice keeps the bond its OS already stored). A probe that connects
+  while the menu is open and ends without registering loses its bond.
+  Bluedroid's LRU remains the backstop; it can still drop a paired computer's
+  bond only if more than 15 centrals earned bonds. A hello queued at the moment
+  the link drops is not processed, so that link does not earn its bond. The
+  former NVS `peers` list is deleted at boot.
 

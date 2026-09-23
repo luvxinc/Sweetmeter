@@ -1,5 +1,6 @@
 """Cross-language wire fixtures and trust-boundary regression tests (offline)."""
 from __future__ import annotations
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 
 import copy
 from dataclasses import replace

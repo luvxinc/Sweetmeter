@@ -30,7 +30,10 @@ BOARD_ID = "elecrow-crowpanel-2.13-v1.2-jd79661"
 # companions accept releases signed by either key during the transition.
 KEY_ID = "release-1"
 KEYS_DIR = Path(__file__).resolve().parent / "assets" / "keys"
-_KEY_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,14}", re.ASCII)
+# Same rule as scripts/firmware_build.py KEY_ID_PATTERN (the firmware's
+# embedded key table): 1-15 of [a-z0-9-], starting with [a-z0-9]. A key the
+# firmware cannot embed must not be trusted by the companion either.
+_KEY_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,14}", re.ASCII)
 REPOSITORY = "luvxinc/Sweetmeter"
 SERVICE_UUID, CONTROL_UUID, DATA_UUID, STATUS_UUID, OTA_CONTROL_UUID, OTA_DATA_UUID, OTA_STATUS_UUID = (
     f"7a1e000{i}-ff1b-4d9f-a023-47c7752c1a01" for i in range(1, 8)

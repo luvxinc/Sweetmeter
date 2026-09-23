@@ -102,15 +102,22 @@ sleep is a software state, not a physical disconnect of every board component.
 - Deep sleep: 30 s after the selected computer disconnects, 30 minutes without a
   selected computer connecting (outside the menu and updates), top-button hold,
   and critical battery. The top button is always armed as the wake source.
-- Deep sleep keeps time on the internal RC oscillator (roughly ±5%). After more
-  than five minutes asleep the clock shows `--:--` until the computer resets it.
+- Deep sleep keeps time on the internal RC oscillator (roughly ±5%). Once five
+  minutes of sleep have accumulated since the computer last set the clock, it
+  shows `--:--` until the computer resets it.
 - The Bluedroid bond table holds 15 bonds and silently drops the least recent
-  one when full. The firmware removes stale bonds itself (keeping computers that
-  recently proved a pairing secret) once 12 exist, so a paired computer's bond is
-  not lost to stray phones; see `docs/PROTOCOL.md` section 9.
+  one when full. A bond survives only a connection that earned it (the computer
+  proved its pairing secret or registered in the menu); bonds created by other
+  connections, such as a stray phone, are removed when they disconnect. Bonds
+  that existed before a connection are never touched; see `docs/PROTOCOL.md`
+  section 9.
+- After an update from firmware without pairing secrets, the previously
+  selected computer is migrated automatically only within 10 minutes of the
+  meter starting. Otherwise hold the bottom button 3 s and select it again.
 
-**None of these power paths, the low-battery flow, bond eviction or the
-authenticated pairing flow has been validated on hardware yet.**
+**None of these power paths, the low-battery flow, per-link bond removal, the
+migration window or the authenticated pairing flow has been validated on
+hardware yet.**
 
 ## First installation and recovery
 

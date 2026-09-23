@@ -139,6 +139,17 @@ class Desktop:
             self.forget_button.configure(state='disabled')
         ttk.Button(buttons, text='Quit', command=self.quit).pack(side='right')
         ttk.Button(buttons, text='Uninstall…', command=self.uninstall).pack(side='right', padx=8)
+        from .installation import start_at_login_choice
+        try:
+            available, enabled = start_at_login_choice()
+        except OSError:
+            available, enabled = False, True
+        self.start_at_login = tk.BooleanVar(value=enabled)
+        self.start_at_login_box = ttk.Checkbutton(frame, text='Start at login', variable=self.start_at_login,
+                                                  command=self.toggle_start_at_login)
+        self.start_at_login_box.pack(side='bottom', anchor='w')
+        if not available or app.preview_only:
+            self.start_at_login_box.configure(state='disabled')
         self.root.protocol('WM_DELETE_WINDOW', self.root.withdraw)
         if background:
             self.root.withdraw()
@@ -172,6 +183,20 @@ class Desktop:
                                  parent=self.root)
             return
         self.connection.set('Forgetting the meter…')
+
+    def toggle_start_at_login(self):
+        """Record the choice and add or remove the login item right away."""
+        from .installation import InstallError, set_start_at_login
+        wanted = bool(self.start_at_login.get())
+        try:
+            set_start_at_login(wanted)
+        except (InstallError, OSError, ValueError, RuntimeError) as error:
+            logging.warning('Start at login could not be changed (%s)', type(error).__name__)
+            self.start_at_login.set(not wanted)
+            messagebox.showerror('Cannot change login startup',
+                                 plain(str(error) if isinstance(error, InstallError) else '',
+                                       'Sweetmeter could not change its login startup. Try again.'),
+                                 parent=self.root)
 
     def uninstall(self):
         if self.app.updates and self.app.updates.busy:

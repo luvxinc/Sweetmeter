@@ -4,46 +4,72 @@
 #include <string.h>
 
 namespace sweetmeter {
-// ESP-IDF 4.4.7 Bluedroid keeps bonds most-recent-first and, once more than
-// CONFIG_BT_SMP_MAX_BONDS (15) exist, silently deletes the least recent ones
-// (btc_ble_storage.c _btc_storage_save). Stray phones and discovery candidates
-// bond too, so the selected computer's bond could be the one that is lost.
-// Sweetmeter evicts stale bonds itself before the table is nearly full.
-constexpr size_t bondEvictThreshold = 12, recentPeerCount = 8;
+// Arduino's BLEServer asks every central that connects to encrypt, so Bluedroid
+// bonds strangers too, and once more than CONFIG_BT_SMP_MAX_BONDS (15) exist it
+// silently deletes the least recently used bond (btc_ble_storage.c,
+// _btc_storage_save) -- possibly a paired computer's.
+//
+// Root cause fix: a bond survives only a link that earned it. The bond list is
+// read when a link connects; when a link ends without earning its bonds, only
+// the bonds that appeared during that link (present now, absent from the
+// snapshot) are removed. Bonds are compared by the identity address Bluedroid
+// stores, so no address resolution is needed. If either list could not be
+// read, nothing is removed. Bluedroid's own LRU remains the backstop.
+//
+// A link earns its bonds when the central proves a pairing secret (authorized,
+// or "paired but not selected"), completes a menu registration (including an
+// old app's registration that is told to update), or when the physical menu
+// closed during the link or shortly before it began, so a computer that lost
+// the race with the owner's selection keeps the bond its OS already stored.
+constexpr size_t bondListCapacity = 16;              // >= CONFIG_BT_SMP_MAX_BONDS
+constexpr uint32_t bondMenuGraceMs = 10000;          // after the menu closes
 
-// Bond addresses of computers that recently proved a pairing secret (the
-// selected one or another paired one). Strays never prove one, so they cannot
-// push a paired computer out. Persisted as one small NVS blob.
-struct RecentPeers {
-  uint8_t addresses[recentPeerCount][6]{};
+struct BondList {
+  uint8_t addresses[bondListCapacity][6]{};
   uint8_t count = 0;
-  // Returns true when the list changed (the caller persists it).
-  bool touch(const uint8_t *address) {
-    size_t at = 0;
-    while (at < count && memcmp(addresses[at], address, 6)) ++at;
-    if (at == 0 && count) return false;
-    if (at == count) { if (count < recentPeerCount) ++count; at = count - 1; }
-    for (size_t i = at; i > 0; --i) memcpy(addresses[i], addresses[i-1], 6);
-    memcpy(addresses[0], address, 6);
-    return true;
-  }
+  bool valid = false;  // false: the list could not be read
   bool contains(const uint8_t *address) const {
-    for (size_t i = 0; i < count && i < recentPeerCount; ++i) if (!memcmp(addresses[i], address, 6)) return true;
+    for (size_t i = 0; i < count; ++i) if (!memcmp(addresses[i], address, 6)) return true;
     return false;
   }
 };
 
-// Mark bonds to remove. Nothing is removed below the threshold; above it every
-// bond except the current link and recently authenticated peers goes.
-inline size_t chooseBondEvictions(const uint8_t (*bonds)[6], size_t count, const uint8_t *selected,
-                                  const uint8_t *current, const RecentPeers &recent, bool *evict) {
-  size_t evicted = 0;
-  for (size_t i = 0; i < count; ++i) {
-    evict[i] = count >= bondEvictThreshold &&
-               !(selected && !memcmp(bonds[i], selected, 6)) &&
-               !(current && !memcmp(bonds[i], current, 6)) && !recent.contains(bonds[i]);
-    if (evict[i]) ++evicted;
+// Bonds present in `after` that were absent from `before`; none unless both
+// lists were read.
+inline size_t bondsAddedDuring(const BondList &before, const BondList &after, uint8_t (*out)[6]) {
+  if (!before.valid || !after.valid) return 0;
+  size_t added = 0;
+  for (size_t i = 0; i < after.count && i < bondListCapacity; ++i)
+    if (!before.contains(after.addresses[i])) memcpy(out[added++], after.addresses[i], 6);
+  return added;
+}
+
+// Tracks the single current link. connected()/ended() run in the Bluetooth
+// callback task, earned() in the worker; the caller serializes them.
+class LinkBonds {
+ public:
+  void connected(uint32_t generation, const BondList &snapshot) {
+    generation_ = generation; before_ = snapshot; earned_ = false; active_ = true;
   }
-  return evicted;
+  void earned(uint32_t generation) { if (active_ && generation == generation_) earned_ = true; }
+  bool isEarned() const { return earned_; }
+  // Returns how many bonds of the ended link to remove (written to `out`).
+  size_t ended(uint32_t generation, const BondList &now, uint8_t (*out)[6]) {
+    if (!active_ || generation != generation_) return 0;
+    active_ = false;
+    return earned_ ? 0 : bondsAddedDuring(before_, now, out);
+  }
+ private:
+  BondList before_;
+  uint32_t generation_ = 0;
+  bool active_ = false, earned_ = false;
+};
+
+// The menu closed while this link was open, or the link began within the
+// grace period after it closed: the central may have lost that race.
+inline bool menuRaceEarnsBond(bool menuClosedDuringLink, uint32_t linkStartedAt, uint32_t menuClosedAt,
+                              bool menuEverClosed) {
+  return menuClosedDuringLink ||
+         (menuEverClosed && uint32_t(linkStartedAt - menuClosedAt) < bondMenuGraceMs);
 }
 }  // namespace sweetmeter

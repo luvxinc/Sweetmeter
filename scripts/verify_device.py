@@ -8,7 +8,7 @@ import json
 import time
 from pathlib import Path
 
-import serial
+READY_MARKERS = ('READY SWEETMETER', 'READY QM')
 
 
 def read_json(path):
@@ -18,7 +18,37 @@ def read_json(path):
         return {}
 
 
+def recovery_result(cycle, reset_at, serial_events, saved, ack, expected_host):
+    """Pass/fail for one EN reset, or None while recovery is still in progress.
+
+    Firmware reports no uptime, so recovery is proven by ordering instead:
+    exactly one serial READY marker after the reset pulse (the new boot), then
+    a trusted status the companion saved after that boot (it saves only
+    statuses from an authenticated link) that shows the selected computer and a
+    synchronized clock, and a frame ACK received after that boot.
+    """
+    lines = [event['value'] for event in serial_events]
+    if any('panic\'ed' in line or 'Guru Meditation' in line for line in lines):
+        return {'cycle': cycle, 'pass': False, 'reason': 'Panic during recovery'}
+    ready = [event['at'] for event in serial_events if any(marker in event['value'] for marker in READY_MARKERS)]
+    if len(ready) > 1:
+        return {'cycle': cycle, 'pass': False, 'reason': 'Unexpected second boot during recovery'}
+    if not ready or ready[0] < reset_at:
+        return None
+    booted_at = ready[0]
+    device = saved.get('status', {}) if isinstance(saved.get('status'), dict) else {}
+    selected = (device.get('selected') is True if device.get('auth') == 1
+                else device.get('selected_host') == expected_host)
+    if (saved.get('seen_at', 0) > booted_at and device.get('clock_synced') is True and selected and
+            ack.get('received_at', 0) > booted_at):
+        return {'cycle': cycle, 'pass': True, 'recovered_in_seconds': round(ack['received_at'] - reset_at, 2),
+                'ready_after_seconds': round(booted_at - reset_at, 2), 'status': saved, 'ack': ack}
+    return None
+
+
 def main():
+    import serial
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', required=True, help='Diagnostic serial port for this device')
     parser.add_argument('--reset-cycles', type=int, default=0)
@@ -74,23 +104,9 @@ def main():
             stream.rts = False
             while time.time() - started < args.recovery_timeout:
                 status, ack = observe()
-                device = status.get('status', {})
-                serial_lines = [event['value'] for event in evidence['events'][first_event:]
-                                if event['kind'] == 'serial']
-                if (any('panic\'ed' in line or 'Guru Meditation' in line for line in serial_lines) or
-                        sum(('READY QM' in line or 'READY SWEETMETER' in line) for line in serial_lines) > 1):
-                    result = {'cycle': cycle + 1, 'pass': False,
-                              'reason': 'Panic or unexpected second boot during recovery'}
-                    break
-                if (status.get('seen_at', 0) > started and
-                        device.get('clock_synced') and
-                        (device.get('selected') is True if device.get('auth') == 1
-                         else device.get('selected_host') == expected_host) and
-                        device.get('uptime_ms', 9999999) < (time.time() - started + 3) * 1000 and
-                        ack.get('received_at', 0) > started):
-                    result = {'cycle': cycle + 1, 'pass': True,
-                              'recovered_in_seconds': round(time.time() - started, 2),
-                              'status': status, 'ack': ack}
+                serial_events = [event for event in evidence['events'][first_event:] if event['kind'] == 'serial']
+                result = recovery_result(cycle + 1, started, serial_events, status, ack, expected_host)
+                if result is not None:
                     break
             else:
                 result = {'cycle': cycle + 1, 'pass': False,

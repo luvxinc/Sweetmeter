@@ -199,8 +199,10 @@ successfully does not resolve that permission.
 ## Release key
 
 Every `meter/assets/keys/<key-id>.pem` is a trusted verification key named by its
-key ID (1–15 characters, `[a-z0-9._-]`, fitting the 16-byte firmware header
-field). `meter.protocol.KEY_ID` (currently `release-1`) is the key new releases
+key ID (1–15 characters of `[a-z0-9-]`, starting with a letter or digit, fitting
+the 16-byte firmware header field; the companion loader and the firmware build
+`scripts/firmware_build.py` enforce the same rule, so dots and underscores are
+rejected by both). `meter.protocol.KEY_ID` (currently `release-1`) is the key new releases
 are signed with; manifests and firmware envelopes carry the signing key ID and
 are accepted if that ID is shipped. The firmware keeps an equivalent trusted-key
 list. Release data can never add a key. The signer refuses a package whose
@@ -370,12 +372,25 @@ XDG autostart unit stays alive; on Windows it starts the app without a console
 window and exits.
 
 The health receipt includes Bluetooth when the previous version had working
-Bluetooth (`radio.health == 'ok'`): the new version must reach `ok` (or `off`,
-which is the user's choice and never causes a rollback) within 90 seconds. A
-persisting `unauthorized` (for example an ad-hoc re-signed macOS app that lost
-its permission and the user did not click Allow) or a radio that never starts
-is reported as unhealthy; the backup is kept and restored, and the user is told
-to allow Bluetooth and retry. If the previous version already lacked Bluetooth,
+Bluetooth (`radio.health == 'ok'`): the new version confirms as soon as it
+reaches `ok` (or `off`, which is the user's choice and never causes a rollback).
+No state yet (`None`, e.g. while the macOS permission prompt is open) means
+waiting: after about 10 s the user is reminded to allow Bluetooth, and the
+watcher follows a Bluetooth worker the app restarted meanwhile. The helper
+gives the app `HEALTH_TIMEOUT` (180 s, capped at 300 s) and passes that
+deadline as `SWEETMETER_UPDATE_DEADLINE`; the app answers about 15 s before it
+(or within 110 s when an older helper passed no deadline, since those stop
+waiting after 150 s). If the state is still unknown at the deadline, the update
+is kept. Only a persisting `unauthorized` (for example an ad-hoc re-signed macOS
+app that lost its permission and the user chose Don't Allow) or a radio that
+failed to start (its startup error, or every bounded restart used up) is
+reported as unhealthy; the backup is kept and restored, and the user is told to
+allow Bluetooth and retry. A rolled-back version is recorded and not offered
+again automatically. On a rollback the helper also stops every process running
+from the new app folder (found by executable path, so a macOS app that hangs
+before reporting its PID is stopped too) and never deletes a folder a process
+still runs from; the launcher then finishes the rollback at the next login.
+If the previous version already lacked Bluetooth,
 the new one is not held to it, so a denied permission cannot cause a loop of
 failed updates. Source/unmanaged or unwritable installs offer verified manual
 extraction without claiming success.

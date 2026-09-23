@@ -59,17 +59,17 @@ static void linkAuthorization() {
     LinkAuth shortPacket;assert(shortPacket.proofHello(packet,16,registry,challenge,serial,false,false).result==helloRejected);
   }
   { // Knowing the selected host ID is no longer enough.
-    LinkAuth link;uint8_t legacy[37]={'H'};memcpy(legacy+1,hostA,36);
-    AuthOutcome o=link.legacyHello(legacy,37,registry,false,false);
+    LegacyWindow window;LinkAuth link;uint8_t legacy[37]={'H'};memcpy(legacy+1,hostA,36);
+    AuthOutcome o=link.legacyHello(legacy,37,registry,false,false,window,0);
     assert(o.result==helloRejected && o.drop && !link.authorized());
   }
   { // Hello during OTA never revokes or changes authorization.
-    LinkAuth link;helloPacket(packet,secretA,challenge,hostA);
+    LegacyWindow window;LinkAuth link;helloPacket(packet,secretA,challenge,hostA);
     assert(link.proofHello(packet,17,registry,challenge,serial,false,false).result==helloOk);
     uint8_t legacy[37]={'H'};memcpy(legacy+1,hostB,36);
-    AuthOutcome o=link.legacyHello(legacy,37,registry,false,true);
+    AuthOutcome o=link.legacyHello(legacy,37,registry,false,true,window,0);
     assert(o.result==helloOk && !o.drop && link.authorized());
-    LinkAuth idle;o=idle.legacyHello(legacy,37,registry,false,true);
+    LinkAuth idle;o=idle.legacyHello(legacy,37,registry,false,true,window,0);
     assert(o.result==helloRejected && !o.drop && idle.state==LinkAuth::State::Open);
   }
 }
@@ -77,23 +77,37 @@ static void legacyMigration() {
   Registry registry;registry.migrateLegacy(hostA,36,"Mac");
   assert(registry.count==1 && registry.selected==0 && !registry.current()->hasSecret);
   uint8_t legacy[40]={'H'};memcpy(legacy+1,hostA,36);memcpy(legacy+37,"Mac",3);
-  { // Another host ID is refused.
+  LegacyWindow window;
+  { // Another host ID is refused and does not use up the migration.
     LinkAuth link;uint8_t other[37]={'H'};memcpy(other+1,hostB,36);
-    assert(link.legacyHello(other,37,registry,false,false).result==helloRejected);
+    assert(link.legacyHello(other,37,registry,false,false,window,0).result==helloRejected);
   }
   LinkAuth link;
-  AuthOutcome o=link.legacyHello(legacy,40,registry,false,false);
+  AuthOutcome o=link.legacyHello(legacy,40,registry,false,false,window,0);
   assert(o.result==helloProvision && !o.drop && !link.authorized());
   uint8_t y[33]={'Y'};
   assert(!link.provisionAllowed(y,33));  // all-zero secret
   memset(y+1,0x44,32);assert(link.provisionAllowed(y,33) && !link.provisionAllowed(y,32));
   o=link.provisioned(true);assert(o.result==helloOk && o.changed && link.authorized());
-  LinkAuth failed;failed.legacyHello(legacy,40,registry,false,false);o=failed.provisioned(false);
+  // The first matching legacy hello consumes the migration window.
+  LinkAuth second;assert(second.legacyHello(legacy,40,registry,false,false,window,0).result==helloRejected);
+  LegacyWindow retry;LinkAuth failed;failed.legacyHello(legacy,40,registry,false,false,retry,0);o=failed.provisioned(false);
   assert(o.result==helloStoreFailed && o.drop && !failed.authorized());
+  { // Only within ten minutes of boot; afterwards the owner must pair via the menu.
+    LegacyWindow late;assert(late.open(LegacyWindow::windowMs-1));
+    LinkAuth link;assert(link.legacyHello(legacy,40,registry,false,false,late,LegacyWindow::windowMs).result==helloRejected);
+    // Latched: millis() wrapping around later cannot reopen it.
+    assert(!late.open(5) && link.state==LinkAuth::State::Closed);
+    LegacyWindow inTime;LinkAuth ok;assert(ok.legacyHello(legacy,40,registry,false,false,inTime,LegacyWindow::windowMs-1).result==helloProvision);
+    // A menu-open or OTA hello never consumes it.
+    LegacyWindow kept;LinkAuth menu;assert(menu.legacyHello(legacy,40,registry,true,false,kept,0).result==helloRejected);
+    LinkAuth otaLink;otaLink.legacyHello(legacy,40,registry,false,true,kept,0);
+    LinkAuth later;assert(later.legacyHello(legacy,40,registry,false,false,kept,1).result==helloProvision);
+  }
   LinkAuth noHello;assert(!noHello.provisionAllowed(y,33));
   // Once a secret exists, legacy H is refused for good.
   registry.add(hostA,"Mac",y+1,true);
-  LinkAuth after;assert(after.legacyHello(legacy,40,registry,false,false).result==helloRejected);
+  LegacyWindow fresh;LinkAuth after;assert(after.legacyHello(legacy,40,registry,false,false,fresh,0).result==helloRejected);
   // Invalid legacy NVS data leaves no selection.
   Registry bad;bad.migrateLegacy("not-a-host",10,"Mac");assert(!bad.count && bad.selected<0);
   Registry unnamed;unnamed.migrateLegacy(hostA,36,"");assert(!strcmp(unnamed.entries[0].name,"Computer"));

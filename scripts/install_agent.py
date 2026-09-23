@@ -68,6 +68,19 @@ def ensure_venv(folder):
     return python, identity
 
 
+def _record_startup_choice(enabled):
+    """Remember an explicit choice so a later repair does not undo it."""
+    path = data_dir() / 'install.json'
+    try:
+        record = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    if isinstance(record, dict) and record.get('startup') != enabled:
+        temporary = path.with_name('install.json.tmp')
+        temporary.write_text(json.dumps(dict(record, startup=enabled)) + '\n', encoding='utf-8')
+        os.replace(temporary, path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--app', type=Path)
@@ -76,8 +89,10 @@ def main():
     parser.add_argument('--uninstall', action='store_true', help='Remove this installation and its startup entry')
     parser.add_argument('--remove-data', action='store_true', help='With --uninstall: also delete state')
     args = parser.parse_args()
+    os.umask(0o077)  # Install record, runtime and state are private to this user.
     if args.remove_startup:
         startup([], enable=False)
+        _record_startup_choice(False)
         return
     if args.uninstall:
         try:
@@ -86,7 +101,6 @@ def main():
         except InstallError as error:
             raise SystemExit(str(error))
         return
-    os.umask(0o077)
     root = data_dir()
     state = default_state_dir()
     state.mkdir(parents=True, exist_ok=True)
@@ -116,13 +130,15 @@ def main():
         launcher = runtime / 'run.py'
         launcher.write_text('from meter.__main__ import main\nif __name__ == "__main__":\n    raise SystemExit(main())\n')
         command = [str(python), str(launcher)]
-        info = {'kind': 'source', 'root': str(runtime), 'startup': not args.no_startup}
+        info = {'kind': 'source', 'root': str(runtime), 'startup': not args.no_startup, 'command': command}
     temporary = root / 'install.json.tmp'
     temporary.write_text(json.dumps(info) + '\n', encoding='utf-8')
     os.replace(temporary, root / 'install.json')
     if not args.no_startup:
         retire_legacy_startup()
         startup(command + ['--background', '--state-dir', str(state)])
+    else:
+        startup([], enable=False)  # --no-startup also removes an entry an earlier install created.
     print('Installed:', info['root'])
     print('State preserved:', state)
     print('Start:', subprocess.list2cmdline(command))

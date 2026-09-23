@@ -1,4 +1,5 @@
 """Firmware trust table: every shipped public key is embedded, selected by key ID."""
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import importlib.util
 import os
 import tempfile
@@ -38,6 +39,25 @@ class FirmwareKeyTableTests(unittest.TestCase):
 
     def key(self, name, text):
         (self.root / "meter/assets/keys" / name).write_text(text)
+
+    def test_companion_and_firmware_accept_exactly_the_same_key_ids(self):
+        from meter import protocol
+        samples = ["release-1", "backup-2", "a", "k" * 15, "k" * 16, "release.1", "release_1", "Release-1",
+                   "-release", "", "rélease", "release 1"]
+        for key_id in samples:
+            with self.subTest(key_id=key_id):
+                self.assertEqual(bool(protocol._KEY_ID_RE.fullmatch(key_id)),
+                                 bool(self.module.KEY_ID_PATTERN.fullmatch(key_id)))
+        folder = self.root / "meter/assets/keys"
+        for name in ("release.2.pem", "release_2.pem"):
+            with self.subTest(name=name):
+                for path in folder.glob("*.pem"):
+                    path.unlink()
+                self.key(name, public_pem())
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.trusted_keys(folder)
+                with self.assertRaises(ValueError):
+                    self.module.trusted_key_table(self.root)
 
     def test_repository_key_is_embedded(self):
         keys = self.module.trusted_key_table(ROOT)

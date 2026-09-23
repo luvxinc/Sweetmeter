@@ -1,4 +1,5 @@
 """Install repair, startup registration and uninstall in a sandboxed home only."""
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import json
 import os
 from pathlib import Path
@@ -52,16 +53,19 @@ class Sandbox(unittest.TestCase):
     def name(self):
         return 'Sweetmeter.app' if sys.platform == 'darwin' else 'Sweetmeter'
 
-    def make_app(self, root, marker=b'app'):
+    def make_app(self, root, marker=b'app', version='2026.9.1'):
         executable = Path(paths.app_command(root)[0])
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_bytes(marker)
         if sys.platform == 'darwin':
             (root / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': paths.BUNDLE_ID}))
+            (root / 'Contents/Resources').mkdir(parents=True, exist_ok=True)
+            (root / 'Contents/Resources/VERSION').write_text(version + '\n')
             helper = root / 'Contents/Frameworks' / self_update.HELPER_NAME
         else:
             (root / '_internal').mkdir(exist_ok=True)
             (root / '_internal/build-metadata.json').write_text(json.dumps({'kind': 'sweetmeter-companion-build'}))
+            (root / '_internal/VERSION').write_text(version + '\n')
             helper = root / '_internal' / self_update.HELPER_NAME
         helper.parent.mkdir(parents=True, exist_ok=True)
         helper.write_bytes(b'launcher ' + marker)
@@ -97,9 +101,14 @@ class RepairTests(Sandbox):
         paths.data_dir().mkdir(parents=True)
         (paths.data_dir() / 'install.json').write_text(json.dumps(
             {'kind': 'native', 'root': str(destination), 'startup': False}))
+        with patch.object(installation, 'startup') as startup, \
+                patch.object(installation, 'startup_registered', return_value=True):
+            installation.ensure_registration(destination)
+        # The choice is off: an existing entry is removed, never (re)created.
+        startup.assert_called_once_with([], enable=False)
         with patch.object(installation, 'startup') as startup:
             installation.ensure_registration(destination)
-        startup.assert_not_called()
+        startup.assert_not_called()  # Nothing registered: no launchctl/registry work at every start.
 
     def test_pending_update_never_replaces_the_launcher(self):
         destination = self.make_app(paths.default_install_root())
@@ -280,11 +289,308 @@ class UninstallTests(Sandbox):
                 installation.uninstall()
         self.assertTrue(destination.exists())
 
+    def test_app_is_moved_aside_before_anything_is_deleted(self):
+        destination, _ = self.install()
+        seen = []
+        real_remove = installation._remove
+        def remove(path, removed):
+            seen.append((Path(path).name, destination.exists()))
+            return real_remove(path, removed)
+        with patch.object(installation, 'startup'), patch.object(installation, '_remove', side_effect=remove):
+            removed = installation.uninstall()
+        self.assertIn(destination, removed)
+        deleted = [name for name, _ in seen if '.removing-' in name]
+        self.assertEqual(len(deleted), 1)
+        self.assertTrue(all(not present for name, present in seen if '.removing-' in name))
+        self.assertEqual(installation._sibling_leftovers(destination), [])
+
+    def test_failed_move_deletes_nothing_and_restores_the_login_item(self):
+        destination, _ = self.install()
+        real_rename = Path.rename
+        def rename(path, target):
+            if '.removing-' in Path(target).name:
+                raise PermissionError('in use')
+            return real_rename(path, target)
+        with patch.object(Path, 'rename', rename), patch.object(self_update.time, 'sleep'), \
+                patch.object(installation, 'startup') as startup:
+            with self.assertRaisesRegex(installation.InstallError, 'Nothing was deleted'):
+                installation.uninstall()
+        startup.assert_not_called()  # Failed before the login item was touched.
+        self.assertTrue(Path(paths.app_command(destination)[0]).is_file())
+        self.assertTrue((paths.data_dir() / 'install.json').is_file())
+
+    def test_failed_login_item_removal_puts_the_app_back(self):
+        destination, _ = self.install()
+        with patch.object(installation, 'startup', side_effect=installation.InstallError('launchd')), \
+                patch.object(installation, 'startup_registered', return_value=False), \
+                patch.object(installation, 'ensure_registration') as register:
+            with self.assertRaises(installation.InstallError):
+                installation.uninstall()
+        self.assertTrue(Path(paths.app_command(destination)[0]).is_file())
+        self.assertEqual(installation._sibling_leftovers(destination), [])
+        register.assert_not_called()  # Nothing was registered before, so nothing to restore.
+
+    def test_restores_a_removed_login_item_when_the_app_cannot_be_moved_back(self):
+        destination, _ = self.install()
+        states = iter([True, False])
+        with patch.object(installation, 'startup', side_effect=installation.InstallError('launchd')), \
+                patch.object(installation, 'startup_registered', side_effect=lambda: next(states)), \
+                patch.object(installation, 'ensure_registration') as register:
+            with self.assertRaises(installation.InstallError):
+                installation.uninstall()
+        register.assert_called_once()
+        self.assertEqual(register.call_args.args[0], destination)
+
+    def test_undeletable_leftover_is_reported_plainly(self):
+        destination, _ = self.install()
+        import shutil
+        real_rmtree = shutil.rmtree
+        def rmtree(path, *args, **kwargs):
+            if '.removing-' in Path(path).name:
+                raise PermissionError('locked')
+            return real_rmtree(path, *args, **kwargs)
+        with patch.object(installation, 'startup'), patch.object(self_update.time, 'sleep'), \
+                patch.object(installation.shutil, 'rmtree', rmtree):
+            with self.assertRaisesRegex(installation.InstallError, 'could not be deleted'):
+                installation.uninstall()
+        self.assertFalse(destination.exists())  # Never half-deleted under its real name.
+        leftovers = installation._sibling_leftovers(destination)
+        self.assertEqual(len(leftovers), 1)
+        with patch.object(installation, 'startup'):
+            installation.uninstall()  # A later run removes it.
+        self.assertEqual(installation._sibling_leftovers(destination), [])
+
+    def test_uninstall_refuses_during_an_update_swap(self):
+        destination, _ = self.install()
+        with self_update._update_lock():
+            with patch.object(installation, 'startup') as startup:
+                with self.assertRaisesRegex(installation.InstallError, 'update is being installed'):
+                    installation.uninstall()
+        startup.assert_not_called()
+        self.assertTrue(destination.exists())
+
+    def test_interrupted_update_is_finished_before_uninstalling(self):
+        destination, state = self.install()
+        backup = destination.with_name(destination.name + '.previous-abc123abc123')
+        destination.rename(backup)
+        self.make_app(destination, b'new')
+        (paths.data_dir() / 'companion-swap.json').write_text(json.dumps(dict(
+            schema=1, root=str(destination), nonce='abc123abc123', state_dir=str(state),
+            version='2026.9.2', stage='new_installed')))
+        with patch.object(installation, 'startup'):
+            installation.uninstall()
+        self.assertFalse(destination.exists())
+        self.assertFalse(backup.exists())
+        self.assertFalse((paths.data_dir() / 'companion-swap.json').exists())
+
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX permission mask')
+    def test_uninstall_command_uses_a_private_umask(self):
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        seen = []
+        def record(*args, **kwargs):
+            current = os.umask(0)
+            os.umask(current)
+            seen.append(current)
+            return []
+        with patch.object(installation, 'uninstall', side_effect=record), patch('sys.stdout'):
+            installation.uninstall_main([])
+        self.assertEqual(seen, [0o077])
+
     def test_uninstall_main_prints_plain_error(self):
         with patch.object(installation, 'uninstall', side_effect=installation.InstallError('Quit it first.')), \
                 patch('sys.stderr') as stderr:
             self.assertEqual(installation.uninstall_main([]), 1)
         self.assertIn('Quit it first.', ''.join(call.args[0] for call in stderr.write.call_args_list))
+
+
+class InstallerRepairTests(Sandbox):
+    """Re-running the installer over an existing managed copy (install.sh/ps1)."""
+
+    def installed(self, version='2026.9.1', marker=b'installed'):
+        destination = self.make_app(paths.default_install_root(), marker, version)
+        paths.data_dir().mkdir(parents=True, exist_ok=True)
+        (paths.data_dir() / 'install.json').write_text(json.dumps(
+            {'kind': 'native', 'root': str(destination), 'startup': True}))
+        return destination
+
+    def download(self, version='2026.9.2', marker=b'download'):
+        return self.make_app(self.root / 'download' / self.name, marker, version)
+
+    def install(self, source):
+        messages = []
+        with patch.object(installation, 'startup') as startup:
+            result = installation.install_native(source, start_at_login=None, report=messages.append)
+        return result, messages, startup
+
+    def executable(self, root):
+        return Path(paths.app_command(root)[0]).read_bytes()
+
+    def test_older_copy_is_replaced_atomically_then_registered(self):
+        destination = self.installed('2026.9.1')
+        result, messages, startup = self.install(self.download('2026.9.2'))
+        self.assertEqual(result, destination)
+        self.assertEqual(self.executable(destination), b'download')
+        self.assertEqual(installation.tree_version(destination).as_tuple(), (2026, 9, 2))
+        self.assertEqual(messages, ['Updated Sweetmeter 2026.9.1 to 2026.9.2.'])
+        # Same journaled swap as updates, fully finished: no journal or siblings left.
+        self.assertFalse((paths.data_dir() / 'companion-swap.json').exists())
+        self.assertEqual(installation._sibling_leftovers(destination), [])
+        self.assertTrue(startup.call_args.kwargs['start_now'])
+
+    def test_same_version_failing_its_self_test_is_replaced(self):
+        destination = self.installed('2026.9.2')
+        self.run_mock.return_value = Mock(returncode=1, stdout=b'', stderr=b'')
+        _, messages, _ = self.install(self.download('2026.9.2'))
+        self.assertEqual(self.executable(destination), b'download')
+        self.assertIn('Replaced a damaged Sweetmeter installation (it failed its self-test)', messages[0])
+        command = self.run_mock.call_args_list[0].args[0]
+        self.assertEqual(command[-1], '--self-test')
+
+    def test_same_version_with_damaged_files_is_replaced(self):
+        destination = self.installed('2026.9.2')
+        (Path(paths.app_command(destination)[0]).parent / 'bad').symlink_to('/etc')
+        _, messages, _ = self.install(self.download('2026.9.2'))
+        self.assertEqual(self.executable(destination), b'download')
+        self.assertIn('its files are damaged', messages[0])
+
+    def test_healthy_same_or_newer_copy_is_kept_and_only_registration_repaired(self):
+        for installed_version, note in (('2026.9.2', ''), ('2026.9.5', ' (newer than this package)')):
+            with self.subTest(installed=installed_version):
+                destination = self.installed(installed_version)
+                _, messages, startup = self.install(self.download('2026.9.2'))
+                self.assertEqual(self.executable(destination), b'installed')
+                self.assertEqual(messages, [f'Sweetmeter {installed_version}{note} is already installed '
+                                            'and working; its login startup was checked.'])
+                startup.assert_called_once()
+                import shutil
+                shutil.rmtree(destination)
+                shutil.rmtree(self.root / 'download')
+
+    def test_replacement_waits_for_no_update_and_never_runs_during_one(self):
+        destination = self.installed('2026.9.1')
+        source = self.download('2026.9.2')
+        with self_update._update_lock():
+            with self.assertRaisesRegex(installation.InstallError, 'update is being installed'):
+                self.install(source)
+        self.assertEqual(self.executable(destination), b'installed')
+
+    def test_interrupted_replacement_restores_the_previous_copy(self):
+        destination = self.installed('2026.9.1')
+        source = self.download('2026.9.2')
+        real_rename = Path.rename
+        def rename(path, target):
+            if '.incoming-' in Path(path).name:
+                raise PermissionError('in use')
+            return real_rename(path, target)
+        with patch.object(Path, 'rename', rename), patch.object(self_update.time, 'sleep'):
+            with self.assertRaises(PermissionError):
+                self.install(source)
+        self.assertEqual(self.executable(destination), b'installed')
+        self.assertFalse((paths.data_dir() / 'companion-swap.json').exists())
+        self.assertEqual(installation._sibling_leftovers(destination), [])
+
+    def test_running_app_is_stopped_before_replacement(self):
+        destination = self.installed('2026.9.1')
+        with patch.object(installation, 'stop_running_app', return_value=False):
+            with self.assertRaisesRegex(installation.InstallError, 'still running'):
+                self.install(self.download('2026.9.2'))
+        self.assertEqual(self.executable(destination), b'installed')
+
+    def test_installed_copy_checking_itself_reports_damage(self):
+        destination = self.installed('2026.9.2')
+        (destination / ('Contents/Resources/VERSION' if sys.platform == 'darwin' else '_internal/VERSION')).unlink()
+        with self.assertRaisesRegex(installation.InstallError, 'damaged'):
+            self.install(destination)
+
+    def test_recorded_start_at_login_choice_survives_a_reinstall(self):
+        destination = self.installed('2026.9.1')
+        record = json.loads((paths.data_dir() / 'install.json').read_text())
+        (paths.data_dir() / 'install.json').write_text(json.dumps(dict(record, startup=False)))
+        with patch.object(installation, 'open_installed') as opened, \
+                patch.object(installation, 'startup_registered', return_value=True):
+            _, _, startup = self.install(self.download('2026.9.2'))
+        startup.assert_called_once_with([], enable=False)
+        opened.assert_called_once_with(destination)
+
+
+class StartAtLoginTests(Sandbox):
+    def test_checkbox_turns_the_entry_off_and_on_and_is_remembered(self):
+        registered = patch.object(installation, 'startup_registered', return_value=True)
+        registered.start()
+        self.addCleanup(registered.stop)
+        destination = self.make_app(paths.default_install_root())
+        with patch.object(installation, 'startup'):
+            installation.install_native(destination)
+        self.assertEqual(installation.start_at_login_choice(), (True, True))
+        with patch.object(installation, 'startup') as startup:
+            installation.set_start_at_login(False)
+        startup.assert_called_once_with([], enable=False)
+        self.assertEqual(installation.start_at_login_choice(), (True, False))
+        # A later repair from the running app keeps it off.
+        with patch.object(installation, 'startup') as startup:
+            installation.ensure_registration(destination, start_now=False)
+        startup.assert_called_once_with([], enable=False)
+        with patch.object(installation, 'startup') as startup:
+            installation.set_start_at_login(True)
+        self.assertFalse(startup.call_args.kwargs['start_now'])
+        self.assertIn('--background', startup.call_args.args[0])
+        self.assertEqual(installation.start_at_login_choice(), (True, True))
+
+    def test_source_install_choice_uses_the_recorded_command(self):
+        paths.data_dir().mkdir(parents=True)
+        (paths.data_dir() / 'install.json').write_text(json.dumps(
+            {'kind': 'source', 'root': str(paths.data_dir() / 'runtime'), 'startup': True,
+             'command': ['/venv/python', '/runtime/run.py']}))
+        with patch.object(installation, 'startup') as startup:
+            installation.set_start_at_login(False)
+            installation.set_start_at_login(True)
+        self.assertEqual(startup.call_args_list[0].args, ([],))
+        self.assertEqual(startup.call_args_list[1].args[0][:2], ['/venv/python', '/runtime/run.py'])
+
+    def test_unavailable_without_an_installation(self):
+        self.assertEqual(installation.start_at_login_choice()[0], False)
+        with self.assertRaises(installation.InstallError):
+            installation.set_start_at_login(True)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'LaunchAgent')
+    def test_repair_rewrites_any_changed_field_and_reloads(self):
+        agent = self.home / 'Library/LaunchAgents' / (installation.LABEL + '.plist')
+        with patch.dict(os.environ, PATH='/opt/homebrew/bin:/usr/bin', CODEX_HOME='/codex'):
+            installation.startup(['/launcher', '--launch'], start_now=True)
+        self.run_mock.reset_mock()
+        # Same program, same everything: nothing is written or reloaded.
+        installation.startup(['/launcher', '--launch'], start_now=False)
+        self.run_mock.assert_not_called()
+        # An older release wrote another ProcessType and output path.
+        config = plistlib.loads(agent.read_bytes())
+        config.update(ProcessType='Background', StandardOutPath='/old/agent.log')
+        agent.write_bytes(plistlib.dumps(config))
+        with patch.dict(os.environ, PATH='/usr/bin:/bin'):
+            os.environ.pop('CODEX_HOME', None)
+            installation.startup(['/launcher', '--launch'], start_now=False)
+        config = plistlib.loads(agent.read_bytes())
+        self.assertEqual(config['ProcessType'], 'Interactive')
+        self.assertIn('launcher-output.log', config['StandardOutPath'])
+        self.assertEqual(config['EnvironmentVariables'], {'PATH': '/opt/homebrew/bin:/usr/bin', 'CODEX_HOME': '/codex'})
+        commands = [call.args[0][:2] for call in self.run_mock.call_args_list]
+        self.assertEqual(commands, [['launchctl', 'bootout'], ['launchctl', 'bootstrap']])
+
+    def test_linux_repair_rewrites_a_damaged_entry_but_keeps_profile_variables(self):
+        entry = self.home / 'config/autostart/sweetmeter.desktop'
+        with patch.object(sys, 'platform', 'linux'), patch.dict(os.environ, CODEX_HOME='/my codex'):
+            installation.startup(['/old launcher', '--launch'], start_now=False)
+        self.assertIn('"CODEX_HOME=/my codex"', entry.read_text())
+        with patch.object(sys, 'platform', 'linux'):
+            os.environ.pop('CODEX_HOME', None)
+            installation.startup(['/new launcher', '--launch'], start_now=False)
+        text = entry.read_text()
+        self.assertIn('"/new launcher"', text)
+        self.assertIn('"CODEX_HOME=/my codex"', text)
+        entry.write_text('garbage')
+        with patch.object(sys, 'platform', 'linux'):
+            installation.startup(['/new launcher', '--launch'], start_now=False)
+        self.assertIn('Exec="/new launcher" "--launch"', entry.read_text())
 
 
 if __name__ == '__main__':

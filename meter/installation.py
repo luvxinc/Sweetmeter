@@ -26,7 +26,7 @@ UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\Sweetmeter
 RUN_VALUE = 'Sweetmeter'
 # Files this module (or the updater) creates directly under data_dir().
 MANAGED_FILES = ('install.json', 'startup-environment.json', 'companion-swap.json', 'helper.log',
-                 'helper.log.1', 'install-error.txt')
+                 'helper.log.1', 'install-error.txt', 'install-result.txt')
 
 
 class InstallError(RuntimeError):
@@ -165,13 +165,50 @@ def _startup_environment():
     return {key: os.environ[key] for key in PROFILE_ENV if key in os.environ}
 
 
+def _desktop_quote(value):
+    """Desktop-entry quoting differs from shell quoting; escape reserved syntax."""
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%') + '"'
+
+
+def _desktop_tokens(text):
+    """Inverse of _desktop_quote for an Exec line this module wrote."""
+    tokens = []
+    for match in re.finditer(r'"((?:[^"\\]|\\.)*)"', text):
+        tokens.append(re.sub(r'\\(.)', r'\1', match.group(1)).replace('%%', '%'))
+    return tokens
+
+
+def _existing_desktop_environment(destination):
+    """Profile variables recorded in an existing autostart entry's Exec line."""
+    try:
+        lines = destination.read_text(encoding='utf-8').splitlines()
+    except (OSError, UnicodeError):
+        return None
+    for line in lines:
+        if line.startswith('Exec='):
+            tokens = _desktop_tokens(line[5:])
+            environment = {}
+            if tokens[:1] == ['env']:
+                for token in tokens[1:]:
+                    key, separator, value = token.partition('=')
+                    if not separator:
+                        break
+                    if key in PROFILE_ENV:
+                        environment[key] = value
+            return environment
+    return None
+
+
 def startup(command, *, enable=True, start_now=True):
     """Create (or with enable=False remove) this user's login startup entry.
 
     `start_now` also starts the command immediately (explicit installs). A
     repair (`start_now=False`) runs inside an app that may have been opened
-    from Finder/Explorer without the user's shell PATH or profile variables, so
-    it only creates a missing entry and keeps an existing entry's environment.
+    from Finder/Explorer without the user's shell PATH or profile variables:
+    it keeps an existing entry's environment but rewrites every other field
+    this module manages when one differs (program, output path, process
+    type…). A rewritten macOS login item is reloaded; the launcher it runs
+    does not start a second copy of an already running app.
     """
     from .self_update import app_environment, detached_options
     if any('\n' in value or '\r' in value or '\0' in value
@@ -186,16 +223,16 @@ def startup(command, *, enable=True, start_now=True):
             return
         environment = {'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
         environment.update(_startup_environment())
-        if not start_now and destination.is_file():
+        existing = None
+        if destination.is_file():
             try:
                 existing = plistlib.loads(destination.read_bytes())
             except (OSError, ValueError):
                 existing = {}
-            if existing.get('ProgramArguments') == list(command):
-                return
-            if isinstance(existing.get('EnvironmentVariables'), dict):
-                environment = {key: value for key, value in existing['EnvironmentVariables'].items()
-                               if isinstance(key, str) and isinstance(value, str)}
+            existing = existing if isinstance(existing, dict) else {}
+        if not start_now and existing is not None and isinstance(existing.get('EnvironmentVariables'), dict):
+            environment = {key: value for key, value in existing['EnvironmentVariables'].items()
+                           if isinstance(key, str) and isinstance(value, str)}
         # The launcher starts the app through LaunchServices and exits. Its own
         # rare output goes to a separate small file, never into agent.log.
         output = str(default_state_dir() / 'launcher-output.log')
@@ -203,13 +240,18 @@ def startup(command, *, enable=True, start_now=True):
                       WorkingDirectory=str(data_dir()), ThrottleInterval=30, ProcessType='Interactive',
                       EnvironmentVariables=environment, StandardOutPath=output, StandardErrorPath=output)
         default_state_dir().mkdir(parents=True, exist_ok=True)
-        _write_file(destination, plistlib.dumps(config))
+        changed = _write_file(destination, plistlib.dumps(config))
         if start_now:
             subprocess.run(['launchctl', 'bootout', domain + '/' + LABEL], capture_output=True)
             result = subprocess.run(['launchctl', 'bootstrap', domain, str(destination)], capture_output=True)
             if result.returncode:
                 raise InstallError('macOS did not accept the login item (launchctl bootstrap failed). '
                                    'Log out and back in, then run the installer again.')
+        elif changed and existing is not None:
+            # launchd keeps the old definition until reloaded. RunAtLoad runs
+            # the launcher, which sees the running app and starts nothing.
+            subprocess.run(['launchctl', 'bootout', domain + '/' + LABEL], capture_output=True)
+            subprocess.run(['launchctl', 'bootstrap', domain, str(destination)], capture_output=True)
     elif sys.platform == 'win32':
         import winreg
         appdata = os.environ.get('APPDATA')
@@ -249,15 +291,16 @@ def startup(command, *, enable=True, start_now=True):
         if not enable:
             destination.unlink(missing_ok=True)
             return
+        environment = _startup_environment()
         if not start_now and destination.is_file():
-            return  # Keep the recorded profile variables; the launcher path is stable.
-        # Desktop-entry quoting differs from shell quoting; escape reserved syntax.
-        def quote(value):
-            return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%') + '"'
-        assignments = [f'{key}={value}' for key, value in _startup_environment().items()]
+            # Keep the profile variables recorded by the explicit install.
+            recorded = _existing_desktop_environment(destination)
+            if recorded is not None:
+                environment = recorded
+        assignments = [f'{key}={value}' for key, value in environment.items()]
         desktop_command = ['env', *assignments, *command] if assignments else list(command)
         _write_file(destination, ('[Desktop Entry]\nType=Application\nName=Sweetmeter\n'
-                                  'Exec=' + ' '.join(map(quote, desktop_command)) +
+                                  'Exec=' + ' '.join(map(_desktop_quote, desktop_command)) +
                                   '\nTerminal=false\nX-GNOME-Autostart-enabled=true\n').encode('utf-8'))
         if start_now:
             subprocess.Popen(list(command), env=app_environment(), **detached_options())
@@ -328,8 +371,47 @@ def ensure_registration(root, *, start_at_login=None, start_now=False, refresh_l
     if start_at_login:
         retire_legacy_startup()
         startup(command + ['--background', '--state-dir', str(default_state_dir())], start_now=start_now)
+    elif startup_registered():
+        startup([], enable=False)  # The recorded choice is off: never keep or recreate an entry.
     register_uninstall_entry(root, command[0])
     return command
+
+
+def start_at_login_choice():
+    """(available, enabled) for the GUI "Start at login" checkbox."""
+    record = read_install_record()
+    available = ((record.get('kind') == 'native' and isinstance(record.get('root'), str))
+                 or (record.get('kind') == 'source' and _source_command(record) is not None))
+    return available, record.get('startup', True) is not False
+
+
+def _source_command(record):
+    command = record.get('command')
+    if isinstance(command, list) and command and all(isinstance(part, str) for part in command):
+        return command
+    return None
+
+
+def set_start_at_login(enabled):
+    """Record the user's "Start at login" choice and add or remove the entry now."""
+    enabled = bool(enabled)
+    with install_lock(timeout=5):
+        record = read_install_record()
+        if record.get('kind') == 'native' and isinstance(record.get('root'), str):
+            ensure_registration(Path(record['root']), start_at_login=enabled, start_now=False,
+                                refresh_launcher=False)
+        elif record.get('kind') == 'source' and _source_command(record) is not None:
+            if enabled:
+                retire_legacy_startup()
+                startup(_source_command(record) + ['--background', '--state-dir', str(default_state_dir())],
+                        start_now=False)
+            else:
+                startup([], enable=False)
+            _write_file(data_dir() / 'install.json',
+                        (json.dumps(dict(record, startup=enabled)) + '\n').encode('utf-8'))
+        else:
+            raise InstallError('Start at login can be changed after Sweetmeter is installed.')
+    return enabled
 
 
 def open_installed(destination=None):
@@ -358,7 +440,96 @@ def _destination_for(source):
     return recorded if recorded.exists() else default_install_root().absolute()
 
 
-def install_native(application, *, start_at_login=True):
+SELF_TEST_TIMEOUT = 120
+
+
+def tree_version(root):
+    """The Version bundled in an application tree, or None if unreadable."""
+    from .version import Version
+    root = Path(root)
+    for relative in ('Contents/Resources/VERSION', 'Contents/Frameworks/VERSION', '_internal/VERSION', 'VERSION'):
+        try:
+            return Version.parse((root / relative).read_text(encoding='ascii').strip())
+        except (OSError, ValueError, UnicodeError):
+            continue
+    for relative in ('Contents/Resources/build-metadata.json', '_internal/build-metadata.json'):
+        try:
+            return Version.parse(json.loads((root / relative).read_text(encoding='utf-8')).get('version'))
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+    return None
+
+
+def tree_problem(root, *, self_test=True):
+    """None when an installed tree is intact (and passes its own offline
+    self-test), else a short plain reason."""
+    from .self_update import CREATE_NO_WINDOW, validate_tree
+    root = Path(root)
+    if not Path(app_command(root)[0]).is_file():
+        return 'its program file is missing'
+    try:
+        validate_tree(root)
+    except (OSError, ValueError):
+        return 'its files are damaged'
+    if tree_version(root) is None:
+        return 'its version file is missing'
+    if not self_test:
+        return None
+    options = {'creationflags': CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
+    try:
+        result = subprocess.run(app_command(root) + ['--self-test'], capture_output=True,
+                                timeout=SELF_TEST_TIMEOUT, check=False, **options)
+    except (OSError, subprocess.SubprocessError):
+        return 'it could not be started'
+    return None if result.returncode == 0 else 'it failed its self-test'
+
+
+def _replace_installation(destination, source, version):
+    """Atomically replace the managed tree with `source` using the same
+    journaled swap as companion updates (the login launcher finishes or rolls
+    back an interrupted swap)."""
+    import contextlib
+    import secrets
+    from .self_update import TreeSwap, _update_lock, recover_update_locked
+    if not stop_running_app():
+        raise InstallError('Sweetmeter is still running and could not be stopped. '
+                           'Quit it, then run the installer again.')
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(_update_lock())
+        except RuntimeError:
+            raise InstallError('A Sweetmeter update is being installed right now. '
+                               'Wait a minute for it to finish, then run the installer again.') from None
+        if (data_dir() / 'companion-swap.json').exists():
+            try:
+                recover_update_locked()  # Finish or undo an interrupted update first.
+            except (RuntimeError, ValueError, OSError) as error:
+                raise InstallError('An interrupted Sweetmeter update could not be finished ('
+                                   + str(error) + '). Restart the computer, then run the installer again.') from None
+        swap = TreeSwap(destination, nonce=secrets.token_hex(12), state_dir=default_state_dir(),
+                        version=str(version) if version else 'installer')
+        try:
+            swap.prepare(source, strip_marks=True)
+            swap.swap()
+            swap.confirm()
+        except BaseException:
+            if not swap.rollback():
+                raise InstallError('Replacing Sweetmeter was interrupted. The previous version is restored '
+                                   'when you next log in; then run the installer again.') from None
+            raise
+        finally:
+            swap.cleanup()
+
+
+def install_native(application, *, start_at_login=True, report=None):
+    """Install, update or repair the managed native app from `application`.
+
+    An existing managed copy that is older than `application`, damaged, or
+    failing its self-test is replaced atomically; a healthy copy of the same
+    or a newer version is kept and only its registration (record, launcher,
+    login item) is repaired. `start_at_login` None keeps the recorded choice
+    (default on). `report` receives one truthful line about what happened.
+    """
     from .self_update import strip_download_marks, validate_tree
     source = Path(application).absolute()
     expected = 'Sweetmeter.app' if sys.platform == 'darwin' else 'Sweetmeter'
@@ -368,13 +539,36 @@ def install_native(application, *, start_at_login=True):
         destination = _destination_for(source)
         if any(p.is_symlink() for p in (destination, *destination.parents)):
             raise ValueError('Refusing symlinked installation path.')
-        if destination.exists():
-            record = read_install_record()
-            if (destination != source and not _is_managed(record, destination)
-                    and not looks_like_sweetmeter(destination)):
+        record = read_install_record()
+        if start_at_login is None:
+            start_at_login = record.get('startup', True) is not False
+        offered = tree_version(source)
+        shown = str(offered) if offered else 'this version'
+        if destination.exists() and destination == source:
+            # Running the installed (or adopted) copy itself: it just passed
+            # its self-test in this process; only its files need checking.
+            problem = tree_problem(destination, self_test=False)
+            if problem:
+                raise InstallError('The installed Sweetmeter is damaged (' + problem + '). '
+                                   'Run the installer again to replace it.')
+            message = f'Sweetmeter {shown} is installed; its login startup was checked.'
+        elif destination.exists():
+            if not _is_managed(record, destination) and not looks_like_sweetmeter(destination):
                 raise ValueError('Existing installation is not managed by Sweetmeter.')
-            if not Path(app_command(destination)[0]).is_file():
-                raise ValueError('Existing Sweetmeter installation is incomplete.')
+            current = tree_version(destination)
+            problem = tree_problem(destination)
+            if problem is None and (offered is None or current >= offered):
+                newer = ' (newer than this package)' if current > offered else ''
+                message = f'Sweetmeter {current}{newer} is already installed and working; its login startup was checked.'
+            else:
+                validate_tree(source)
+                _replace_installation(destination, source, offered)
+                if problem:
+                    message = f'Replaced a damaged Sweetmeter installation ({problem}) with Sweetmeter {shown}.'
+                elif current is not None:
+                    message = f'Updated Sweetmeter {current} to {shown}.'
+                else:
+                    message = f'Replaced the installed Sweetmeter with {shown}.'
         else:
             validate_tree(source)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -386,21 +580,24 @@ def install_native(application, *, start_at_login=True):
                 # so the installed app and launcher do not warn at every login.
                 strip_download_marks(staged)
                 staged.rename(destination)
+            message = f'Installed Sweetmeter {shown}.'
         state = default_state_dir()
         state.mkdir(parents=True, exist_ok=True)
         (state / 'show-window').touch()
         ensure_registration(destination, start_at_login=start_at_login, start_now=start_at_login)
         if not start_at_login:
             open_installed(destination)
+    if report:
+        report(message)
     return destination
 
 
-def install_current(*, start_at_login=True):
+def install_current(*, start_at_login=True, report=None):
     if not getattr(sys, 'frozen', False):
         raise ValueError('Source installations use scripts/install_agent.py.')
     executable = Path(sys.executable).absolute()
     application = executable.parents[2] if sys.platform == 'darwin' else executable.parent
-    return install_native(application, start_at_login=start_at_login)
+    return install_native(application, start_at_login=start_at_login, report=report)
 
 
 def repair_running_installation():
@@ -476,15 +673,33 @@ def _remove(path, removed):
         removed.append(path)
 
 
+def _sibling_leftovers(root):
+    """Swap/removal folders next to `root` that only Sweetmeter creates."""
+    pattern = re.escape(root.name) + r'\.(incoming|previous|removing)-[0-9a-f]{12}'
+    try:
+        return [sibling for sibling in root.parent.glob(root.name + '.*') if re.fullmatch(pattern, sibling.name)]
+    except OSError:
+        return []
+
+
 def uninstall(remove_data=False, *, wait_pid=None):
     """Remove Sweetmeter for this user; keeps settings/state unless `remove_data`.
 
     Removes the startup entry, the managed app (only recorded/recognized
     locations), the launcher, the install record and, on Windows, the Apps
     entry. Returns the removed paths.
+
+    Every path here (menu item, command line, Windows Settings > Apps) takes
+    the companion update lock, so it never runs during an update swap; an
+    interrupted swap is finished first. Each app folder is first renamed to a
+    `.removing-*` sibling (atomic on the same volume): if that fails, nothing
+    was deleted and the names and login item are restored, so a failed
+    uninstall never leaves a half-deleted app behind at its real name.
     """
-    from .self_update import LAUNCHER_NAME, _alive
-    removed = []
+    import contextlib
+    import secrets
+    from .self_update import LAUNCHER_NAME, _alive, _retry, _update_lock, helper_log, recover_update_locked
+    removed, leftovers = [], []
     with install_lock():
         if wait_pid:
             deadline = time.monotonic() + 30
@@ -492,42 +707,88 @@ def uninstall(remove_data=False, *, wait_pid=None):
                 time.sleep(.2)
         if not stop_running_app():
             raise InstallError('Sweetmeter is still running. Quit it, then run the uninstaller again.')
-        startup([], enable=False)
-        record = read_install_record()
-        for root in _managed_roots():
-            if any(p.is_symlink() for p in (root, *root.parents)):
-                continue
-            for sibling in root.parent.glob(root.name + '.*'):
-                if re.fullmatch(re.escape(root.name) + r'\.(incoming|previous)-[0-9a-f]{12}', sibling.name):
-                    _remove(sibling, removed)
-            _remove(root, removed)
-        runtime = data_dir() / 'runtime'
-        if record.get('kind') == 'source' and record.get('root') == str(runtime):
-            _remove(runtime, removed)
-        launcher = data_dir() / 'launcher'
-        for name in (LAUNCHER_NAME, LAUNCHER_NAME + '.new', LAUNCHER_NAME + '.old'):
+        with contextlib.ExitStack() as stack:
             try:
-                _remove(launcher / name, removed)
+                stack.enter_context(_update_lock())
+            except RuntimeError:
+                raise InstallError('A Sweetmeter update is being installed right now. '
+                                   'Wait a minute for it to finish, then uninstall again.') from None
+            if (data_dir() / 'companion-swap.json').exists():
+                try:
+                    recover_update_locked()
+                except (RuntimeError, ValueError, OSError) as error:
+                    raise InstallError('An interrupted Sweetmeter update could not be finished ('
+                                       + str(error) + '). Restart the computer, then uninstall again.') from None
+            record = read_install_record()
+            had_startup = startup_registered()
+            moved = []
+            try:
+                for root in _managed_roots():
+                    if any(p.is_symlink() for p in (root, *root.parents)) or not root.exists():
+                        continue
+                    aside = root.with_name(root.name + '.removing-' + secrets.token_hex(6))
+                    _retry(lambda: root.rename(aside), attempts=4)
+                    moved.append((root, aside))
+                startup([], enable=False)
+            except (OSError, InstallError) as error:
+                for root, aside in reversed(moved):
+                    try:
+                        aside.rename(root)
+                    except OSError:
+                        leftovers.append(aside)
+                if had_startup and record.get('kind') == 'native' and not startup_registered():
+                    try:
+                        ensure_registration(Path(record['root']), start_now=False, refresh_launcher=False)
+                    except (OSError, InstallError, ValueError, RuntimeError):
+                        pass
+                detail = ' Also rename ' + str(leftovers[0]) + ' back by hand.' if leftovers else ''
+                helper_log('Uninstall stopped before deleting anything: ' + type(error).__name__)
+                raise InstallError('Sweetmeter could not be removed because one of its files is in use. '
+                                   'Nothing was deleted. Restart the computer, then uninstall again.'
+                                   + detail) from None
+            for root, aside in moved:
+                removed.append(root)
+            # Also leftovers of an earlier interrupted uninstall or swap, which
+            # only ever sit next to a location Sweetmeter may manage.
+            for root in {root for root, _ in moved} | set(_managed_roots()) | set(candidate_install_roots()):
+                for sibling in _sibling_leftovers(root):
+                    try:
+                        _remove(sibling, [])
+                    except OSError:
+                        leftovers.append(sibling)
+            runtime = data_dir() / 'runtime'
+            if record.get('kind') == 'source' and record.get('root') == str(runtime):
+                _remove(runtime, removed)
+            launcher = data_dir() / 'launcher'
+            for name in (LAUNCHER_NAME, LAUNCHER_NAME + '.new', LAUNCHER_NAME + '.old'):
+                try:
+                    _remove(launcher / name, removed)
+                except OSError:
+                    pass  # A running Windows launcher; the folder is harmless.
+            try:
+                launcher.rmdir()
             except OSError:
-                pass  # A running Windows launcher; the folder is harmless.
-        try:
-            launcher.rmdir()
-        except OSError:
-            pass
-        _remove_uninstall_entry()
-        for name in MANAGED_FILES:
-            _remove(data_dir() / name, removed)
-        if remove_data:
-            _remove(default_state_dir(), removed)
-            _remove(data_dir() / 'retired-startup', removed)
-            _remove(data_dir() / 'companion-update.lock', removed)
+                pass
+            _remove_uninstall_entry()
+            for name in MANAGED_FILES:
+                _remove(data_dir() / name, removed)
+            if remove_data:
+                _remove(default_state_dir(), removed)
+                _remove(data_dir() / 'retired-startup', removed)
     if remove_data:
+        for name in ('companion-update.lock', 'install.lock'):
+            try:
+                (data_dir() / name).unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
-            (data_dir() / 'install.lock').unlink(missing_ok=True)
             data_dir().rmdir()
             removed.append(data_dir())
         except OSError:
             pass
+    if leftovers:
+        raise InstallError('Sweetmeter was removed, but this folder could not be deleted: '
+                           + str(leftovers[0]) + '. Delete it by hand.')
     return removed
 
 
@@ -569,6 +830,7 @@ def uninstall_main(argv):
     """`--uninstall [--remove-data] [--wait-pid PID] [--interactive]` for app and launcher."""
     import argparse
     from .self_update import HELPER_NAME, LAUNCHER_NAME, app_environment, detached_options, helper_log
+    os.umask(0o077)  # Logs and copies this process writes stay private.
     parser = argparse.ArgumentParser(prog='Sweetmeter --uninstall')
     parser.add_argument('--remove-data', action='store_true')
     parser.add_argument('--wait-pid', type=int)

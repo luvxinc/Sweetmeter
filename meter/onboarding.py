@@ -41,8 +41,9 @@ def welcome():
               wraplength=480).pack(anchor='w', pady=(12, 16))
     if existing is not None:
         text = ('Sweetmeter is already installed at\n' + str(existing) + '.\n\n'
-                'Continue opens that copy and checks its login startup. This downloaded '
-                'copy is not used; you can delete it.')
+                'Continue checks that copy: if it is older than this download or damaged, '
+                'it is replaced with this version; otherwise it is kept. Then Sweetmeter opens. '
+                'Afterwards you can delete this downloaded copy.')
     else:
         text = ('This installs Sweetmeter for your user and starts it at login.\n'
                 'It uses Bluetooth and your existing Claude Code / Codex sign-ins\n'
@@ -57,7 +58,7 @@ def welcome():
         status.set('Installing and opening Sweetmeter…')
         root.update_idletasks()
         try:
-            install_current()
+            install_current(start_at_login=None)
         except Exception as error:
             detail = str(error) or type(error).__name__
             messagebox.showerror('Setup could not finish', detail, parent=root)
@@ -66,7 +67,7 @@ def welcome():
         else:
             root.destroy()
 
-    label = 'Open installed Sweetmeter' if existing is not None else 'Install and continue'
+    label = 'Continue' if existing is not None else 'Install and continue'
     button = ttk.Button(panel, text=label, command=install)
     button.pack(side='right')
     ttk.Button(panel, text='Cancel', command=root.destroy).pack(side='right', padx=8)

@@ -14,16 +14,32 @@
         $data = Join-Path $env:LOCALAPPDATA 'Sweetmeter'
         $state = Join-Path $data 'state'
         $errorFile = Join-Path $data 'install-error.txt'
-        $installed = Join-Path $env:LOCALAPPDATA 'Programs\Sweetmeter\Sweetmeter.exe'
-        if (Test-Path -LiteralPath $installed) {
+        $resultFile = Join-Path $data 'install-result.txt'
+        $installedRoot = Join-Path $env:LOCALAPPDATA 'Programs\Sweetmeter'
+        $installed = Join-Path $installedRoot 'Sweetmeter.exe'
+        $versionPattern = '^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]*$'
+        $hasInstalled = Test-Path -LiteralPath $installed
+        $installedVersion = $null
+        if ($hasInstalled) {
+            try {
+                $raw = [string](Get-Content -LiteralPath (Join-Path $installedRoot '_internal\VERSION') -TotalCount 1 -ErrorAction Stop)
+                if ($raw.Trim() -cmatch $versionPattern) { $installedVersion = $raw.Trim() }
+            } catch { $installedVersion = $null }
+        }
+        # The installed copy checks itself (self-test and files), repairs its
+        # login startup and opens. Its one-line outcome is shown either way.
+        function Invoke-ExistingCheck {
             $null = New-Item -ItemType Directory -Path $state -Force
             $null = New-Item -ItemType File -Path (Join-Path $state 'show-window') -Force
-            Write-Host 'Opening your existing Sweetmeter. Use its updater for new versions.'
-            # --install on the installed copy re-checks its login startup, then opens it.
-            $process = Start-Process -FilePath $installed -ArgumentList '--install' -PassThru
-            $process.WaitForExit()
-            if ($process.ExitCode -eq 0) { return }
-            Write-Host 'The existing installation needs repair; installing the latest release.'
+            Remove-Item -LiteralPath $errorFile, $resultFile -Force -ErrorAction SilentlyContinue
+            $check = Start-Process -FilePath $installed -ArgumentList '--install' -PassThru
+            $check.WaitForExit()
+            if ($check.ExitCode -eq 0) {
+                if (Test-Path -LiteralPath $resultFile) { Write-Host (Get-Content -LiteralPath $resultFile -Raw).Trim() }
+                return $true
+            }
+            if (Test-Path -LiteralPath $errorFile) { Write-Host (Get-Content -LiteralPath $errorFile -Raw).Trim() }
+            return $false
         }
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $temporary = Join-Path ([IO.Path]::GetTempPath()) ('sweetmeter-' + [Guid]::NewGuid().ToString('N'))
@@ -31,7 +47,6 @@
         Write-Host 'Finding the latest Sweetmeter release...'
         # Like install.sh: follow github.com's releases/latest redirect, which is
         # not subject to the anonymous REST API rate limit. The API is a fallback.
-        $versionPattern = '^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]*$'
         $version = $null
         try {
             $response = Invoke-WebRequest -UseBasicParsing -Method Head -Uri 'https://github.com/luvxinc/Sweetmeter/releases/latest' -TimeoutSec 60
@@ -41,11 +56,26 @@
             if ($final -and $final -cmatch '^https://github\.com/luvxinc/Sweetmeter/releases/tag/([^/?#]+)$') { $version = $Matches[1] }
         } catch { $version = $null }
         if (-not $version -or $version -cnotmatch $versionPattern) {
-            $releaseInfo = Invoke-RestMethod -Uri 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest' -TimeoutSec 60
+            try {
+                $releaseInfo = Invoke-RestMethod -Uri 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest' -TimeoutSec 60
+            } catch {
+                if (-not $hasInstalled) { throw }
+                Write-Host 'Could not reach GitHub to check for a newer Sweetmeter; checking the installed copy instead.'
+                if (Invoke-ExistingCheck) { return }
+                throw 'The installed Sweetmeter needs repair (reason above), but the latest release could not be downloaded. Check the Internet connection and run this again.'
+            }
             if ($releaseInfo.draft -or $releaseInfo.prerelease) { throw 'The latest release is not a stable release.' }
             $version = $releaseInfo.tag_name
         }
         if ($version -cnotmatch $versionPattern) { throw 'Unexpected release version.' }
+        if ($installedVersion -and ([Version]$version -le [Version]$installedVersion)) {
+            # The installed copy is current (or newer): keep it when it is healthy.
+            if (Invoke-ExistingCheck) { return }
+            Write-Host "Reinstalling Sweetmeter $version from the verified release."
+        } elseif ($hasInstalled) {
+            if ($installedVersion) { Write-Host "Updating your installed Sweetmeter $installedVersion to $version." }
+            else { Write-Host "Updating your installed Sweetmeter to $version." }
+        }
         $release = "https://github.com/luvxinc/Sweetmeter/releases/download/$version"
         $manifestFile = Join-Path $temporary 'manifest.json'
         $signatureFile = Join-Path $temporary 'manifest.json.sig'
@@ -103,7 +133,9 @@
         [IO.Compression.ZipFile]::ExtractToDirectory($package, $extracted)
         $null = New-Item -ItemType Directory -Path $state -Force
         $null = New-Item -ItemType File -Path (Join-Path $state 'show-window') -Force
-        Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $errorFile, $resultFile -Force -ErrorAction SilentlyContinue
+        # Installs, or replaces an installed copy that is older, damaged or
+        # failing its self-test (atomically); a healthy current copy is kept.
         $process = Start-Process -FilePath (Join-Path $extracted 'Sweetmeter\Sweetmeter.exe') -ArgumentList '--install' -PassThru
         # Wait only for setup, not the long-running companion it starts.
         $process.WaitForExit()
@@ -111,6 +143,7 @@
             $reason = if (Test-Path -LiteralPath $errorFile) { (Get-Content -LiteralPath $errorFile -Raw).Trim() } else { 'Sweetmeter setup did not finish.' }
             throw $reason
         }
+        if (Test-Path -LiteralPath $resultFile) { Write-Host (Get-Content -LiteralPath $resultFile -Raw).Trim() }
         Write-Host 'Sweetmeter is opening. Allow Bluetooth if asked, then confirm this computer on the meter.'
     } catch {
         Write-Host ('Sweetmeter: ' + $_.Exception.Message) -ForegroundColor Red

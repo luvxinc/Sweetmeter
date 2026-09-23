@@ -22,6 +22,8 @@
 #include "update_notice.h"
 #include "power_policy.h"
 #include "bond_policy.h"
+#include "display_policy.h"
+#include "advertising.h"
 #include "status_json.h"
 
 const char *SERVICE_UUID="7a1e0001-ff1b-4d9f-a023-47c7752c1a01";
@@ -38,19 +40,25 @@ bool bleStarted=false;
 char advertisedName[24]{};
 TaskHandle_t workerTask=nullptr;
 // Written by BTC callbacks, read by the worker: guarded by snapshotMux.
-esp_bd_addr_t peerAddress={}, bondAddress={};
-uint32_t bondGeneration=0;
+esp_bd_addr_t peerAddress={};
+// Bonds of the current link (see bond_policy.h) and those of ended links that
+// the worker must remove before advertising again. Guarded by snapshotMux.
+sweetmeter::LinkBonds linkBonds;
+uint8_t bondRemovals[sweetmeter::bondListCapacity][6]{};
+size_t bondRemovalCount=0;
 uint8_t linkChallenge[sweetmeter::challengeSize]{};
 char linkChallengeHex[2*sweetmeter::challengeSize+1]="00000000000000000000000000000000";
 Preferences preferences;
 bool nvsReady=false;
 sweetmeter::Registry registry;
 sweetmeter::LinkAuth linkAuth;
-sweetmeter::RecentPeers recentPeers;
+sweetmeter::LegacyWindow legacyWindow;
 sweetmeter::NoticeState notices;
+sweetmeter::RefreshRequest refreshRequest;
+sweetmeter::MinuteRedraw minuteRedraw;
 sweetmeter::IdlePowerOff idlePower;
 sweetmeter::RetryBackoff registryRetry;
-bool registryDirty=false,recentDirty=false,bondMaintenanceDue=true;
+bool registryDirty=false;
 char deviceSerial[sweetmeter::serialSize+1]{};
 volatile bool connected=false;
 volatile int signalRssi=127;
@@ -61,17 +69,17 @@ volatile bool bleServiceStarted=false;
 volatile uint32_t droppedRejects=0;
 RTC_DATA_ATTR int32_t timezoneOffset=0;
 RTC_DATA_ATTR bool clockSynced=false;
-RTC_DATA_ATTR int64_t sleptAt=0;
+RTC_DATA_ATTR int64_t sleptAt=0,sleptTotal=0;  // see clockStillValid()
 RTC_DATA_ATTR bool lowBatteryLatched=false,lowBatteryShown=false;
 volatile uint8_t keyEvents=0;
 uint8_t dashboard[FRAME_SIZE],incomingFrame[FRAME_SIZE];
 size_t received=0;
-uint32_t incomingSequence=0,incomingCRC=0,packetAt=0,refreshRequestedAt=0;
-uint32_t seenGeneration=0,discoveryReleaseAt=0,droppedGeneration=0;
+uint32_t incomingSequence=0,incomingCRC=0,packetAt=0;
+uint32_t seenGeneration=0,discoveryReleaseAt=0,droppedGeneration=0,clockGeneration=0,menuClosedAt=0;
+bool menuEverClosed=false;
 uint8_t linkPeer[6]{};
 bool receiving=false,pendingFrame=false,uiDirty=true,sleepCommitted=false,serviceChangeSent=false;
-int removeConfirm=-1;
-time_t paintedMinute=-1;
+int removeConfirm=-1,keyConfirm=-1;
 int batteryPercent=-1,batteryMillivolts=-1;
 DisconnectSleep disconnectSleep;
 sweetmeter::Discovery discovery;
@@ -232,6 +240,16 @@ class OtaStatusCallbacks : public BLECharacteristicCallbacks {
     characteristic->setValue(copy,20);
   }
 };
+// Called from the Bluetooth callback task only (it owns the static buffer).
+void readBonds(sweetmeter::BondList &out) {
+  static esp_ble_bond_dev_t list[CONFIG_BT_SMP_MAX_BONDS];
+  out=sweetmeter::BondList{};
+  int count=esp_ble_get_bond_device_num();
+  if(count<0 || count>CONFIG_BT_SMP_MAX_BONDS || size_t(count)>sweetmeter::bondListCapacity) return;
+  if(count && (esp_ble_get_bond_device_list(&count,list)!=ESP_OK || count<0 || count>CONFIG_BT_SMP_MAX_BONDS)) return;
+  for(int i=0;i<count;++i) memcpy(out.addresses[i],list[i].bd_addr,6);
+  out.count=uint8_t(count); out.valid=true;
+}
 class ServerCallbacks : public BLEServerCallbacks {
   // Arduino calls onConnect(server) and then onConnect(server,param). All work
   // happens in the second so the peer address is stored before the worker can
@@ -240,9 +258,13 @@ class ServerCallbacks : public BLEServerCallbacks {
     // A fresh challenge for every physical connection; one hello attempt each.
     uint8_t fresh[sweetmeter::challengeSize]; char hex[2*sweetmeter::challengeSize+1];
     esp_fill_random(fresh,sizeof(fresh)); sweetmeter::hexEncode(fresh,sizeof(fresh),hex);
+    // Bonds that exist before this link; SMP for this link completes later in
+    // this same task, so the snapshot cannot already contain its bond.
+    static sweetmeter::BondList bonds; readBonds(bonds);
     portENTER_CRITICAL(&snapshotMux);
     memcpy(peerAddress,parameters->connect.remote_bda,sizeof(peerAddress));
     memcpy(linkChallenge,fresh,sizeof(fresh)); memcpy(linkChallengeHex,hex,sizeof(hex));
+    linkBonds.connected(linkGeneration+1,bonds);
     portEXIT_CRITICAL(&snapshotMux);
     signalRssi=127; signalReadAt=0;
     connected=true; connectionAt=millis(); firstProbeAt=0; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
@@ -250,6 +272,14 @@ class ServerCallbacks : public BLEServerCallbacks {
     wakeWorker();
   }
   void onDisconnect(BLEServer *) override {
+    // A link that did not earn its bonds loses the ones it created; the
+    // worker removes them before advertising again (see bond_policy.h).
+    static sweetmeter::BondList bonds; readBonds(bonds);
+    static uint8_t added[sweetmeter::bondListCapacity][6];
+    portENTER_CRITICAL(&snapshotMux);
+    size_t count=linkBonds.ended(linkGeneration,bonds,added);
+    for(size_t i=0;i<count && bondRemovalCount<sweetmeter::bondListCapacity;++i) memcpy(bondRemovals[bondRemovalCount++],added[i],6);
+    portEXIT_CRITICAL(&snapshotMux);
     signalRssi=127; signalReadAt=0;
     connected=false; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
     wakeWorker();
@@ -261,7 +291,7 @@ void updateDeviceSnapshot() {
   f.selected=registry.selected>=0; f.secured=f.selected && registry.current()->hasSecret;
   f.battery=batteryPercent; f.millivolts=batteryMillivolts; f.interval=refreshSeconds(); f.critical=criticalBattery();
   f.clockSynced=clockSynced; f.menu=discovery.open; f.nonce=discovery.open?discovery.nonce:0;
-  f.remaining=discovery.remaining(millis()); f.computers=discovery.count; f.ota=ota.active();
+  f.remaining=discovery.remaining(millis()); f.computers=discovery.open?discovery.count:0; f.ota=ota.active();
   f.health=bootHealth.health; f.lastUpdate=bootHealth.lastUpdate; f.target=bootHealth.target;
   f.rssi=connected&&isAuthorized()&&signalReadAt&&millis()-signalReadAt<30000?signalRssi:127;
   char next[sweetmeter::statusLimit]; size_t offset=0;
@@ -288,10 +318,6 @@ void persistPending(uint32_t now) {
     if(writeRegistry()) { registryDirty=false; registryRetry.succeeded(); }
     else { registryRetry.failed(now); Serial.printf("ERR PAIRING_NVS retry_ms=%lu\n",(unsigned long)registryRetry.delay()); }
   }
-  if(recentDirty && nvsReady) {
-    recentDirty=false;
-    if(preferences.putBytes("peers",&recentPeers,sizeof(recentPeers))!=sizeof(recentPeers)) Serial.println("ERR PEERS_NVS");
-  }
 }
 void loadRegistry() {
   sweetmeter::RegistryBlob blob;
@@ -305,35 +331,21 @@ void loadRegistry() {
   registry.migrateLegacy(host.c_str(),host.length(),name.c_str());
   if(registry.count) Serial.println("PAIRING LEGACY_SELECTION awaiting secret");
 }
-void loadRecentPeers() {
-  sweetmeter::RecentPeers stored;
-  if(nvsReady && preferences.getBytesLength("peers")==sizeof(stored) &&
-     preferences.getBytes("peers",&stored,sizeof(stored))==sizeof(stored) && stored.count<=sweetmeter::recentPeerCount)
-    recentPeers=stored;
+// This link earned its bonds (see bond_policy.h).
+void earnBond() {
+  portENTER_CRITICAL(&snapshotMux); linkBonds.earned(seenGeneration); portEXIT_CRITICAL(&snapshotMux);
 }
-// A link proved a pairing secret: protect its bond from eviction.
-void rememberAuthenticatedPeer() {
-  uint8_t address[6];
+// Remove bonds created by links that ended without earning them. Runs in the
+// worker, always before advertising again, and never touches other bonds.
+void removeUnearnedBonds() {
+  uint8_t pending[sweetmeter::bondListCapacity][6]; size_t count;
   portENTER_CRITICAL(&snapshotMux);
-  if(bondGeneration==seenGeneration) memcpy(address,bondAddress,6); else memcpy(address,peerAddress,6);
+  count=bondRemovalCount; memcpy(pending,bondRemovals,count*6); bondRemovalCount=0;
   portEXIT_CRITICAL(&snapshotMux);
-  if(recentPeers.touch(address)) recentDirty=true;
+  for(size_t i=0;i<count;++i) esp_ble_remove_bond_device(pending[i]);
+  if(count) Serial.printf("BLE BONDS removed_unearned=%u\n",unsigned(count));
 }
-// See bond_policy.h: remove stale bonds before Bluedroid silently drops the
-// least recently used one, which could be a paired computer.
-void evictStaleBonds() {
-  int count=esp_ble_get_bond_device_num();
-  if(count<int(sweetmeter::bondEvictThreshold)) return;
-  static esp_ble_bond_dev_t list[CONFIG_BT_SMP_MAX_BONDS];
-  if(count>CONFIG_BT_SMP_MAX_BONDS) count=CONFIG_BT_SMP_MAX_BONDS;
-  if(esp_ble_get_bond_device_list(&count,list)!=ESP_OK) return;
-  uint8_t addresses[CONFIG_BT_SMP_MAX_BONDS][6]; bool evict[CONFIG_BT_SMP_MAX_BONDS];
-  for(int i=0;i<count;++i) memcpy(addresses[i],list[i].bd_addr,6);
-  uint8_t current[6]; copyPeer(current);
-  size_t removed=sweetmeter::chooseBondEvictions(addresses,size_t(count),nullptr,connected?current:nullptr,recentPeers,evict);
-  for(int i=0;i<count;++i) if(evict[i]) esp_ble_remove_bond_device(list[i].bd_addr);
-  Serial.printf("BLE BONDS count=%d evicted=%u\n",count,unsigned(removed));
-}
+void advertise() { removeUnearnedBonds(); BLEDevice::startAdvertising(); }
 void powerOffPanel() {
   // Q9 disconnects LCD ground, not VDD. Avoid supplying a ground return via SPI.
   for (int pin : {SCK_PIN, MOSI_PIN, RST, DC, CS}) pinMode(pin, INPUT);
@@ -436,16 +448,34 @@ void drawMenu() {
     textAt(4,98,"Bottom: keep");
     return;
   }
+  if(keyConfirm>=0 && unsigned(keyConfirm)<discovery.count) {
+    // A paired computer sent a different pairing secret. Legitimate after it
+    // forgot this meter; otherwise someone is imitating it.
+    const sweetmeter::Computer &c=discovery.computers[keyConfirm];
+    textAt(4,1,"NEW KEY",false);
+    textAt(4,20,c.name); textAt(220,20,c.id+32);
+    textAt(4,40,"This computer sent a new key.");
+    textAt(4,56,"Accept only if you reset it.");
+    textAt(4,80,"Press rocker: accept new key");
+    textAt(4,98,"Bottom: cancel");
+    return;
+  }
   textAt(4,1,"SELECT COMPUTER",false);
-  textAt(4,16,discovery.count?"Press: use     Hold 3s: remove":"Open Sweetmeter on your computer.");
+  const sweetmeter::Computer *highlighted=discovery.count?&discovery.computers[discovery.selection]:nullptr;
+  if(highlighted && highlighted->outdated) textAt(4,16,String("Update Sweetmeter on ")+highlighted->name);
+  else textAt(4,16,discovery.count?"Press: use     Hold 3s: remove":"Open Sweetmeter on your computer.");
   unsigned first=discovery.selection>=4?discovery.selection-3:0;
   for(unsigned i=first;i<discovery.count && i<first+4;++i) {
     const sweetmeter::Computer &c=discovery.computers[i];
     int y=32+(i-first)*17; bool chosen=i==discovery.selection;
     if(chosen) box(2,y,246,15,true);
-    // '>' current computer, '+' new (not yet paired), '!' conflicting identity.
-    const char *mark=c.conflict?"!":c.paired<0?"+":c.paired==registry.selected?">":"";
-    textAt(5,y+2,mark,!chosen); textAt(14,y+2,c.name,!chosen); textAt(220,y+2,c.id+32,!chosen);
+    // '>' current computer, '+' new (not yet paired), '!' needs attention:
+    // conflicting identity, a changed key, or an app that must be updated.
+    bool attention=c.conflict||c.keyChanged||c.outdated;
+    const char *mark=attention?"!":c.paired<0?"+":c.paired==registry.selected?">":"";
+    const char *label=c.conflict?"CONFLICT":c.outdated?"UPDATE APP":c.keyChanged?"NEW KEY":"";
+    textAt(5,y+2,mark,!chosen); textAt(14,y+2,c.name,!chosen);
+    textAt(216-6*int(strlen(label)),y+2,label,!chosen); textAt(220,y+2,c.id+32,!chosen);
   }
   if(!discovery.count) textAt(4,43,"Waiting for computers...");
   textAt(4,107,"Top: rescan    Bottom: back");
@@ -477,7 +507,7 @@ void drawScreen() {
     int rssi=connected&&isAuthorized()&&signalReadAt&&millis()-signalReadAt<30000?signalRssi:127;
     int bars=rssi>20||rssi<-127?0:rssi>=-60?4:rssi>=-70?3:rssi>=-80?2:1;
     for(int i=0;i<4;++i) { int height=i<bars?2+i*2:1; box(105+i*4,10-height,2,height,false); }
-    if(refreshRequestedAt && millis()-refreshRequestedAt<10000) textAt(78,1,"*",false);
+    if(refreshRequest.marker) textAt(78,1,"*",false);
     // An unsynced clock (including after a long deep sleep) is never shown.
     char stamp[24]="----/--/-- --:--";
     if(clockSynced) { time_t now=time(nullptr)+timezoneOffset; tm local; gmtime_r(&now,&local); strftime(stamp,sizeof(stamp),"%Y/%m/%d %H:%M",&local); }
@@ -509,18 +539,26 @@ void dropLink() {
   delay(80);
   if(connected) { droppedGeneration=seenGeneration; meterServer->disconnect(meterServer->getConnId()); }
 }
-void setAdvertisedMenu(bool menu) {
-  // A computer that has never paired can only find a meter by connecting to
-  // it. The "-PAIR" scan-response suffix tells companions which meter has its
-  // physical menu open so they do not probe other people's meters.
-  BLEAdvertisementData response;
-  std::string name(advertisedName); if(menu) name+="-PAIR";
-  response.setName(name);
+// Scan response: name (with "-PAIR" while the menu is open) and the capability
+// marker (advertising.h), so computers can tell this firmware from pre-secret
+// firmware and see an open menu without connecting.
+void setScanResponse(bool menu) {
+  BLEAdvertisementData response; uint8_t raw[sweetmeter::advertisingLimit];
+  size_t length=sweetmeter::buildScanResponse(raw,advertisedName,menu);
+  if(length) response.addData(std::string(reinterpret_cast<const char*>(raw),length));
+  else response.setName(advertisedName);
   BLEDevice::getAdvertising()->setScanResponseData(response);
-  if(!connected) BLEDevice::startAdvertising();
+}
+void setAdvertisedMenu(bool menu) {
+  setScanResponse(menu);
+  if(!connected) advertise();
 }
 void closeDiscovery() {
-  discovery.close(); removeConfirm=-1; receiving=pendingFrame=false; linkAuth.revoke();
+  // A computer connected while the menu closes may have lost the race with
+  // the owner's choice: it keeps the bond its OS stored (bond_policy.h).
+  if(connected) earnBond();
+  menuClosedAt=millis(); menuEverClosed=true;
+  discovery.close(); removeConfirm=keyConfirm=-1; receiving=pendingFrame=false; linkAuth.revoke();
   disconnectSleep.freshGrace(millis()); uiDirty=true; setAdvertisedMenu(false);
   if(connected) meterServer->disconnect(meterServer->getConnId());
   updateDeviceSnapshot();
@@ -528,7 +566,7 @@ void closeDiscovery() {
 void startComputerScan() {
   if(ota.active()) return;
   uint32_t nonce; do { nonce=esp_random(); } while(!nonce);
-  discovery.begin(millis(),nonce,registry); removeConfirm=-1;
+  discovery.begin(millis(),nonce,registry); removeConfirm=keyConfirm=-1;
   // Opening the menu revokes the current link's authorization.
   linkAuth.revoke();
   receiving=pendingFrame=false; discoveryReleaseAt=millis(); uiDirty=true;
@@ -538,8 +576,9 @@ void startComputerScan() {
 }
 // Rocker press in the menu: switch to a paired computer instantly, or pair a
 // newly registered one (the least recently used pairing is replaced when full).
-void chooseComputer() {
-  unsigned i=discovery.selection;
+// A paired computer that sent a different secret needs a second, explicit
+// confirmation before the new secret replaces the stored one.
+void selectComputer(unsigned i) {
   if(!discovery.selectable(i)) return;
   const sweetmeter::Computer &c=discovery.computers[i];
   int index=c.paired;
@@ -547,6 +586,17 @@ void chooseComputer() {
   registry.select(index); saveRegistrySoon();
   Serial.printf("UI SELECT paired=%u\n",registry.count);
   closeDiscovery();
+}
+void chooseComputer() {
+  unsigned i=discovery.selection;
+  if(!discovery.selectable(i)) return;
+  if(discovery.needsKeyConfirmation(i)) { keyConfirm=int(i); uiDirty=true; return; }
+  selectComputer(i);
+}
+void acceptNewKey() {
+  unsigned i=unsigned(keyConfirm); keyConfirm=-1; uiDirty=true;
+  // The row may have become a conflict meanwhile; selectComputer() checks.
+  if(i<discovery.count && discovery.computers[i].keyChanged) selectComputer(i);
 }
 void confirmRemove() {
   unsigned i=unsigned(removeConfirm); removeConfirm=-1; uiDirty=true;
@@ -558,13 +608,13 @@ void confirmRemove() {
 }
 void onAuthorized() {
   disconnectSleep.targetConnected(); idlePower.seen(millis());
-  rememberAuthenticatedPeer();
+  earnBond();
   Serial.println("BLE AUTHORIZED");
 }
 void helloReply(uint8_t opcode,const sweetmeter::AuthOutcome &outcome) {
   uint8_t reply[2]={opcode,outcome.result}; notifyControl(reply,2);
   if(outcome.changed && linkAuth.authorized()) onAuthorized();
-  if(outcome.result==sweetmeter::helloNotSelected) rememberAuthenticatedPeer();
+  if(outcome.result==sweetmeter::helloNotSelected) earnBond();  // proved a paired secret
   updateDeviceSnapshot();
   if(outcome.drop) { Serial.printf("BLE HELLO_REJECTED result=%u\n",outcome.result); dropLink(); }
 }
@@ -574,11 +624,14 @@ void processControl(const uint8_t *p,size_t n) {
   if(p[0]=='J' || p[0]=='j' || p[0]=='K') {
     uint32_t sid=0,next=0; unsigned before=discovery.count;
     uint8_t result=discovery.handle(p,n,millis(),sid,next,linkPeer); registrationReply(result,sid,next);
+    // A completed registration keeps its bond; so does an old app told to
+    // update, which registers again after updating.
+    if(p[0]=='K' && (result==RegOk || result==RegOutdated)) earnBond();
     if(before!=discovery.count || (p[0]=='K' && !result)) uiDirty=true;
     if(result || p[0]=='K') dropLink();
     return;
   }
-  if(p[0]=='H') { helloReply('H',linkAuth.legacyHello(p,n,registry,discovery.open,ota.active())); return; }
+  if(p[0]=='H') { helloReply('H',linkAuth.legacyHello(p,n,registry,discovery.open,ota.active(),legacyWindow,millis())); return; }
   if(p[0]=='P') {
     uint8_t challenge[challengeSize];
     portENTER_CRITICAL(&snapshotMux); memcpy(challenge,linkChallenge,sizeof(challenge)); portEXIT_CRITICAL(&snapshotMux);
@@ -602,7 +655,14 @@ void processControl(const uint8_t *p,size_t n) {
     return;
   }
   if(p[0]=='T') {
-    if(n==9 && !ota.active()) { timeval tv={time_t(read32(p+1)),0}; settimeofday(&tv,nullptr); timezoneOffset=int32_t(read32(p+5)); clockSynced=true; }
+    if(n==9 && !ota.active()) {
+      // Sub-2-second differences are transport jitter; stepping back for them
+      // could redraw the previous minute (display_policy.h).
+      int64_t incoming=int64_t(read32(p+1));
+      if(clockNeedsStep(clockSynced,int64_t(time(nullptr)),incoming)) { timeval tv={time_t(incoming),0}; settimeofday(&tv,nullptr); }
+      timezoneOffset=int32_t(read32(p+5)); clockSynced=true; sleptTotal=0;
+      if(clockGeneration!=seenGeneration) { clockGeneration=seenGeneration; minuteRedraw.firstClock(millis()); }
+    }
   } else if(p[0]=='B') {
     uint32_t seq=n>=5?read32(p+1):0,checksum=n>=9?read32(p+5):0;
     if(n!=11 || ota.active() || pendingFrame || receiving || sweetmeter::u16(p+9)!=FRAME_SIZE) { frameBeginReply(2,seq,checksum); return; }
@@ -636,13 +696,18 @@ void syncLink(uint32_t now) {
   if(wasAuthorized) disconnectSleep.targetDisconnected(now);
   serviceChangeSent=false; discoveryReleaseAt=0; discovery.resetRegistration(); copyPeer(linkPeer);
   if(notices.link(generation)) uiDirty=true;
-  if(!connected) { BLEDevice::startAdvertising(); bondMaintenanceDue=true; Serial.println("BLE DISCONNECTED"); }
+  if(connected && !discovery.open &&
+     sweetmeter::menuRaceEarnsBond(false,connectionAt,menuClosedAt,menuEverClosed)) earnBond();
+  if(!connected) { advertise(); Serial.println("BLE DISCONNECTED"); }
   updateDeviceSnapshot();
 }
 void setupBluetooth() {
   nvsReady=preferences.begin("quota-meter",false);
   bootHealth.initialize(preferences,nvsReady);
-  loadRegistry(); loadRecentPeers();
+  loadRegistry();
+  // Earlier builds kept a "peers" list for bond eviction; bonds are now
+  // removed only per link (bond_policy.h), so drop the stale key.
+  if(nvsReady && preferences.isKey("peers")) preferences.remove("peers");
   uint64_t mac=ESP.getEfuseMac();
   for(int i=0;i<6;++i) { uint8_t byte=uint8_t(mac>>(8*i)); sweetmeter::hexEncode(&byte,1,deviceSerial+2*i); }
   packetQueue=xQueueCreate(4,sizeof(HostPacket)); rejectQueue=xQueueCreate(4,sizeof(HostPacket));
@@ -659,12 +724,6 @@ void setupBluetooth() {
         signalRssi=parameters->read_rssi_cmpl.status==ESP_BT_STATUS_SUCCESS?parameters->read_rssi_cmpl.rssi:127;
         signalReadAt=millis();
       }
-    }
-    // The bonded identity address of this link (what the bond list stores).
-    if(event==ESP_GAP_BLE_AUTH_CMPL_EVT && parameters->ble_security.auth_cmpl.success) {
-      portENTER_CRITICAL(&snapshotMux);
-      memcpy(bondAddress,parameters->ble_security.auth_cmpl.bd_addr,6); bondGeneration=linkGeneration;
-      portEXIT_CRITICAL(&snapshotMux);
     }
   });
   BLEDevice::setCustomGattsHandler([](esp_gatts_cb_event_t event,esp_gatt_if_t interface,esp_ble_gatts_cb_param_t *parameters) {
@@ -697,11 +756,11 @@ void setupBluetooth() {
   otaStatusCccd=new BLE2902(); otaStatusCharacteristic->addDescriptor(otaStatusCccd); otaStatusCharacteristic->setCallbacks(new OtaStatusCallbacks());
   publishOta(ota.status,true); updateDeviceSnapshot(); service->start();
   BLEAdvertising *advertising=BLEDevice::getAdvertising();
-  BLEAdvertisementData advertisement,response;
+  BLEAdvertisementData advertisement;
   advertisement.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC|ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
-  advertisement.setCompleteServices(BLEUUID(SERVICE_UUID)); response.setName(advertisedName);
-  advertising->setAdvertisementData(advertisement); advertising->setScanResponseData(response);
-  advertising->setMinInterval(800); advertising->setMaxInterval(1600); BLEDevice::startAdvertising();
+  advertisement.setCompleteServices(BLEUUID(SERVICE_UUID));
+  advertising->setAdvertisementData(advertisement); setScanResponse(false);
+  advertising->setMinInterval(800); advertising->setMaxInterval(1600); advertise();
   drawScreen();
   bool bleReady=bleServiceStarted && service->getHandle()!=0 && controlCharacteristic->getHandle()!=0 && otaStatusCharacteristic->getHandle()!=0;
   bootHealth.finish(allocated && nvsReady && panelReady && bleReady);
@@ -720,6 +779,11 @@ void handleKeys(uint8_t keys,uint32_t now) {
     else if(keys) { removeConfirm=-1; uiDirty=true; }
     return;
   }
+  if(discovery.open && keyConfirm>=0) {
+    if(keys&16) acceptNewKey();
+    else if(keys) { keyConfirm=-1; uiDirty=true; }
+    return;
+  }
   if(discovery.open) {
     if(keys&1) startComputerScan();
     if((keys&4)&&discovery.count) { discovery.selection=(discovery.selection+discovery.count-1)%discovery.count; uiDirty=true; }
@@ -730,9 +794,12 @@ void handleKeys(uint8_t keys,uint32_t now) {
     return;
   }
   if(keys&1) {
-    refreshRequestedAt=now; uiDirty=true;
-    if(connected&&isAuthorized()) { uint8_t request='R'; notifyControl(&request,1); }
-    else if(!connected) BLEDevice::startAdvertising();
+    // With a computer the answering frame is drawn, not the press (one
+    // refresh); without one the "*" marker acknowledges it now.
+    bool linked=connected&&isAuthorized();
+    if(refreshRequest.press(now,linked)) uiDirty=true;
+    if(linked) { uint8_t request='R'; notifyControl(&request,1); }
+    else if(!connected) advertise();
   }
   if(keys&128) {
     // Holding the rocker asks the selected computer to check and install firmware.
@@ -762,6 +829,7 @@ void bluetoothLoop() {
   updateOtaRadio();
   if(ota.exited) {
     ota.exited=false; uiDirty=true;
+    notices.otaEnded(ota.status.state==OtaState::Error,now);
     if(!connected || !isAuthorized()) disconnectSleep.freshGrace(now);
   }
   if(criticalBattery() && !ota.commitCritical) { if(ota.active()) ota.terminal(OtaError::Power,0); lowBatterySleep(false); }
@@ -787,7 +855,7 @@ void bluetoothLoop() {
   if(idlePower.expired(now,connected&&isAuthorized(),discovery.open,ota.active())) {
     sleepCommitted=true; Serial.println("POWER IDLE_OFF minutes=30"); powerOff("No computer connected.");
   }
-  if(bondMaintenanceDue && !connected) { bondMaintenanceDue=false; evictStaleBonds(); }
+  legacyWindow.open(now);  // latches the migration window closed after ten minutes
   persistPending(now);
   uint8_t keys=__atomic_exchange_n(&keyEvents,uint8_t(0),__ATOMIC_RELAXED);
   handleKeys(keys,now);
@@ -832,8 +900,9 @@ void bluetoothLoop() {
     if(!criticalBattery()) {
       memcpy(dashboard,incomingFrame,FRAME_SIZE);
       bool first=!hasFrame; hasFrame=true; lastCRC=incomingCRC;
-      if(drawFrameNow(first,refreshRequestedAt!=0)) {
-        refreshRequestedAt=0; drawScreen(); paintedMinute=time(nullptr)/60;
+      bool answersPress=refreshRequest.frame();
+      if(drawFrameNow(first,answersPress)) {
+        drawScreen(); minuteRedraw.painted(displayedMinute(int64_t(time(nullptr)),timezoneOffset));
         result=panelReady?frameDisplayed:5;
       } else result=frameDeferred;
     }
@@ -844,7 +913,7 @@ void bluetoothLoop() {
   now=millis();
   if(receiving && expired(now,packetAt,15000)) receiving=false;
   // Removing the refresh marker or a result banner waits for the minute draw.
-  if(refreshRequestedAt && expired(now,refreshRequestedAt,10000)) refreshRequestedAt=0;
+  if(refreshRequest.tick(now)==NoticeChange::DrawNow) uiDirty=true;
   if(notices.tick(now)==NoticeChange::DrawNow) uiDirty=true;
   bool active=ota.active();
   if(active) {
@@ -857,8 +926,8 @@ void bluetoothLoop() {
     otaDrawPercent=0;
     // At most one scheduled full refresh per minute; drawScreen() skips the
     // panel entirely when nothing visible changed.
-    time_t minute=time(nullptr)/60;
-    if(!receiving && (uiDirty || (!discovery.open && minute!=paintedMinute))) { drawScreen(); paintedMinute=minute; }
+    int64_t minute=displayedMinute(int64_t(time(nullptr)),timezoneOffset);
+    if(!receiving && (uiDirty || (!discovery.open && minuteRedraw.due(minute,now)))) { drawScreen(); minuteRedraw.painted(minute); }
   }
   wasOta=active;
   bootHealth.retry(millis());

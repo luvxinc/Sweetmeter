@@ -10,6 +10,14 @@ Pairing model (protocol 4, firmware with ``"auth": 1`` in its status):
   status; the hello proves the secret with HMAC-SHA256 (``P``).
 * Meters still running pre-secret firmware (2026.9.8/2026.9.13) are handled
   with the legacy ``H`` hello so they can receive the firmware that adds this.
+* A secret is transmitted once, in the registration that created it; see
+  ``PairingStore`` and ``authorize_link``. Status is reported as trusted only
+  after this link's authentication succeeded.
+* Pairing firmware advertises a capability marker (see ``advertised_kind``).
+  This computer connects (and so bonds) to such a meter only if it is paired
+  or pairing with it, or its physical menu is open. Pre-secret firmware (no
+  marker) never removes bonds, so it is probed as before: that is how an
+  unpaired pre-secret meter is selected and then updated.
 """
 from __future__ import annotations
 import asyncio
@@ -40,9 +48,16 @@ SERIAL_PATTERN = re.compile(r'[0-9a-f]{12}\Z')
 CHALLENGE_PATTERN = re.compile(r'[0-9a-f]{32}\Z')
 FRAME_ACK_TIMEOUT = 30
 NOTICE_MAX_AGE = 60
+# A firmware job must start on its meter within this time or it is dropped.
+JOB_START_TIMEOUT = 60
+JOB_EXPIRED = {'event': 'ota_error', 'error': 'The meter disconnected before the update started. Try again.',
+               'code': 'job_expired'}
 SECRET_SIZE = 32
 AUTH_LABEL = b'SWM-AUTH-1'
 MENU_NAME_SUFFIX = '-PAIR'
+# Scan-response capability marker of pairing firmware: manufacturer data with
+# company ID 0xFFFF, b'SM' and a flags byte (bit 0 pairing secrets, bit 1 menu open).
+MARKER_COMPANY, MARKER_PREFIX, MARKER_AUTH, MARKER_MENU = 0xFFFF, b'SM', 1, 2
 SCAN_SECONDS = 3
 MAX_IDLE_GAP = 30
 MAX_FOUND_GAP = 15
@@ -103,6 +118,33 @@ def pairing_proof(secret, challenge_hex, serial, host_id):
     return hmac.new(secret, message, hashlib.sha256).digest()[:16]
 
 
+def advertised_kind(advertisement):
+    """Classify a meter from its (merged) advertisement without connecting.
+
+    ``'menu'``: pairing firmware with its menu open (marker flag, or the
+    ``-PAIR`` name suffix when a scanner reports only the name);
+    ``'closed'``: pairing firmware, menu closed; ``'legacy'``: a name but no
+    marker, i.e. pre-secret firmware; None: the scan response (name and marker)
+    has not been seen yet.
+    """
+    data = getattr(advertisement, 'manufacturer_data', None) or {}
+    marker = data.get(MARKER_COMPANY) if isinstance(data, dict) else None
+    name = getattr(advertisement, 'local_name', None)
+    if isinstance(marker, (bytes, bytearray)) and len(marker) >= 3 and bytes(marker[:2]) == MARKER_PREFIX:
+        return 'menu' if marker[2] & MARKER_MENU else 'closed'
+    if isinstance(name, str) and name.endswith(MENU_NAME_SUFFIX):
+        return 'menu'
+    if isinstance(name, str) and name:
+        return 'legacy'
+    return None
+
+
+class _Advertisement:
+    """Advertisement fields merged over one scan (a scan response can arrive separately)."""
+    def __init__(self, local_name=None, manufacturer_data=None):
+        self.local_name, self.manufacturer_data = local_name, dict(manufacturer_data or {})
+
+
 def device_key(address, status):
     serial = status.get('serial')
     return 'serial:' + serial if isinstance(serial, str) and SERIAL_PATTERN.fullmatch(serial) else 'address:' + address
@@ -122,6 +164,9 @@ class PairingRejected(Exception):
     def __init__(self, reason, *, paired=False):
         super().__init__('Select this computer using the meter buttons')
         self.reason, self.paired = reason, paired
+        # True when only an unproven pending secret was refused and a
+        # confirmed one remains to try on the next connection.
+        self.retry = False
 
 
 class HelloBusy(RuntimeError):
@@ -175,11 +220,27 @@ def classify_error(error):
 
 
 class PairingStore:
-    """Per-meter pairing secrets, private to this user (``pairings.json``, 0600)."""
+    """Per-meter pairing secrets, private to this user (``pairings.json``, 0600).
+
+    A meter is keyed by its serial (``serial:<12 hex>``). Each record holds at
+    most one **confirmed** secret (``secret``: the meter proved it knows it by
+    accepting an authenticated hello) and **pending** secrets per BLE address
+    (``pending``: sent in a registration, not yet proven). A secret is sent over
+    the air exactly once, in the registration that created it; a confirmed
+    secret is never transmitted again, so a peripheral that merely copies a
+    meter's public serial cannot obtain it. Records keyed ``address:<addr>``
+    with ``legacy`` come from companions that predate pairing secrets.
+
+    ``generation`` changes when the user forgets every meter; writers pass the
+    generation they started with and their write is dropped if it changed.
+    """
+    MAX_PENDING = 4
+
     def __init__(self, state_dir):
         self.path = Path(state_dir) / 'pairings.json'
         self.lock = threading.RLock()
         self.meters = {}
+        self.generation = 0
         existing = self.path.exists()
         try:
             raw = json.loads(self.path.read_text(encoding='utf-8'))
@@ -188,8 +249,16 @@ class PairingStore:
             for key, record in raw['meters'].items():
                 if isinstance(key, str) and isinstance(record, dict):
                     secret = record.get('secret')
-                    if secret is not None and not (isinstance(secret, str) and re.fullmatch(r'[0-9a-f]{64}', secret)):
+                    if secret is not None and not _secret_hex(secret):
                         continue
+                    pending = record.get('pending', {})
+                    if not isinstance(pending, dict):
+                        pending = {}
+                    record['pending'] = {address: entry for address, entry in pending.items()
+                                         if isinstance(address, str) and isinstance(entry, dict)
+                                         and _secret_hex(entry.get('secret'))}
+                    if not record['pending']:
+                        record.pop('pending')
                     self.meters[key] = record
             if os.name == 'posix' and self.path.stat().st_mode & 0o077:
                 self.path.chmod(0o600)
@@ -223,23 +292,81 @@ class PairingStore:
                 os.chmod(temp, 0o600)
             os.replace(temp, self.path)
 
+    def _current(self, generation):
+        return generation is None or generation == self.generation
+
     def secret(self, key):
+        """The confirmed secret for this meter, or None."""
         with self.lock:
             value = self.meters.get(key, {}).get('secret')
             return bytes.fromhex(value) if value else None
 
-    def secret_for(self, key, address):
-        """The secret registered with this meter, created (and saved) on first use."""
+    confirmed = secret
+
+    def pending(self, key, address):
         with self.lock:
-            record = self.meters.setdefault(key, {'paired': False})
-            if not record.get('secret'):
+            entry = self.meters.get(key, {}).get('pending', {}).get(address)
+            return bytes.fromhex(entry['secret']) if entry else None
+
+    def new_pending(self, key, address, *, generation=None):
+        """A fresh secret for one registration, saved before it is sent.
+
+        Returns None if the user forgot every meter since ``generation``.
+        """
+        with self.lock:
+            if not self._current(generation):
+                return None
+            value = secrets.token_bytes(SECRET_SIZE)
+            while not any(value):
                 value = secrets.token_bytes(SECRET_SIZE)
-                while not any(value):
-                    value = secrets.token_bytes(SECRET_SIZE)
-                record['secret'] = value.hex()
+            record = self.meters.setdefault(key, {'paired': False})
+            pending = record.setdefault('pending', {})
+            pending[address] = {'secret': value.hex(), 'at': time.time()}
+            while len(pending) > self.MAX_PENDING:
+                pending.pop(min(pending, key=lambda a: pending[a].get('at', 0)))
             record['address'], record['updated_at'] = address, time.time()
             self.save()
-            return bytes.fromhex(record['secret'])
+            return value
+
+    def drop_pending(self, key, address, *, generation=None):
+        with self.lock:
+            record = self.meters.get(key)
+            if not self._current(generation) or not record or address not in record.get('pending', {}):
+                return
+            del record['pending'][address]
+            if not record['pending']:
+                record.pop('pending')
+            self.save()
+
+    def promote(self, key, address, secret, *, generation=None):
+        """The meter proved it stores ``secret``: it becomes the confirmed one."""
+        with self.lock:
+            if not self._current(generation):
+                return False
+            record = self.meters.setdefault(key, {})
+            record.update(secret=secret.hex(), paired=True, address=address, updated_at=time.time())
+            record.pop('pending', None)
+            record.pop('legacy', None)
+            if key != 'address:' + address:
+                self.meters.pop('address:' + address, None)
+            self.save()
+            return True
+
+    def legacy_record(self, address):
+        """A pre-secret companion was paired with the meter at this exact address."""
+        with self.lock:
+            record = self.meters.get('address:' + address, {})
+            return bool(record.get('legacy') and record.get('paired'))
+
+    def related(self, address):
+        """This computer has (or is completing) a pairing with the meter at ``address``."""
+        with self.lock:
+            return any(record.get('address') == address or address in record.get('pending', {})
+                       for record in self.meters.values())
+
+    def has_pairing(self):
+        with self.lock:
+            return any(record.get('secret') or record.get('legacy') for record in self.meters.values())
 
     def trusted(self, key, address):
         with self.lock:
@@ -248,8 +375,16 @@ class PairingStore:
             legacy = self.meters.get('address:' + address, {})
             return bool(legacy.get('paired') and legacy.get('legacy'))
 
-    def mark_paired(self, key, address, *, legacy=False):
+    def needs_registration(self, key):
+        """Register in an open menu unless the meter recently accepted our confirmed secret."""
         with self.lock:
+            record = self.meters.get(key, {})
+            return not (record.get('secret') and record.get('paired'))
+
+    def mark_paired(self, key, address, *, legacy=False, generation=None):
+        with self.lock:
+            if not self._current(generation):
+                return False
             record = self.meters.setdefault(key, {})
             record.update(paired=True, address=address, updated_at=time.time())
             if legacy:
@@ -260,6 +395,7 @@ class PairingStore:
                 if key != 'address:' + address:
                     self.meters.pop('address:' + address, None)
             self.save()
+            return True
 
     def mark_unpaired(self, key, address):
         with self.lock:
@@ -284,7 +420,69 @@ class PairingStore:
     def forget_all(self):
         with self.lock:
             self.meters = {}
+            self.generation += 1
             self.save()
+
+
+def _secret_hex(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None and int(value, 16) != 0
+
+
+async def authorize_link(session, store, address, status, *, generation=None):
+    """Authorize this link exactly as the companion does; returns the method used.
+
+    * Pairing firmware with a secured selection: prove the pending secret for
+      this address if one exists (the most recent registration), otherwise the
+      confirmed one. A pending secret is confirmed only when the meter accepts
+      its proof. One hello per link, so a refused pending secret is dropped and
+      the confirmed one is tried on the next connection.
+    * A selection inherited from pre-secret firmware (``secured`` false): the
+      legacy H/Y migration runs only when this computer holds no confirmed
+      secret for the meter **and** a pre-secret companion record exists for
+      this exact BLE address. It always provisions a fresh secret.
+
+    Raises PairingRejected. ``generation`` is the PairingStore generation read
+    when the visit began; a Forget in between is never undone.
+    """
+    key = device_key(address, status)
+    if not status['selected']:
+        raise PairingRejected('unpaired')
+    if status['secured']:
+        pending = store.pending(key, address)
+        secret = pending if pending is not None else store.confirmed(key)
+        if secret is None:
+            raise PairingRejected('other_computer')
+        try:
+            await session.authenticate(secret, status['challenge'], status['serial'])
+        except PairingRejected as rejection:
+            if pending is not None and not rejection.paired:
+                # The meter never stored it (not chosen, or superseded).
+                store.drop_pending(key, address, generation=generation)
+                rejection.retry = store.confirmed(key) is not None
+            raise
+        if pending is not None:
+            store.promote(key, address, pending, generation=generation)
+        else:
+            store.mark_paired(key, address, generation=generation)
+        return 'authenticated'
+    if store.confirmed(key) is not None:
+        # Never send a confirmed secret again. An unsecured selection on a
+        # meter we hold a secret for is someone else's migration (or a copied
+        # serial); it says nothing about our own pairing, so keep it.
+        raise PairingRejected('other_computer', paired=True)
+    if not store.legacy_record(address):
+        # Never trust a first use for a meter this computer never paired with
+        # under pre-secret firmware.
+        raise PairingRejected('other_computer')
+    if await session.hello() != HELLO_PROVISION:
+        raise PairingRejected('other_computer')
+    secret = store.new_pending(key, address, generation=generation)
+    if secret is None:
+        raise PairingRejected('other_computer')
+    await session.provision(secret)
+    # Y is acknowledged only after the meter stored it durably.
+    store.promote(key, address, secret, generation=generation)
+    return 'provisioned'
 
 
 class Session:
@@ -452,7 +650,6 @@ class Bluetooth:
         self._idle_gap = 0
         self._wake = threading.Event()
         self._reset_requested = False
-        self._forget_generation = 0
         self._last_error = (None, 0.0)
         self.thread = threading.Thread(target=self._thread, name='sweetmeter-ble', daemon=True)
         if start:
@@ -509,15 +706,18 @@ class Bluetooth:
     async def _scan(self):
         devices = {}
         def found(device, advertisement):
-            devices[device.address] = (device, advertisement)
+            previous = devices.get(device.address, (None, _Advertisement()))[1]
+            name = getattr(advertisement, 'local_name', None) or previous.local_name
+            data = dict(previous.manufacturer_data)
+            data.update(getattr(advertisement, 'manufacturer_data', None) or {})
+            devices[device.address] = (device, _Advertisement(name, data))
         async with self.scanner_factory(detection_callback=found, service_uuids=[SERVICE_UUID]):
             await self._sleep(SCAN_SECONDS)
         return devices
 
     @staticmethod
     def _menu_hint(advertisement):
-        name = getattr(advertisement, 'local_name', None)
-        return isinstance(name, str) and name.endswith(MENU_NAME_SUFFIX)
+        return advertised_kind(advertisement) == 'menu'
 
     async def _cycle(self):
         if self._reset_requested:
@@ -535,14 +735,29 @@ class Bluetooth:
             await self._sleep(self._next_idle_gap())
             return
         self._set_health('ok')
+        self._expire_job()
         paired = self.store.paired_addresses()
         order = sorted(devices.items(), key=lambda item: (item[0] not in paired, not self._menu_hint(item[1][1])))
         for address, (device, advertisement) in order:
             if self.stop.is_set():
                 return
-            hinted = self._menu_hint(advertisement)
+            kind = advertised_kind(advertisement)
+            hinted = kind == 'menu'
             if not hinted and time.monotonic() < self._not_before.get(address, 0):
                 continue
+            if not hinted and not self.store.related(address):
+                if kind is None:
+                    continue  # scan response not seen yet: decide on a later scan
+                if kind == 'closed':
+                    # Pairing firmware keeps only bonds that were earned, so a
+                    # probe would leave a stale key in this computer's OS.
+                    # Show the instructions from the advertisement instead.
+                    if not self.store.has_pairing():
+                        self.events.put({'event': 'selection_required', 'name': self.name, 'reason': 'unpaired'})
+                    self._not_before[address] = time.monotonic() + random.uniform(3, 5)
+                    continue
+                # 'legacy': pre-secret firmware never removes bonds; probe it
+                # as before so it can be selected, registered and updated.
             delay = await self._visit(device, hinted)
             self._not_before[address] = time.monotonic() + delay
         if devices:
@@ -582,24 +797,35 @@ class Bluetooth:
         """Probe/drive one meter; returns seconds before probing it again."""
         address = device.address
         was_connected, key = False, None
+        # A Forget while this visit runs must never be undone by it.
+        generation = self.store.generation
         try:
             async with self.client_factory(device, timeout=20) as client:
                 status = parse_status(await asyncio.wait_for(client.read_gatt_char(STATUS_UUID), 10))
                 key = device_key(address, status)
-                self._status(address, status, self.store.trusted(key, address))
+                # Anyone can copy a meter's serial: nothing is trusted before
+                # this link has authenticated.
+                self._status(address, status, False)
                 session = Session(client, self.host_id, self.name, self.events.put, protocol=status['protocol'])
                 await session.subscribe()
                 nonce = status.get('discovery_nonce', 0)
                 if status['protocol'] == 4 and status.get('menu') and type(nonce) is int and nonce:
-                    if self.registered.get(address) != nonce:
-                        secret = self.store.secret_for(key, address) if status.get('auth') == 1 else None
+                    if self.registered.get(address) != nonce and (
+                            status.get('auth') != 1 or self.store.needs_registration(key)):
+                        secret = None
+                        if status.get('auth') == 1:
+                            # A fresh secret for every registration; it stays
+                            # pending until the meter proves it stored it.
+                            secret = self.store.new_pending(key, address, generation=generation)
+                            if secret is None:
+                                return 0
                         await session.register(nonce, secret)
                         self.registered[address] = nonce
                         self.events.put({'event': 'registered', 'name': self.name})
                     return random.uniform(5, 9)
                 legacy = status.get('auth') != 1
-                if status.get('auth') == 1:
-                    await self._authenticate(session, address, key, status)
+                if not legacy:
+                    await authorize_link(session, self.store, address, status, generation=generation)
                 else:
                     selected = status.get('selected_host', '')
                     if selected and selected != self.host_id:
@@ -607,12 +833,16 @@ class Bluetooth:
                     if status['protocol'] == 4 and not selected:
                         raise PairingRejected('unpaired')
                     await session.hello()
-                self.store.mark_paired(key, address, legacy=legacy)
+                if generation != self.store.generation or not self.store.mark_paired(
+                        key, address, legacy=legacy, generation=generation):
+                    await client.disconnect()
+                    return 0
                 self.pinned = address
                 was_connected = True
                 self._idle_gap = 0
+                self._status(address, status, True)
                 self.events.put({'event': 'connected', 'device_id': address})
-                await self._connected(session, address, status, key)
+                await self._connected(session, address, status, key, generation)
                 return 0
         except DiscoveryOpened:
             return random.uniform(2, 5)
@@ -628,23 +858,13 @@ class Bluetooth:
             return random.uniform(2, 5)
         finally:
             if was_connected:
+                self._drop_job(address)
                 self.events.put({'event': 'disconnected'})
 
-    async def _authenticate(self, session, address, key, status):
-        if not status['selected']:
-            raise PairingRejected('unpaired')
-        if status['secured']:
-            secret = self.store.secret(key)
-            if secret is None:
-                raise PairingRejected('other_computer')
-            await session.authenticate(secret, status['challenge'], status['serial'])
-            return
-        # The meter's selection predates pairing secrets. Only that computer's
-        # legacy hello is accepted, once, and must immediately store a secret.
-        if await session.hello() == HELLO_PROVISION:
-            await session.provision(self.store.secret_for(key, address))
-
     def _rejected(self, address, rejection, key):
+        if rejection.retry:
+            # Only an unproven pending secret was refused; try the confirmed one.
+            return random.uniform(2, 4)
         if key is not None and not rejection.paired:
             self.store.mark_unpaired(key, address)
         event = {'event': 'selection_required', 'name': self.name, 'reason': rejection.reason}
@@ -655,19 +875,58 @@ class Bluetooth:
         # switches back to it; strangers to this meter back off politely.
         return random.uniform(8, 12) if rejection.paired else random.uniform(30, 45)
 
-    async def _connected(self, session, address, status, key):
+    # --- firmware jobs ------------------------------------------------------------
+    def _take_job(self, address):
+        """The queued firmware job for this meter, if it may start now."""
+        try:
+            job, queued_at = self.jobs.get_nowait()
+        except queue.Empty:
+            return None
+        target = job.get('device_id')
+        if time.monotonic() - queued_at > JOB_START_TIMEOUT or (target is not None and target != address):
+            self.events.put(dict(JOB_EXPIRED))
+            return None
+        return {name: value for name, value in job.items() if name != 'device_id'}
+
+    def _drop_job(self, address):
+        """The meter disconnected: a job waiting for it can no longer start."""
+        try:
+            job, _queued_at = self.jobs.get_nowait()
+        except queue.Empty:
+            return
+        target = job.get('device_id')
+        if target is not None and target != address:
+            try:
+                self.jobs.put_nowait((job, _queued_at))
+            except queue.Full:
+                self.events.put(dict(JOB_EXPIRED))
+            return
+        self.events.put(dict(JOB_EXPIRED))
+
+    def _expire_job(self):
+        try:
+            job, queued_at = self.jobs.get_nowait()
+        except queue.Empty:
+            return
+        if time.monotonic() - queued_at > JOB_START_TIMEOUT:
+            self.events.put(dict(JOB_EXPIRED))
+            return
+        try:
+            self.jobs.put_nowait((job, queued_at))
+        except queue.Full:
+            self.events.put(dict(JOB_EXPIRED))
+
+    async def _connected(self, session, address, status, key, generation=None):
         sent, next_status = None, 0
-        generation = self._forget_generation
+        if generation is None:
+            generation = self.store.generation
         while session.client.is_connected and not self.stop.is_set():
             if session.discovery:
                 raise DiscoveryOpened()
-            if generation != self._forget_generation:
+            if generation != self.store.generation:
                 await session.client.disconnect()
                 return
-            try:
-                job = self.jobs.get_nowait()
-            except queue.Empty:
-                job = None
+            job = self._take_job(address)
             if job:
                 if status['protocol'] != 4:
                     self.events.put({'event': 'ota_error', 'error': 'Legacy firmware requires USB bootstrap'})
@@ -746,14 +1005,19 @@ class Bluetooth:
         """Forget every paired meter and its secret on this computer."""
         self.store.forget_all()
         self.pinned = None
-        self._forget_generation += 1
         self.rescan()
         self.events.put({'event': 'forgotten'})
 
     def install_firmware(self, **job):
+        """Queue a firmware transfer for the meter ``device_id`` (its BLE address).
+
+        It starts only on that meter, within JOB_START_TIMEOUT seconds; otherwise
+        an ``ota_error`` event with code ``job_expired`` is emitted. A job without
+        ``device_id`` runs on the next connected meter (older callers).
+        """
         if self.ota is not None:
             raise RuntimeError('An update is already running')
-        self.jobs.put_nowait(job)
+        self.jobs.put_nowait((job, time.monotonic()))
 
     def cancel_update(self):
         try:

@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import hashlib
 import json
 import os
@@ -27,6 +28,11 @@ class UpdateTests(unittest.TestCase):
                              LOCALAPPDATA=str(home / 'local'), APPDATA=str(home / 'roaming'))
         sandbox.start()
         self.addCleanup(sandbox.stop)
+        # Process lookup by tree (ps / /proc) is exercised by its own tests;
+        # here Popen is a fake, so no process runs from any tree.
+        pids = patch.object(update, 'tree_pids', return_value=set())
+        self.tree_pids = pids.start()
+        self.addCleanup(pids.stop)
         self.package = self.root / 'package.zip'
         self.name = 'Sweetmeter.app' if sys.platform == 'darwin' else 'Sweetmeter'
         self.relative_exe = ('Contents/MacOS/Sweetmeter' if sys.platform == 'darwin'
@@ -401,6 +407,66 @@ class UpdateTests(unittest.TestCase):
         launch.assert_not_called()
         self.assertIn('Quit the running', (self.root / 'helper.log').read_text())
 
+    def test_helper_gives_the_app_a_deadline_beyond_the_old_150_seconds(self):
+        import time
+        installed, plan, plan_path = self.plan()
+        plan['health_timeout'] = update.HEALTH_TIMEOUT
+        plan_path.write_text(json.dumps(plan))
+        with patch.object(update, 'install_root', return_value=installed), \
+                patch.object(update, 'data_dir', return_value=self.root), \
+                patch.object(update, '_alive', side_effect=lambda pid: pid == 444), \
+                patch.object(update.subprocess, 'Popen', side_effect=self.launch_healthy(plan)) as popen:
+            update.apply_update(plan_path)
+        deadline = float(popen.call_args_list[0].kwargs['env']['SWEETMETER_UPDATE_DEADLINE'])
+        self.assertAlmostEqual(deadline - time.time(), update.HEALTH_TIMEOUT, delta=10)
+
+    def test_hung_app_that_never_reported_its_pid_is_stopped_and_its_tree_kept(self):
+        installed, plan, plan_path = self.plan()
+        running = {777}
+        stopped = []
+        self.tree_pids.side_effect = lambda root: set(running) if Path(root) == installed else set()
+        def terminate(pid, timeout=10):
+            stopped.append(pid)
+            return False  # Hangs: cannot be stopped.
+        with patch.object(update, 'install_root', return_value=installed), \
+                patch.object(update, 'data_dir', return_value=self.root), \
+                patch.object(update, '_alive', return_value=False), \
+                patch.object(update, 'terminate_pid', side_effect=terminate), \
+                patch.object(update.subprocess, 'Popen', return_value=Process(exit_after=2)):
+            with self.assertRaises(RuntimeError):
+                update.apply_update(plan_path)
+        self.assertIn(777, stopped)  # Found by its executable path, not a receipt.
+        # Never delete the tree the hung process runs from; the launcher
+        # finishes the rollback once it has exited.
+        self.assertEqual((installed / self.relative_exe).read_text(), 'new app')
+        self.assertTrue((self.root / 'companion-swap.json').exists())
+        result = json.loads((self.state / 'companion-update-result.json').read_text())
+        self.assertIn('next login', result['reason'])
+        with patch.object(update, 'install_root', return_value=installed), \
+                patch.object(update, 'data_dir', return_value=self.root):
+            with self.assertRaisesRegex(RuntimeError, 'Quit the running'):
+                update.recover_update()
+            running.clear()  # It exited: the launcher now restores the previous version.
+            self.assertTrue(update.recover_update())
+        self.assertEqual((installed / self.relative_exe).read_text(), 'old app')
+
+    def test_launcher_does_not_start_a_second_copy_of_a_running_app(self):
+        from meter.instance_lock import InstanceLock
+        installed = self.installed_app()
+        state = self.root / 'state-running'
+        state.mkdir()
+        lock = InstanceLock(state / 'meter.lock')
+        self.addCleanup(lock.close)
+        with patch.object(update, 'recover_update'), \
+                patch.object(update, 'install_root', return_value=installed), \
+                patch.object(update, 'data_dir', return_value=self.root), \
+                patch.object(update.subprocess, 'Popen') as launch:
+            self.assertEqual(update.launch_installed(['--background', '--state-dir', str(state)]), 0)
+            launch.assert_not_called()
+            lock.close()
+            update.launch_installed(['--background', '--state-dir', str(state)])
+            launch.assert_called_once()
+
     def test_launcher_applies_saved_profile_environment(self):
         from unittest.mock import Mock
         installed = self.installed_app()
@@ -525,6 +591,91 @@ class HealthReceiptTests(unittest.TestCase):
         with self.environment('unauthorized'):
             self.assertIsNone(update.confirm_update_health('2026.9.2', radio=SimpleNamespace(health='unauthorized')))
         self.assertTrue(self.marker.exists())
+
+    def test_open_permission_prompt_is_waited_for_and_never_rolls_back(self):
+        # macOS shows its Bluetooth prompt: the radio reports nothing (None).
+        radio = SimpleNamespace(health=None)
+        notices, confirmed = [], threading.Event()
+        with self.environment('ok'), patch.object(update, 'BLUETOOTH_PROMPT_NOTICE_AFTER', .05):
+            thread = update.confirm_update_health('2026.9.2', radio=radio, notify=notices.append,
+                                                  on_confirmed=confirmed.set, timeout=.4, interval=.01)
+            thread.join(5)
+        self.assertTrue(confirmed.is_set())  # Unknown at the deadline: the update is kept.
+        self.assertTrue(self.marker.exists())
+        self.assertFalse((self.folder / 'unhealthy.json').exists())
+        self.assertEqual(len(notices), 1)
+        self.assertIn('Allow Bluetooth for Sweetmeter', notices[0])
+        self.assertNotIn('None', notices[0])
+
+    def test_restarted_radio_is_followed(self):
+        app = SimpleNamespace(radio=SimpleNamespace(health=None))
+        confirmed = threading.Event()
+        with self.environment('ok'):
+            thread = update.confirm_update_health('2026.9.2', radio=lambda: app.radio, on_confirmed=confirmed.set,
+                                                  timeout=5, interval=.01)
+        app.radio = None  # Bluetooth worker stopped; the app restarts it...
+        app.radio = SimpleNamespace(health='ok')  # ...and the new worker works.
+        self.assertTrue(confirmed.wait(5))
+        thread.join(5)
+        self.assertTrue(self.marker.exists())
+
+    def test_radio_that_failed_to_start_rolls_back_with_a_plain_reason(self):
+        with self.environment('ok'):
+            thread = update.confirm_update_health('2026.9.2', radio=lambda: None, radio_failed=lambda: True,
+                                                  timeout=5, interval=.01)
+        thread.join(5)
+        self.assertFalse(self.marker.exists())
+        failure = json.loads((self.folder / 'unhealthy.json').read_text())
+        self.assertEqual(failure['bluetooth'], 'failed')
+        self.assertIn('Bluetooth did not start', failure['reason'])
+        self.assertNotIn('None', failure['reason'])
+
+    def test_helper_deadline_sets_the_wait(self):
+        import time
+        with patch.dict(os.environ, SWEETMETER_UPDATE_DEADLINE='%.3f' % (time.time() + 180)):
+            self.assertAlmostEqual(update._health_timeout(110), 180 - update.BLUETOOTH_DEADLINE_MARGIN, delta=2)
+        with patch.dict(os.environ, SWEETMETER_UPDATE_DEADLINE='garbage'):
+            self.assertEqual(update._health_timeout(110), 110)
+        os.environ.pop('SWEETMETER_UPDATE_DEADLINE', None)
+        self.assertEqual(update._health_timeout(110), 110)  # Older helper: stay inside its 150 s.
+        self.assertLess(update.BLUETOOTH_HEALTH_TIMEOUT + 30, 150)
+        self.assertGreaterEqual(update.HEALTH_TIMEOUT, 165)
+
+
+class TreePidsTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == 'win32', 'Windows refuses to move a running executable instead')
+    def test_finds_a_process_running_from_the_tree(self):
+        import shutil
+        import subprocess
+        import time
+        source = shutil.which('sleep')
+        if source is None:
+            self.skipTest('no sleep executable')
+        with tempfile.TemporaryDirectory() as folder:
+            tree = Path(folder) / 'Sweetmeter.app'
+            executable = tree / 'Contents/MacOS/Sweetmeter'
+            executable.parent.mkdir(parents=True)
+            if sys.platform == 'darwin':
+                # macOS kills a copied system binary (code signature); ps
+                # reports the path a program was started by, so link it.
+                executable.symlink_to(source)
+            else:
+                shutil.copyfile(source, executable)  # /proc/<pid>/exe resolves links.
+                executable.chmod(0o755)
+            process = subprocess.Popen([str(executable), '30'])
+            try:
+                found = set()
+                for _ in range(50):
+                    found = update.tree_pids(tree)
+                    if process.pid in found:
+                        break
+                    time.sleep(.05)
+                self.assertIn(process.pid, found)
+                self.assertNotIn(process.pid, update.tree_pids(Path(folder) / 'Other.app'))
+            finally:
+                process.kill()
+                process.wait(5)
+            self.assertNotIn(process.pid, update.tree_pids(tree))
 
 
 if __name__ == '__main__':

@@ -1,4 +1,5 @@
 """Run the real installers against signed local fixtures, never user accounts."""
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ class BootstrapTests(unittest.TestCase):
         self.restricted_path = False
         self.hide = ()
         self.redirect = 'yes'
+        self.offline = False
         self.package_log = self.root / 'package-manager'
         self.arch = 'arm64' if sys.platform == 'darwin' and platform.machine() == 'arm64' else 'x86_64'
         self.version = '2026.9.999'
@@ -153,7 +155,7 @@ for arg do
   previous=$arg
 done
 case "$url" in
-  */releases/latest) printf 'https://github.com/luvxinc/Sweetmeter/releases/tag/2026.9.999' ;;
+  */releases/latest) [ {'yes' if self.offline else 'no'} = no ] || exit 7; printf 'https://github.com/luvxinc/Sweetmeter/releases/tag/2026.9.999' ;;
   */*) cp {self.quote(self.root)}/"${{url##*/}}" "$output" ;;
 esac''')
             command = ['sh', str(installer)]
@@ -238,30 +240,77 @@ esac''')
         else:
             self.assertNotIn('systemctl', self.log())
 
-    def test_existing_linux_install_skips_dependency_setup(self):
+    def existing(self, version, exit_code=0):
+        """An installed Linux copy that records how it was run."""
+        installed = self.home / '.local/lib/Sweetmeter/Sweetmeter'
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_text('#!/bin/sh\nprintf "%s" "$1" > ' + self.quote(self.root / 'existing') +
+                             '\necho "Sweetmeter ' + (version or 'x') + ' checked itself."\nexit ' + str(exit_code) + '\n')
+        installed.chmod(0o755)
+        if version is not None:
+            (installed.parent / '_internal').mkdir(exist_ok=True)
+            (installed.parent / '_internal/VERSION').write_text(version + '\n')
+        return installed
+
+    def test_current_install_is_checked_in_place_without_dependency_setup(self):
         self.use_linux()
         self.bluez_installed = False
-        installed = self.home / '.local/lib/Sweetmeter/Sweetmeter'
-        installed.parent.mkdir(parents=True)
-        installed.write_text('#!/bin/sh\nprintf "%s" "$1" > ' + self.quote(self.root / 'existing') + '\nexit 0\n')
-        installed.chmod(0o755)
+        self.existing('2026.9.999')
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('Opening your existing Sweetmeter', result.stdout)
-        self.assertEqual((self.root / 'existing').read_text(), '--install')  # Repairs startup, then opens.
+        self.assertEqual((self.root / 'existing').read_text(), '--install')  # Self-check, startup repair, open.
+        self.assertIn('Sweetmeter 2026.9.999 checked itself.', result.stdout)
         self.assertFalse(self.package_log.exists())
-        self.assertFalse(self.mark.exists())
+        self.assertFalse(self.mark.exists())  # Nothing downloaded or replaced.
 
-    def test_broken_existing_install_is_repaired_from_the_latest_release(self):
+    def test_older_install_is_updated_from_the_verified_release(self):
         self.use_linux()
-        installed = self.home / '.local/lib/Sweetmeter/Sweetmeter'
-        installed.parent.mkdir(parents=True)
-        installed.write_text('#!/bin/sh\nexit 1\n')
-        installed.chmod(0o755)
+        self.bluez_installed = False
+        self.existing('2026.9.1')
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('needs repair', result.stdout)
+        self.assertIn('Updating your installed Sweetmeter 2026.9.1 to 2026.9.999.', result.stdout)
+        self.assertEqual(self.mark.read_text().strip(), '--install')  # The verified package replaces it.
+        self.assertFalse((self.root / 'existing').exists())
+        self.assertFalse(self.package_log.exists())
+        self.assertNotIn('Opening your existing', result.stdout)
+
+    def test_broken_current_install_is_reinstalled_from_the_latest_release(self):
+        self.use_linux()
+        self.existing('2026.9.999', exit_code=2)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Reinstalling Sweetmeter 2026.9.999 from the verified release.', result.stdout)
         self.assertEqual(self.mark.read_text().strip(), '--install')
+
+    def test_install_without_readable_version_is_replaced(self):
+        self.use_linux()
+        self.existing(None)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Updating your installed Sweetmeter to 2026.9.999.', result.stdout)
+        self.assertEqual(self.mark.read_text().strip(), '--install')
+
+    def test_offline_rerun_checks_the_installed_copy_and_says_so(self):
+        self.use_linux()
+        self.offline = True
+        self.existing('2026.9.1')
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Could not reach GitHub to check for a newer Sweetmeter', result.stdout)
+        self.assertEqual((self.root / 'existing').read_text(), '--install')
+        self.assertFalse(self.mark.exists())
+        self.existing('2026.9.1', exit_code=2)
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('needs repair', result.stderr)
+
+    def test_offline_first_install_fails_plainly(self):
+        self.use_linux()
+        self.offline = True
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Could not reach GitHub to find the latest release', result.stderr)
 
     def test_failed_setup_shows_plain_reason(self):
         self.use_linux()
@@ -276,6 +325,8 @@ esac''')
     def test_app_in_system_applications_is_reused(self):
         installed = self.root / 'SystemApplications/Sweetmeter.app/Contents/MacOS/Sweetmeter'
         installed.parent.mkdir(parents=True)
+        (installed.parents[1] / 'Resources').mkdir()
+        (installed.parents[1] / 'Resources/VERSION').write_text(self.version + '\n')
         installed.write_text('#!/bin/sh\nprintf "%s" "$1" > ' + self.quote(self.root / 'existing') + '\n')
         installed.chmod(0o755)
         result = self.run_installer()

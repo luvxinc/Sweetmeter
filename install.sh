@@ -26,6 +26,7 @@ case "$(uname -s)" in
 esac
 
 installed=''
+version_file=''
 if [ "$system" = macos ]; then
   state="$HOME/Library/Application Support/Sweetmeter/state"
   if [ -f "$HOME/Library/Application Support/QuotaMeter/state/companion.json" ]; then
@@ -35,28 +36,45 @@ if [ "$system" = macos ]; then
   for candidate in "$HOME/Applications/Sweetmeter.app" /Applications/Sweetmeter.app; do
     if [ -z "$installed" ] && [ -x "$candidate/Contents/MacOS/Sweetmeter" ]; then
       installed="$candidate/Contents/MacOS/Sweetmeter"
+      version_file="$candidate/Contents/Resources/VERSION"
     fi
   done
 else
   state="${XDG_DATA_HOME:-$HOME/.local/share}/sweetmeter/state"
-  if [ -x "$HOME/.local/lib/Sweetmeter/Sweetmeter" ]; then installed="$HOME/.local/lib/Sweetmeter/Sweetmeter"; fi
+  if [ -x "$HOME/.local/lib/Sweetmeter/Sweetmeter" ]; then
+    installed="$HOME/.local/lib/Sweetmeter/Sweetmeter"
+    version_file="$HOME/.local/lib/Sweetmeter/_internal/VERSION"
+  fi
 fi
+version_pattern='^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]*$'
+installed_version=''
 if [ -n "$installed" ]; then
+  installed_version=$(sed -n '1p' "$version_file" 2>/dev/null | tr -d '\r') || installed_version=''
+  printf '%s\n' "$installed_version" | grep -Eq "$version_pattern" || installed_version=''
+fi
+# True when version $1 is newer than version $2 (both YYYY.M.N).
+version_newer() {
+  awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, ".")
+    for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 1 }'
+}
+# Keep the installed copy: it checks itself (self-test and files), repairs
+# its login startup and opens. It prints a one-line outcome either way.
+check_existing() {
   mkdir -p "$state"
   touch "$state/show-window"
-  printf 'Opening your existing Sweetmeter. Use its updater for new versions.\n'
-  # --install on the installed copy re-checks its login startup, then opens it.
-  if "$installed" --install >/dev/null 2>&1; then
-    return 0
-  fi
-  printf 'The existing installation needs repair; installing the latest release.\n'
-fi
+  "$installed" --install
+}
 
 # Add only missing tools; present ones are never reinstalled. A package
-# manager is needed only when something is missing.
+# manager is needed only when something is missing. A re-run over an existing
+# installation checks only the tools this installer itself needs; Bluetooth
+# was set up by the first install.
 if [ "$system" = linux ]; then
+  tools='curl openssl unzip python3'
+  [ -n "$installed" ] || tools="$tools bluetoothctl"
   missing=''
-  for tool in curl openssl unzip python3 bluetoothctl; do
+  for tool in $tools; do
     if ! command -v "$tool" >/dev/null 2>&1; then missing="$missing $tool"; fi
   done
   if [ -n "$missing" ]; then
@@ -87,7 +105,7 @@ if [ "$system" = linux ]; then
   fi
   # Start BlueZ only on a computer that has an adapter and the service. An
   # active, enabled service needs no password prompt on later runs.
-  if command -v systemctl >/dev/null 2>&1 && ls /sys/class/bluetooth/hci* >/dev/null 2>&1 \
+  if [ -z "$installed" ] && command -v systemctl >/dev/null 2>&1 && ls /sys/class/bluetooth/hci* >/dev/null 2>&1 \
       && systemctl cat bluetooth.service >/dev/null 2>&1; then
     if ! systemctl is-active --quiet bluetooth.service || ! systemctl is-enabled --quiet bluetooth.service; then
       printf 'Enabling the system Bluetooth service (sudo may ask for your password).\n'
@@ -101,9 +119,23 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 fetch() { curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 20 --max-time 600 "$1" -o "$2"; }
 base=https://github.com/luvxinc/Sweetmeter
 printf 'Finding the latest Sweetmeter release…\n'
-latest=$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 60 -o /dev/null -w '%{url_effective}' "$base/releases/latest") || fail 'Could not reach GitHub to find the latest release. Check the Internet connection and try again.'
+if ! latest=$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 60 -o /dev/null -w '%{url_effective}' "$base/releases/latest"); then
+  [ -n "$installed" ] || fail 'Could not reach GitHub to find the latest release. Check the Internet connection and try again.'
+  printf 'Could not reach GitHub to check for a newer Sweetmeter; checking the installed copy instead.\n'
+  check_existing || fail 'The installed Sweetmeter needs repair (reason above), but the latest release could not be downloaded. Check the Internet connection and run this again.'
+  return 0
+fi
 version=${latest##*/}
-printf '%s\n' "$version" | grep -Eq '^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]*$' || fail 'Unexpected release version.'
+printf '%s\n' "$version" | grep -Eq "$version_pattern" || fail 'Unexpected release version.'
+if [ -n "$installed_version" ] && ! version_newer "$version" "$installed_version"; then
+  # The installed copy is current (or newer): keep it when it is healthy.
+  if check_existing; then
+    return 0
+  fi
+  printf 'Reinstalling Sweetmeter %s from the verified release.\n' "$version"
+elif [ -n "$installed" ]; then
+  printf 'Updating your installed Sweetmeter%s to %s.\n' "${installed_version:+ $installed_version}" "$version"
+fi
 release="$base/releases/download/$version"
 fetch "$release/manifest.json" "$temporary/manifest.json" || fail 'Could not download the release manifest.'
 fetch "$release/manifest.json.sig" "$temporary/manifest.json.sig" || fail 'Could not download the release signature.'
@@ -170,7 +202,9 @@ fi
 # Signal before startup, including when bootstrapping older supported releases.
 mkdir -p "$state"
 touch "$state/show-window"
-# The app prints a one-line reason on failure, never a traceback.
+# The app prints what it did (installed, updated, repaired or kept) and, on
+# failure, a one-line reason, never a traceback. An installed copy that is
+# older, damaged or failing its self-test is replaced atomically.
 "$executable" --install || fail 'Setup did not finish (reason above). Correct it and run this command again.'
 printf 'Sweetmeter is opening. Allow Bluetooth if asked, then confirm this computer on the meter.\n'
 }

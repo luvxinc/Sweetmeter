@@ -28,7 +28,7 @@ def run(args, *, timeout=30, check=True, **kwargs):
 class Broker:
     def __init__(self, config):
         self.c = config
-        self.vm = self.ssh = None
+        self.vm = self.guest_process = None
         self.runner_id = None
         for field in ('golden', 'work'):
             if not re.fullmatch(r'sweetmeter-ci-[a-z0-9-]+', self.c[field]):
@@ -93,9 +93,9 @@ class Broker:
         return False
 
     def cleanup(self):
-        if self.ssh and self.ssh.poll() is None:
-            self.ssh.terminate()
-        self.ssh = None
+        if self.guest_process and self.guest_process.poll() is None:
+            self.guest_process.terminate()
+        self.guest_process = None
         run(['tart', 'stop', self.c['work']], check=False)
         if self.vm:
             try:
@@ -121,44 +121,41 @@ class Broker:
             self.vm = subprocess.Popen(['tart', 'run', '--no-graphics', '--no-audio',
                                         '--no-clipboard', self.c['work']], env=ENV,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            ssh = None
+            # The Tart guest agent uses the VM's virtio channel, not the host network.
+            # macOS Local Network privacy blocks launchd-started Homebrew Python (and
+            # its ssh children) from reaching 192.168.64.x, so SSH is not used.
+            guest = ['tart', 'exec', '-i', self.c['work']]
             deadline = time.monotonic() + 120
             while time.monotonic() < deadline:
-                ip = run(['tart', 'ip', self.c['work']], timeout=8, check=False).stdout.strip()
-                if re.fullmatch(r'[0-9.]+', ip):
-                    ssh = ['ssh', '-i', self.c['ssh_key'], '-o', 'BatchMode=yes',
-                           '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
-                           '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=5',
-                           f"{self.c.get('guest_user', 'admin')}@{ip}"]
-                    if run(ssh + ['true'], timeout=8, check=False).returncode == 0:
-                        break
+                if run(['tart', 'exec', self.c['work'], 'true'], timeout=8, check=False).returncode == 0:
+                    break
                 if self.vm.poll() is not None:
-                    raise RuntimeError('Tart guest exited before SSH became ready')
+                    raise RuntimeError('Tart guest exited before its agent became ready')
                 time.sleep(2)
             else:
-                raise RuntimeError('Guest SSH startup timed out')
+                raise RuntimeError('Guest agent startup timed out')
             name = 'sweetmeter-' + time.strftime('%Y%m%d-%H%M%S')
             response = self.api(f'repos/{self.repo}/actions/runners/generate-jitconfig', 'POST',
                                 {'name': name, 'runner_group_id': 1,
                                  'labels': LABELS, 'work_folder': '_work'})
             self.runner_id = response['runner']['id']
             jit = response['encoded_jit_config']
-            # SSH command arguments contain only a static path. JIT travels stdin.
-            self.ssh = subprocess.Popen(ssh + ['/opt/sweetmeter-ci/start-runner.sh'],
+            # Guest command arguments contain only a static path. JIT travels stdin.
+            self.guest_process = subprocess.Popen(guest + ['/opt/sweetmeter-ci/start-runner.sh'],
                                         env=ENV, stdin=subprocess.PIPE, stdout=sys.stdout,
                                         stderr=sys.stderr, text=True)
-            self.ssh.stdin.write(jit + '\n')
-            self.ssh.stdin.close()
+            self.guest_process.stdin.write(jit + '\n')
+            self.guest_process.stdin.close()
             del jit, response
             log(f'Registered ephemeral runner {name} id={self.runner_id}')
             deadline = time.monotonic() + (180 if probe else self.c.get('maximum_job_seconds', 3600))
-            while self.ssh.poll() is None:
+            while self.guest_process.poll() is None:
                 if time.monotonic() > deadline:
                     raise RuntimeError('Disposable runner lifetime exceeded')
                 if self.available_memory() < self.c.get('emergency_available_percent', 15):
                     raise RuntimeError('Host memory pressure: stopping only Sweetmeter VM')
                 time.sleep(10)
-            log(f'Runner finished, exit={self.ssh.returncode}; deleting disposable VM')
+            log(f'Runner finished, exit={self.guest_process.returncode}; deleting disposable VM')
         finally:
             self.cleanup()
 
