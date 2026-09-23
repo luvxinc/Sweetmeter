@@ -116,24 +116,33 @@ def verify_companion_package(path, version, *, os_name, arch, source_commit, sou
         regular_names = [name for name in names if not archive.getinfo(name).is_dir()
                          and stat.S_IFMT(archive.getinfo(name).external_attr >> 16) in (0, stat.S_IFREG)]
         version_paths = [name for name in regular_names if name.endswith(("/_internal/VERSION", "/Contents/Frameworks/VERSION", "/Contents/Resources/VERSION"))]
-        key_paths = [name for name in regular_names if name.endswith("/meter/assets/keys/release-1.pem")]
-        if not version_paths or not key_paths:
-            raise ValueError("Companion package lacks bundled VERSION or public trust resource")
         def public_identity(raw):
             return serialization.load_pem_public_key(raw).public_bytes(
                 serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
 
-        expected_public = public_identity((ROOT / "meter/assets/keys/release-1.pem").read_bytes())
+        # The package must trust exactly the repository's key set: a missing
+        # next key would break rotation, an extra key would widen trust.
+        expected = {key_id: key.public_bytes(serialization.Encoding.DER,
+                                             serialization.PublicFormat.SubjectPublicKeyInfo)
+                    for key_id, key in trusted_keys().items()}
+        bundled = {}
+        for name in regular_names:
+            parent, _, filename = name.rpartition("/")
+            if parent.endswith("/meter/assets/keys") and filename.endswith(".pem"):
+                if archive.getinfo(name).file_size > 4096:
+                    raise ValueError("Oversized bundled public key")
+                bundled.setdefault(filename[:-4], set()).add(public_identity(archive.read(name)))
+        if not version_paths or not bundled:
+            raise ValueError("Companion package lacks bundled VERSION or public trust resource")
         for name in version_paths:
             if archive.getinfo(name).file_size > 20 or archive.read(name).decode("ascii").removesuffix("\n") != str(version):
                 raise ValueError("Companion package VERSION differs from release")
-        for name in key_paths:
-            if archive.getinfo(name).file_size > 4096 or public_identity(archive.read(name)) != expected_public:
-                raise ValueError("Companion package signing trust differs from release")
+        if set(bundled) != set(expected) or any(values != {expected[key_id]} for key_id, values in bundled.items()):
+            raise ValueError("Companion package signing trust differs from release")
 
 
 def build_release(*, firmware, companions, minimum_companion, output, key, commit,
-                  version, changes, published_at=None):
+                  version, changes, published_at=None, key_id=KEY_ID):
     """Create new output only; package inputs are copied without executing them."""
     version = Version.parse(version)
     minimum_companion = Version.parse(minimum_companion)
@@ -157,11 +166,15 @@ def build_release(*, firmware, companions, minimum_companion, output, key, commi
         raise ValueError("Only production Sweetmeter app images may become release assets")
     public = key.public_key().public_bytes(serialization.Encoding.DER,
                                          serialization.PublicFormat.SubjectPublicKeyInfo)
-    expected = trusted_keys()[KEY_ID].public_bytes(serialization.Encoding.DER,
-                                                 serialization.PublicFormat.SubjectPublicKeyInfo)
+    keys = trusted_keys()
+    if key_id not in keys:
+        raise ValueError("Signing key ID is not shipped in meter/assets/keys")
+    expected = keys[key_id].public_bytes(serialization.Encoding.DER,
+                                         serialization.PublicFormat.SubjectPublicKeyInfo)
     if public != expected:
         raise ValueError("Private signing key does not match embedded release trust")
-    meta = FirmwareMetadata(version, minimum_companion, len(image), hashlib.sha256(image).digest())
+    meta = FirmwareMetadata(version, minimum_companion, len(image), hashlib.sha256(image).digest(),
+                            key_id=key_id)
     envelope = sign_envelope(meta, key)
     image_name = f"Sweetmeter-{version}-firmware.bin"
     metadata_name = f"Sweetmeter-{version}-firmware.ota"
@@ -188,7 +201,7 @@ def build_release(*, firmware, companions, minimum_companion, output, key, commi
         copies.append((source, name))
     manifest = {"schema": 1, "product": "Sweetmeter", "channel": "stable", "version": str(version),
                 "published_at": published_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "commit": commit, "key_id": KEY_ID, "changes": changes, "artifacts": artifacts}
+                "commit": commit, "key_id": key_id, "changes": changes, "artifacts": artifacts}
     raw = manifest_bytes(manifest)
     signature = key.sign(raw, ec.ECDSA(hashes.SHA256()))
     verify_manifest(raw, signature)
@@ -215,6 +228,8 @@ def main():
     parser.add_argument("--key-file", required=True, type=Path)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--published-at")
+    parser.add_argument("--key-id", default=KEY_ID,
+                        help="Trusted key ID matching --key-file (default: the current signing key)")
     args = parser.parse_args()
     try:
         if any(name.startswith("SWEETMETER_TEST_") for name in os.environ):
@@ -236,7 +251,8 @@ def main():
         result = build_release(firmware=args.firmware, companions=companions,
                                minimum_companion=args.minimum_companion, output=args.output,
                                key=load_private_key(args.key_file), commit=args.commit, version=version,
-                               changes=changelog_history(ROOT / "CHANGELOG.md", version), published_at=args.published_at)
+                               changes=changelog_history(ROOT / "CHANGELOG.md", version), published_at=args.published_at,
+                               key_id=args.key_id)
     except (OSError, ValueError, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"Release signing failed: {exc}\n")
     print(f"Verified signed release {result['version']}: {len(result['artifacts'])} artifacts")

@@ -2,6 +2,8 @@
 
 Trusted owner pushes and manual runs on `main` or `codex/*` use a dedicated Linux ARM64 VM on an Apple Silicon Mac mini. The runner labels are `[self-hosted, Linux, ARM64, sweetmeter-ci]`. Version policy, Python tests, C++ tests, and ESP32 builds can use this runner. Native macOS ARM64/x86_64, Windows x86_64, and Linux x86_64 application packages use the native GitHub-hosted matrix; PyInstaller does not cross-compile those applications from the ARM64 Linux guest.
 
+The release workflow validates on this runner but signs and publishes only on fresh GitHub-hosted Ubuntu VMs: the release private key never reaches the self-hosted guest, which installs PlatformIO and build dependencies. Every third-party action in `.github/workflows/` is pinned to a full commit SHA with its version in a comment; update pins deliberately (look up the tag's commit with `gh api repos/OWNER/ACTION/commits/TAG --jq .sha`) and keep `actionlint` clean.
+
 Pull requests, including owner PRs and `pull_request_target` validation, run on GitHub-hosted Ubuntu. Other actors, tags, and branches also use hosted runners. Outside contributors require workflow approval. The public repository contains no host addresses, SSH private keys, tokens, or private infrastructure names.
 
 ## Host boundary

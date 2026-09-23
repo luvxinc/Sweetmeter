@@ -1,5 +1,9 @@
 name: Publish verified release
 
+# The only supported way to publish. See docs/RELEASING.md for the repository
+# settings (environment reviewers, tag ruleset, immutable releases) that make
+# publishing outside this workflow impossible rather than merely discouraged.
+
 on:
   workflow_dispatch:
     inputs:
@@ -46,11 +50,11 @@ jobs:
       sha: ${{ steps.check.outputs.sha }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
       - id: check
@@ -69,30 +73,46 @@ jobs:
           subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'origin/main'], check=True)
           subprocess.run(['python', 'scripts/versioning.py', 'check-history', '--head', sha], check=True)
           repo = os.environ['REPO']
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path]))
           run_id, digest = os.environ['ACCEPTED_RUN'], os.environ['ACCEPTED_IMAGE']
           if not re.fullmatch('[1-9][0-9]*', run_id) or not re.fullmatch('[0-9a-f]{64}', digest):
               raise SystemExit('Accepted run ID and lowercase firmware SHA256 are required')
-          run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{run_id}']))
+          run = api(f'repos/{repo}/actions/runs/{run_id}')
           if (run['head_sha'] != sha or run['conclusion'] != 'success'
                   or run['event'] != 'push' or run['path'] != '.github/workflows/test.yml'
                   or run['head_repository']['full_name'] != repo):
               raise SystemExit('Accepted firmware must come from a successful Test push run at this exact SHA')
-          checks = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/commits/{sha}/check-runs']))['check_runs']
+          # CI must have passed for this exact commit, not a neighbour.
+          checks = api(f'repos/{repo}/commits/{sha}/check-runs?per_page=100')['check_runs']
           for name in ('test', 'version-policy-tests'):
-              matching = [c for c in checks if c['name'] == name and c['app']['id'] == 15368]
+              matching = [c for c in checks if c['name'] == name and c['app']['id'] == 15368 and c['head_sha'] == sha]
               if not matching or max(matching, key=lambda c: c['id'])['conclusion'] != 'success':
                   raise SystemExit(f'Required successful Actions check missing: {name}')
-          statuses = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/commits/{sha}/status']))['statuses']
+          statuses = api(f'repos/{repo}/commits/{sha}/status')['statuses']
           trusted = [s for s in statuses if s['context'] == 'version-policy/trusted']
           if not trusted or max(trusted, key=lambda s: s['id'])['state'] != 'success':
               raise SystemExit('Trusted version policy status missing')
           version = subprocess.check_output(['git', 'show', f'{sha}:VERSION'], text=True).strip()
+          if not re.fullmatch('[0-9]{4}\\.[1-9][0-9]?\\.[1-9][0-9]*', version):
+              raise SystemExit('Invalid VERSION at the release commit')
+          # Published versions are immutable: never re-release, move or replace.
+          if subprocess.run(['git', 'ls-remote', '--exit-code', '--tags', 'origin', f'refs/tags/{version}'],
+                            capture_output=True).returncode == 0:
+              raise SystemExit(f'Tag {version} already exists; release a new commit and version instead')
+          tags = subprocess.check_output(['gh', 'api', '--paginate', f'repos/{repo}/releases?per_page=100',
+                                          '--jq', '.[].tag_name'], text=True).split()
+          if version in tags:
+              raise SystemExit(f'A release or draft for {version} already exists')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'sha={sha}\nversion={version}\n')
           PY
   native:
     needs: validate
+    # Environment secrets: optional macOS signing/notarization and Windows Authenticode.
     environment: release
+    permissions:
+      contents: read
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -107,11 +127,11 @@ jobs:
           - runner: macos-15-intel
             id: macos-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
       - name: Linux Tk runtime
@@ -119,15 +139,34 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-tk
       - name: Isolated native build dependencies
         run: python scripts/setup_native_env.py
-      - name: Optional Developer ID signing
+      - name: Optional stable macOS signing identity (Developer ID or self-signed)
         if: runner.os == 'macOS'
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: python scripts/macos_signing.py
-      - run: python scripts/build_companion.py
-      - uses: actions/upload-artifact@v4
+      - name: Trust a self-signed code-signing certificate on this disposable runner
+        # codesign refuses an untrusted identity. A self-signed certificate still
+        # gives a stable designated requirement, so macOS keeps the Bluetooth
+        # permission across updates; it does not satisfy Gatekeeper.
+        if: runner.os == 'macOS' && env.MACOS_SIGN_IDENTITY != '' && !startsWith(env.MACOS_SIGN_IDENTITY, 'Developer ID Application:')
+        run: |
+          keychain="$RUNNER_TEMP/sweetmeter-signing.keychain-db"
+          security find-certificate -c "$MACOS_SIGN_IDENTITY" -p "$keychain" > "$RUNNER_TEMP/sweetmeter-signing-cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain" "$RUNNER_TEMP/sweetmeter-signing-cert.pem"
+          rm -f "$RUNNER_TEMP/sweetmeter-signing-cert.pem"
+          security find-identity -v -p codesigning "$keychain"
+      - name: Build, sign and (when configured) notarize
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: python scripts/build_companion.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.id }}
           path: dist/Sweetmeter-*.zip*
@@ -142,16 +181,16 @@ jobs:
       actions: read
     runs-on: [self-hosted, Linux, ARM64, sweetmeter-ci]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.validate.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements-build.txt
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: firmware-${{ needs.validate.outputs.sha }}
           run-id: ${{ inputs.accepted_firmware_run_id }}
@@ -165,7 +204,7 @@ jobs:
       - name: Install pinned SDK for license and relinking archive (no firmware rebuild)
         run: pio pkg install -d firmware
       - run: python scripts/collect_firmware_sources.py --output dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-firmware
           include-hidden-files: true
@@ -175,23 +214,29 @@ jobs:
             incoming/firmware-build.zip
             dist/Sweetmeter-firmware-rebuild.tar.gz
           if-no-files-found: error
-  sign-and-publish:
+  sign:
+    # The release key only ever reaches this job: a fresh GitHub-hosted VM with
+    # a hash-pinned `cryptography` and nothing else. Build tools, PlatformIO and
+    # the self-hosted runner never see it. It has no write permission.
     needs: [validate, native, firmware]
-    runs-on: [self-hosted, Linux, ARM64, sweetmeter-ci]
+    runs-on: ubuntu-24.04
     environment: release
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.validate.outputs.sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
-      - run: python -m pip install -r requirements-build.txt
-      - uses: actions/download-artifact@v4
+      - name: Minimal hash-pinned signing environment
+        run: |
+          python -m venv "$RUNNER_TEMP/signing-venv"
+          "$RUNNER_TEMP/signing-venv/bin/python" -m pip install --isolated --disable-pip-version-check --no-cache-dir \
+            --require-hashes --only-binary=:all: --no-deps -r packaging/release-signing-requirements.txt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: incoming
@@ -200,7 +245,7 @@ jobs:
         env:
           PRIVATE_KEY: ${{ secrets.SWEETMETER_RELEASE_PRIVATE_KEY }}
         run: |
-          python - <<'PY'
+          "$RUNNER_TEMP/signing-venv/bin/python" - <<'PY'
           import os
           from pathlib import Path
           raw = os.environ.get('PRIVATE_KEY', '')
@@ -216,23 +261,54 @@ jobs:
           RELEASE_SHA: ${{ needs.validate.outputs.sha }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          python scripts/sign_release.py --firmware incoming/firmware/.pio/build/crowpanel213/firmware.bin --minimum-companion "$RELEASE_VERSION" --output signed-release --key-file "$RUNNER_TEMP/sweetmeter-release-key.pem" --commit "$RELEASE_SHA" --companion "linux:x86_64:incoming/Sweetmeter-$RELEASE_VERSION-linux-x86_64.zip" --companion "windows:x86_64:incoming/Sweetmeter-$RELEASE_VERSION-windows-x86_64.zip" --companion "macos:arm64:incoming/Sweetmeter-$RELEASE_VERSION-macos-arm64.zip" --companion "macos:x86_64:incoming/Sweetmeter-$RELEASE_VERSION-macos-x86_64.zip"
+          "$RUNNER_TEMP/signing-venv/bin/python" scripts/sign_release.py --firmware incoming/firmware/.pio/build/crowpanel213/firmware.bin --minimum-companion "$RELEASE_VERSION" --output signed-release --key-file "$RUNNER_TEMP/sweetmeter-release-key.pem" --commit "$RELEASE_SHA" --companion "linux:x86_64:incoming/Sweetmeter-$RELEASE_VERSION-linux-x86_64.zip" --companion "windows:x86_64:incoming/Sweetmeter-$RELEASE_VERSION-windows-x86_64.zip" --companion "macos:arm64:incoming/Sweetmeter-$RELEASE_VERSION-macos-arm64.zip" --companion "macos:x86_64:incoming/Sweetmeter-$RELEASE_VERSION-macos-x86_64.zip"
           cp CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md signed-release/
           cp incoming/dist/Sweetmeter-firmware-rebuild.tar.gz signed-release/
           cp incoming/incoming/firmware-build.zip "signed-release/Sweetmeter-$RELEASE_VERSION-firmware-build.zip"
           git archive --format=tar.gz --output=signed-release/Sweetmeter-source.tar.gz "$RELEASE_SHA"
+      - name: Remove private key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sweetmeter-release-key.pem"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-release
+          path: signed-release/*
+          if-no-files-found: error
+  publish:
+    needs: [validate, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-release
+          path: signed-release
+      - name: Build provenance attestation for every release asset
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: signed-release/*
       - name: Create draft, upload complete assets, then optionally publish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           RELEASE_SHA: ${{ needs.validate.outputs.sha }}
           PUBLISH: ${{ inputs.publish }}
         run: |
-          gh release create "$RELEASE_VERSION" --target "$RELEASE_SHA" --draft --title "Sweetmeter $RELEASE_VERSION" --notes-file CHANGELOG.md
+          # Re-check right before creating: another run may have raced this one.
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "Release $RELEASE_VERSION already exists; refusing to modify it" >&2
+            exit 1
+          fi
+          if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "Tag $RELEASE_VERSION already exists; refusing to publish" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_VERSION" --target "$RELEASE_SHA" --draft --title "Sweetmeter $RELEASE_VERSION" --notes-file signed-release/CHANGELOG.md
           gh release upload "$RELEASE_VERSION" signed-release/*
           if test "$PUBLISH" = true; then
             gh release edit "$RELEASE_VERSION" --draft=false
           fi
-      - name: Remove private key
-        if: always()
-        run: rm -f "$RUNNER_TEMP/sweetmeter-release-key.pem"

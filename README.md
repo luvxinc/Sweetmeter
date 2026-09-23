@@ -65,29 +65,49 @@ and output; cached input/reasoning are already included and are not added twice.
 
 | Control | Action |
 | --- | --- |
-| Top button, short press | Refresh; rescan while selecting a computer |
+| Top button, short press | Refresh; rescan while the computer menu is open |
 | Top button, hold 3 seconds | Show OFF, then sleep after release |
 | Top button while asleep | Wake the device |
-| Bottom button, hold 3 seconds | Open computer selection |
-| Rocker up/down, then press | Choose and save a computer |
-| Rocker press, hold 3 seconds | Check for firmware and install a newer version through the selected computer |
-| Bottom button in selection | Back |
+| Bottom button, hold 3 seconds | Open the computer menu (paired computers and new ones nearby) |
+| Rocker up/down, then press (menu) | Switch to that computer at once, or pair a new one |
+| Rocker press, hold 3 seconds (menu) | Remove the highlighted computer; press the rocker again to confirm, bottom to keep it |
+| Rocker press, hold 3 seconds (dashboard) | Check for firmware and install a newer version through the selected computer |
+| Bottom button in the menu | Back |
 
-After a selected companion has connected in the current boot, a continuous
-30-second disconnection puts the device into deep sleep. A valid reconnect
-within that grace period cancels the timer. Deep sleep disables Bluetooth;
-press the top button to wake before reconnecting. E-paper retains its OFF
-screen without power. Button sleep does not electrically disconnect every
-component on the development board.
+The meter remembers up to eight paired computers; only the one selected in the
+menu drives the dashboard. The menu lists paired computers first (`>` marks the
+current one, `+` a new computer that has just appeared) with the last four
+characters of each computer's ID, so two computers with the same name can be
+told apart. Switching never needs pairing again: pick the computer and it
+reconnects within about 15 seconds while the previous computer steps back.
+When a ninth computer is paired, the least recently used one is forgotten.
+A removed computer, or one that forgot the meter in the companion, must pair
+again through the menu.
+
+After a selected computer has connected, a continuous 30-second disconnection
+puts the device into deep sleep; a reconnect within that grace period cancels
+it. If no selected computer connects for 30 minutes (outside the menu and
+updates), the meter also turns itself off. Deep sleep disables Bluetooth; press
+the top button to wake. After a sleep longer than five minutes the clock shows
+`--:--` until the computer reconnects and sets it. With the optional battery
+gauge, a critically low battery shows BATTERY LOW once, then the meter only
+wakes briefly every five minutes to measure until it is charged. E-paper
+retains its last screen without power. Button sleep does not electrically
+disconnect every component on the development board.
+
+The panel redraws at most once a minute: a new dashboard is stored immediately
+and appears with the next minute's clock update. Button actions, the computer
+menu, update progress and messages still appear right away.
 
 ## Install the companion
 
 The companion targets **Windows 11 x64**, **macOS 15+ arm64 / Intel**, and
 **Ubuntu 22.04+ x64 with a graphical desktop and BlueZ 5.55+**. These are build
 and software-compatibility targets; Windows/Linux physical Bluetooth and battery
-acceptance have not been performed. Read each release's validation record.
-See the [2026.9.3 firmware acceptance record](docs/releases/2026.9.3.md) for the
-exact tested image and recovery results.
+acceptance have not been performed. Hardware acceptance records are kept in
+[docs/releases](docs/releases/); each names the exact firmware image it tested
+(the most recent record is [2026.9.3](docs/releases/2026.9.3.md)). A release
+without its own record has passed software CI only.
 Native builds include Python, Tk, BLE libraries, fonts, the public update key and
 third-party notices. Claude Code and Codex themselves must already be installed
 and logged in as the same OS user.
@@ -99,7 +119,8 @@ desktop user. No Espressif client, Git checkout, pip commands or separate Python
 installation is needed. The installer selects the latest stable native release,
 verifies its signed manifest and package hash, installs for your user, registers
 login startup and opens Sweetmeter. Repeating it opens your existing installation
-without overwriting it; subsequent updates remain **Install / Later / Skip**.
+without overwriting it and re-registers login startup if that went missing;
+subsequent updates remain **Install / Later / Skip**.
 
 **macOS / Ubuntu desktop — paste into Terminal:**
 
@@ -117,8 +138,11 @@ These commands execute this repository's [shell installer](install.sh) or
 [PowerShell installer](install.ps1). Payloads are authenticated with Sweetmeter's
 pinned release key before extraction and execution. The bootstrap script itself
 is obtained over HTTPS from this repository; inspect it first if desired.
-Ubuntu/Debian may request your password to install missing system packages and
-start BlueZ. Do not run the entire installer with `sudo` or from WSL.
+On Linux the installer asks for your password only when something is missing:
+it installs missing tools with apt, dnf, pacman or zypper (otherwise it lists
+the packages to install), and enables BlueZ only when a Bluetooth adapter is
+present. Sweetmeter needs an X11 display (XWayland on Wayland desktops). Do not
+run the entire installer with `sudo` or from WSL.
 
 **首次使用只需：运行上述对应命令 → 允许蓝牙 → 在设备上确认这台电脑。**
 电脑端窗口会引导连接：长按设备下方按钮 3 秒，用摇杆选中电脑并按下确认。
@@ -143,18 +167,24 @@ their own `--install` option:
 | Windows PowerShell | `.\Sweetmeter\Sweetmeter.exe --install` |
 | Linux | `./Sweetmeter/Sweetmeter --install` |
 
-The installer registers login startup and starts the managed companion. The
+The installer registers login startup (a macOS LaunchAgent, a per-user Windows
+`Run` entry, or an XDG autostart entry) and starts the managed companion. The
 managed locations are `~/Applications/Sweetmeter.app`,
-`%LOCALAPPDATA%/Programs/Sweetmeter`, and `~/.local/lib/Sweetmeter`. Running directly
-from Downloads is possible, but automatic application replacement requires the
-managed installation. The quick installer preserves existing installs; use the
-confirmed updater for subsequent releases.
+`%LOCALAPPDATA%/Programs/Sweetmeter`, and `~/.local/lib/Sweetmeter`. On macOS an
+app you dragged into `/Applications` is used in place instead of being copied a
+second time. Running directly from Downloads is possible, but automatic
+application replacement requires the managed installation. The quick installer
+preserves existing installs; use the confirmed updater for subsequent releases.
+Whenever the installed app starts, it quietly restores a missing install record,
+launcher or login entry (for example after an interrupted setup).
 
-**Current macOS development builds are ad-hoc signed, not Developer ID signed or
-notarized. Windows builds are not Authenticode signed.** OS warnings must not be
-misrepresented as verification by Apple/Microsoft. Verify the source/release you
-intend to trust; do not disable OS security globally. Release signatures checked
-by Sweetmeter are separate from platform app signing.
+**Unless a release's notes say otherwise, macOS builds are not Developer ID
+signed or notarized, and Windows builds are not Authenticode signed.** OS
+warnings must not be misrepresented as verification by Apple/Microsoft. Verify
+the source/release you intend to trust; do not disable OS security globally.
+Release signatures checked by Sweetmeter are separate from platform app
+signing. Builds signed with a stable certificate keep macOS's Bluetooth
+permission across updates; ad-hoc builds may ask for it again after an update.
 
 Allow Bluetooth permission when requested. On Linux ensure BlueZ and its D-Bus
 service are running and the current desktop user has Bluetooth permission. Log
@@ -177,16 +207,16 @@ On macOS a Python distribution that includes working Tk is required.
 ```sh
 git clone https://github.com/luvxinc/Sweetmeter.git
 cd Sweetmeter
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m meter --self-test
-.venv/bin/python scripts/install_agent.py
+python3 scripts/install_agent.py
 ```
 
-On Windows replace `.venv/bin/python` with `.venv\Scripts\python.exe` and use
-`py -3` to create the environment. Running `install_agent.py` again reuses the
-installed dependencies and only runs pip when `requirements.txt` changed.
-`--no-startup` installs without registering
+On Windows use `py -3 scripts\install_agent.py`. The installer copies the
+companion into a private runtime folder, creates its own virtual environment,
+installs the pinned `requirements.txt` there (the only dependency install),
+runs the offline self-test and registers login startup. Running it again
+reuses those dependencies and only runs pip when `requirements.txt` or the
+Python interpreter changed. A development `.venv` for running the tests is
+separate and not needed to install. `--no-startup` installs without registering
 login startup. `--remove-startup` removes Sweetmeter's current startup entry.
 Source installs receive update notices and verified manual packages; the app
 never pretends to automatically replace an arbitrary source checkout.
@@ -207,6 +237,24 @@ to that adopted prototype path. Stop other custom helpers before starting the
 new one; only one companion should use the device. Installation never imports another
 person's source-checkout caches or account credentials.
 
+### Uninstall
+
+You do not need to quit first; the uninstaller stops the running companion. It removes the
+login startup entry, the recovery launcher, the installed app and its install
+record. Add `--remove-data` to also delete settings, the device pairing identity
+and caches (otherwise they are kept for a later reinstall).
+
+| System | Command |
+| --- | --- |
+| macOS | `~/Applications/Sweetmeter.app/Contents/MacOS/Sweetmeter --uninstall` |
+| Windows | Settings > Apps > Installed apps > Sweetmeter > Uninstall, or `& "$env:LOCALAPPDATA\Programs\Sweetmeter\Sweetmeter.exe" --uninstall` |
+| Linux | `~/.local/lib/Sweetmeter/Sweetmeter --uninstall` |
+| Source install | `python3 scripts/install_agent.py --uninstall` |
+
+On macOS use `/Applications/Sweetmeter.app/...` if that is where the app is.
+Only Sweetmeter's own managed locations and files are removed. After an
+uninstall, select another computer on the meter or leave it asleep.
+
 ## Updates and release notes
 
 Sweetmeter checks GitHub Releases, verifies the signed manifest and shows the
@@ -224,6 +272,11 @@ approve a later firmware update.
 Managed companion updates use a temporary helper outside the application. It
 waits for the current app to exit, swaps in the verified native package, and
 restores the previous app if the new process does not confirm healthy startup.
+If Bluetooth worked before the update, the new version must also reach
+Bluetooth (being switched off is fine); if macOS withholds the Bluetooth
+permission, the previous version is kept and Sweetmeter explains how to allow
+it before retrying. After a confirmed update the recovery launcher is refreshed
+from the new version.
 For source or unwritable installs, the UI offers the verified extracted package
 for manual installation. Installed login startup uses a separate recovery
 launcher and durable swap journal, so an interrupted replacement rolls back on

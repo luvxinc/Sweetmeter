@@ -1,28 +1,51 @@
 # Run in Windows PowerShell 5.1+ as the desktop user; no Python or Espressif app.
+# Errors are printed as one plain line. The window is never closed (no `exit`),
+# because this script usually runs inside the user's own session via `irm | iex`.
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
-    if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'Use install.sh on macOS/Linux.' }
-    $architecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
-    if ($architecture -ne 'AMD64') { throw 'The Windows release currently requires x64.' }
-    if ([Environment]::OSVersion.Version.Build -lt 22000) { throw 'Windows 11 or later is required.' }
-    $state = Join-Path $env:LOCALAPPDATA 'Sweetmeter\state'
-    $installed = Join-Path $env:LOCALAPPDATA 'Programs\Sweetmeter\Sweetmeter.exe'
-    if (Test-Path -LiteralPath $installed) {
-        $null = New-Item -ItemType Directory -Path $state -Force
-        $null = New-Item -ItemType File -Path (Join-Path $state 'show-window') -Force
-        Write-Host 'Opening your existing Sweetmeter. Use its updater for new versions.'
-        Start-Process -FilePath $installed
-        return
-    }
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $temporary = Join-Path ([IO.Path]::GetTempPath()) ('sweetmeter-' + [Guid]::NewGuid().ToString('N'))
-    $null = New-Item -ItemType Directory -Path $temporary
+    $global:LASTEXITCODE = 0
+    $temporary = $null
     try {
+        if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'Use install.sh on macOS/Linux.' }
+        $architecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+        if ($architecture -ne 'AMD64') { throw 'The Windows release currently requires x64.' }
+        if ([Environment]::OSVersion.Version.Build -lt 22000) { throw 'Windows 11 or later is required.' }
+        $data = Join-Path $env:LOCALAPPDATA 'Sweetmeter'
+        $state = Join-Path $data 'state'
+        $errorFile = Join-Path $data 'install-error.txt'
+        $installed = Join-Path $env:LOCALAPPDATA 'Programs\Sweetmeter\Sweetmeter.exe'
+        if (Test-Path -LiteralPath $installed) {
+            $null = New-Item -ItemType Directory -Path $state -Force
+            $null = New-Item -ItemType File -Path (Join-Path $state 'show-window') -Force
+            Write-Host 'Opening your existing Sweetmeter. Use its updater for new versions.'
+            # --install on the installed copy re-checks its login startup, then opens it.
+            $process = Start-Process -FilePath $installed -ArgumentList '--install' -PassThru
+            $process.WaitForExit()
+            if ($process.ExitCode -eq 0) { return }
+            Write-Host 'The existing installation needs repair; installing the latest release.'
+        }
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $temporary = Join-Path ([IO.Path]::GetTempPath()) ('sweetmeter-' + [Guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $temporary
         Write-Host 'Finding the latest Sweetmeter release...'
-        $releaseInfo = Invoke-RestMethod -Uri 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest' -TimeoutSec 60
-        $version = $releaseInfo.tag_name
-        if ($version -cnotmatch '^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]*$' -or $releaseInfo.draft -or $releaseInfo.prerelease) { throw 'Unexpected release version.' }
+        # Like install.sh: follow github.com's releases/latest redirect, which is
+        # not subject to the anonymous REST API rate limit. The API is a fallback.
+        $versionPattern = '^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]*$'
+        $version = $null
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Method Head -Uri 'https://github.com/luvxinc/Sweetmeter/releases/latest' -TimeoutSec 60
+            $final = $null
+            if ($response.BaseResponse.ResponseUri) { $final = $response.BaseResponse.ResponseUri.AbsoluteUri }
+            elseif ($response.BaseResponse.RequestMessage) { $final = $response.BaseResponse.RequestMessage.RequestUri.AbsoluteUri }
+            if ($final -and $final -cmatch '^https://github\.com/luvxinc/Sweetmeter/releases/tag/([^/?#]+)$') { $version = $Matches[1] }
+        } catch { $version = $null }
+        if (-not $version -or $version -cnotmatch $versionPattern) {
+            $releaseInfo = Invoke-RestMethod -Uri 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest' -TimeoutSec 60
+            if ($releaseInfo.draft -or $releaseInfo.prerelease) { throw 'The latest release is not a stable release.' }
+            $version = $releaseInfo.tag_name
+        }
+        if ($version -cnotmatch $versionPattern) { throw 'Unexpected release version.' }
         $release = "https://github.com/luvxinc/Sweetmeter/releases/download/$version"
         $manifestFile = Join-Path $temporary 'manifest.json'
         $signatureFile = Join-Path $temporary 'manifest.json.sig'
@@ -72,20 +95,27 @@
             $digest = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
             if ($digest -cne $artifact.sha256 -or $stream.Length -ne $artifact.size) { throw 'Package verification failed. Nothing was installed.' }
         } finally { $stream.Dispose(); $sha.Dispose() }
+        # Verified against the signed manifest: drop any Mark-of-the-Web so the
+        # extracted app is not treated as an unverified Internet download.
+        Unblock-File -LiteralPath $package
         $extracted = Join-Path $temporary 'extracted'
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [IO.Compression.ZipFile]::ExtractToDirectory($package, $extracted)
         $null = New-Item -ItemType Directory -Path $state -Force
         $null = New-Item -ItemType File -Path (Join-Path $state 'show-window') -Force
-        if (Test-Path -LiteralPath $installed) {
-            Write-Host 'Opening your existing Sweetmeter. Use its updater for new versions.'
-            Start-Process -FilePath $installed
-        } else {
-            $process = Start-Process -FilePath (Join-Path $extracted 'Sweetmeter\Sweetmeter.exe') -ArgumentList '--install' -PassThru
-            # Wait only for setup, not the long-running companion it starts.
-            $process.WaitForExit()
-            if ($process.ExitCode -ne 0) { throw 'Sweetmeter installation failed.' }
+        Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+        $process = Start-Process -FilePath (Join-Path $extracted 'Sweetmeter\Sweetmeter.exe') -ArgumentList '--install' -PassThru
+        # Wait only for setup, not the long-running companion it starts.
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            $reason = if (Test-Path -LiteralPath $errorFile) { (Get-Content -LiteralPath $errorFile -Raw).Trim() } else { 'Sweetmeter setup did not finish.' }
+            throw $reason
         }
         Write-Host 'Sweetmeter is opening. Allow Bluetooth if asked, then confirm this computer on the meter.'
-    } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
+    } catch {
+        Write-Host ('Sweetmeter: ' + $_.Exception.Message) -ForegroundColor Red
+        $global:LASTEXITCODE = 1
+    } finally {
+        if ($temporary -and (Test-Path -LiteralPath $temporary)) { Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }

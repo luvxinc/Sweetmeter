@@ -136,7 +136,22 @@ void setup() {
   for (int pin : {SCK_PIN, MOSI_PIN, RST, DC, CS, POWER, LED})
     gpio_hold_dis(gpio_num_t(pin));
   pinMode(BUSY_PIN, INPUT);
-  if (xTaskCreate(meterWorker, "sweetmeter", 16384, nullptr, 2, nullptr) != pdPASS) {
+  const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+  // A drifted RC clock after a long deep sleep shows --:-- until T arrives.
+  if (!sweetmeter::clockStillValid(clockSynced, wake != ESP_SLEEP_WAKEUP_UNDEFINED, int64_t(time(nullptr)), sleptAt))
+    clockSynced = false;
+  // Check an optional gauge before BLE and the panel: a critical cell wakes on
+  // a 300 s timer only to measure again, not to advertise and redraw.
+  Wire.begin(40, 41, 100000); Wire.setTimeOut(25); readBattery();
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t imageState = ESP_OTA_IMG_UNDEFINED;
+  bool candidate = running && esp_ota_get_state_partition(running, &imageState) == ESP_OK &&
+                   imageState == ESP_OTA_IMG_PENDING_VERIFY;
+  // A pending-verify update must finish its health checks first; sleeping here
+  // would reset it unconfirmed and roll it back.
+  if (!candidate && criticalBattery()) lowBatterySleep(wake == ESP_SLEEP_WAKEUP_EXT0);
+  if (batteryPercent >= 0 && !criticalBattery()) lowBatteryLatched = lowBatteryShown = false;
+  if (xTaskCreate(meterWorker, "sweetmeter", 16384, nullptr, 2, &workerTask) != pdPASS) {
     Serial.println("ERR WORKER_ALLOCATION"); esp_restart();
   }
 }

@@ -35,10 +35,12 @@ All UUIDs below are complete UUIDs; the changing `000x` is in the **first** fiel
 | OTA status | `7a1e0007-ff1b-4d9f-a023-47c7752c1a01` | Read, notify |
 
 Reads/writes require BLE encryption; notifications have a CCCD. Preserve existing
-bonding and the `quota-meter` NVS namespace with `host` and `name` keys. A stable
-host UUID is a routing/selection identifier, **not cryptographic authentication**.
-Just Works bonding does not turn it into one. Signed OTA protects authenticity of
-the firmware; this is not secure boot or protection against physical USB flashing.
+bonding and the `quota-meter` NVS namespace. A stable host UUID is a routing and
+display identifier, **not authentication**, and the device never publishes it.
+A link is authorized only by proving a per-computer pairing secret (section 2.1).
+Just Works (LE Secure Connections) bonding encrypts the link against passive
+listeners but does not authenticate either side. Signed OTA protects authenticity
+of the firmware; this is not secure boot or protection against physical USB flashing.
 
 The ESP32 is the peripheral; Windows/macOS/Linux companions are GATT centrals.
 There is one active connection. Advertise the fixed service UUID using a legacy
@@ -59,20 +61,36 @@ BLE callbacks only validate packet bounds and enqueue bounded work. Crypto,
 flash erase/write, panel drawing, NVS writes and sleep transitions run outside
 the callback, with a queue and worker stack sized for them. There is one
 application operation in flight; queue capacity is four packets, each at most
-182 bytes (legacy H has its own bounded buffer). Queue exhaustion returns BUSY,
-never silently drops a packet. Status reads copy an already prepared snapshot.
+182 bytes (legacy H and Y may use a GATT long write). Queue exhaustion returns
+BUSY, never silently drops a packet: the callback records the refused packet in
+a second four-entry queue and the worker sends the BUSY reply. **Every
+notification is sent by the worker task** from its own buffer through
+`esp_ble_gatts_send_indicate`; Arduino's `BLECharacteristic::notify()` is not used
+because it re-reads the characteristic value without a lock while BTC_TASK may
+be replacing it. Status reads copy an already prepared snapshot; the callback
+only patches in the current link's challenge. The worker blocks on a task
+notification (packets, buttons, connection events) with a 50–250 ms deadline
+check instead of polling.
+
+Outside the physical menu and OTA, a link that is not authorized within
+**10 seconds** of connecting is disconnected, and any rejected hello disconnects
+immediately after its reply. A stray phone or a stale OS auto-connection cannot
+occupy the single link.
 
 ## 2. Existing dashboard messages
 
-These byte layouts are unchanged. Subscribe to dashboard control notifications
-before sending H. A protocol-4 companion may use the legacy dashboard transport
+The frame, clock and notice layouts are unchanged; the hello gained P and Y.
+Subscribe to dashboard control notifications before any hello. A protocol-4 companion may use the legacy dashboard transport
 on protocol 3, but must disable OTA and protocol-4 discovery in that case.
 The old Swift helper which requires `protocol == 3` itself needs replacement.
 
 | Direction/characteristic | Layout |
 | --- | --- |
-| Host → control, hello | `H:u8, host_id:36 ASCII bytes, name:0..20 ASCII bytes` |
-| Device → control, hello ACK | `H:u8, result:u8` (`0` selected, `7` not selected/menu open) |
+| Host → control, authenticated hello | `P:u8, proof:16` (section 2.1) |
+| Host → control, legacy hello | `H:u8, host_id:36 ASCII bytes, name:0..20 ASCII bytes` (migration only) |
+| Host → control, provision secret | `Y:u8, secret:32` (only directly after a legacy H answered `8`) |
+| Device → control, hello ACK (H and P) | `H:u8, result:u8` |
+| Device → control, provision ACK | `Y:u8, result:u8` (`0` stored and authorized, `2` busy, `5` storage failed, `7` refused) |
 | Host → control, clock | `T:u8, unix_seconds:u32, UTC_offset_seconds:i32` |
 | Host → control, begin frame | `B:u8, sequence:u32, CRC32:u32, length:u16` (length 4000) |
 | Device → control, protocol-4 begin-ready ACK | `b:u8, result:u8, sequence:u32, CRC32:u32` |
@@ -88,11 +106,63 @@ companion checks the signed release immediately and, when newer compatible
 firmware exists, starts the normal verified OTA without a desktop dialog. A
 companion update is never installed from the meter.
 
-H uses a write-with-response long write if its 37–57 bytes exceed the ATT value
-budget; this is below the 512-byte GATT attribute limit. Require a backend that
-supports this normal long-write path; do not split legacy H into separate writes
-or pretend a partial identity is valid. Registration below is explicitly
-fragmented and does not depend on long writes.
+The meter sends U only on an authorized link and then shows "Checking for
+updates..."; without one it shows "Select a computer first." (none selected) or
+"Computer not connected." (selected but not connected). It accepts `u` only while
+a check is outstanding (and `u 4` after `u 3`); unsolicited `u` is ignored. A new
+or lost link clears a pending check; no answer within 45 seconds shows "Update
+check failed." Results stay about eight seconds and disappear with the next
+minute draw. The companion drops a notice it could not deliver within 60 seconds.
+
+Hello results: `0` authorized; `2` busy (queue full, retry, link stays open);
+`7` rejected (unknown secret, replayed/second hello, menu open, legacy H refused);
+`8` legacy H accepted, send Y now; `9` the proof is valid but that computer is
+not the one selected on the meter. Every result except 0 and 2 is followed by a
+disconnect. P (17 bytes) fits the minimum 20-byte value budget. H (37–57 bytes)
+and Y (33 bytes) use a write-with-response long write if they exceed the ATT
+value budget; do not split them into separate writes. Registration below is
+explicitly fragmented and does not depend on long writes.
+
+### 2.1 Pairing secrets and the authenticated hello
+
+Firmware that implements this reports `"auth":1` in its status. Each computer
+generates a random 32-byte secret **per meter** (keyed by the meter's `serial`,
+never by an OS-specific BLE address), stores it in a private file (`0600`) and
+sends it in its registration while the owner has the physical menu open. When
+the owner selects it, the meter stores host ID, name and secret.
+
+The meter keeps up to **eight** paired computers in one checksummed NVS blob
+(`pairs`); exactly one of them is selected. Adding a ninth replaces the least
+recently used. The legacy `host`/`name` keys mirror the selected computer for
+downgrade tooling only; a valid `pairs` blob is authoritative and a corrupt one
+fails closed (no selection) rather than falling back to a bare host ID.
+
+Every physical connection gets a fresh random 16-byte challenge, published as
+32 lower-case hex characters in the status `challenge` field. The computer proves
+possession of its secret:
+
+```
+proof = HMAC-SHA256(secret, "SWM-AUTH-1" || challenge(16 raw bytes)
+                    || serial (12 ASCII) || host_id (36 ASCII))[0:16]
+```
+
+and sends `P || proof`. The meter tries each stored secret (constant-time
+comparison) so the hello never names a computer. A match for the selected
+computer authorizes the link (`0`); a match for another paired computer returns
+`9`; no match returns `7`. Each link allows one hello; the challenge cannot be
+reused, and a new connection gets a new one. A hello while OTA is active never
+changes or revokes authorization.
+
+**Migration from pre-secret firmware (2026.9.8, 2026.9.13).** Those meters stored
+only a selected host ID. After updating, the status shows `"selected":true,
+"secured":false`. The selected computer sends one legacy H; if the ID matches
+the meter answers `8` and the computer must immediately send `Y` with a new
+secret (trust on first use). Y is durable in NVS before it is acknowledged and
+authorizes the link. From then on legacy H is always refused. A companion
+connecting to pre-secret firmware (status has `selected_host` and no `auth`)
+keeps using legacy H and the legacy registration body so it can still deliver
+the OTA that adds pairing secrets; firmware that adds this protocol must be
+released with a `minimum_companion` that implements it.
 
 Host IDs are lower-case UUID text matching
 `7a1e1000-ff1b-4d9f-a023-[0-9a-f]{12}`; preserve existing installations' IDs.
@@ -102,10 +172,10 @@ UI may retain the full Unicode computer name; its transmitted short name removes
 unsupported characters and falls back to `Mac`, `Windows PC` or `Linux PC` if
 empty. Names never contain NUL/newline/control bytes.
 
-Protocol 4 requires **physical selection before a new host can use H**. An empty
-selected host no longer causes implicit first-peer selection. Existing persisted
-selection is honored. H is refused while discovery is open. A selected H success
-is the only network event that cancels the normal target-disconnect timer.
+Protocol 4 requires **physical selection before a computer is authorized**. An
+empty selection never causes implicit first-peer selection. Hellos are refused
+while discovery is open. An authorized hello (P, or Y after migration) is the
+only network event that cancels the normal target-disconnect timer.
 
 Protocol 4 waits for a matching **b0** begin-ready ACK before sending any
 framebuffer data. The 10-byte b ACK echoes B's sequence and CRC: result 0 means the
@@ -117,16 +187,27 @@ expires, and drains frame packets without a fixed per-packet sleep. This prevent
 a short four-packet callback queue overflowing behind a multi-second panel draw.
 The GATT write response alone is never readiness. Protocol 3 has no b event and
 retains its legacy begin behavior. A b error ends that frame attempt; do not send
-data. C still receives its A acknowledgement only after panel completion.
+data.
 
-Frame A results: 0 displayed; 1 already identical; 2 busy/invalid begin length;
-3 incomplete/CRC/commit mismatch; 4 offset error; 5 display failure; 6 critical
-battery. The CRC is standard CRC-32/ISO-HDLC (same as Python `zlib.crc32`). Data
-must arrive at the exact next offset; no interleaving frames. Commit ACK follows
-panel completion; wait up to 30 seconds. An unfinished frame expires after 15
-seconds without a valid frame packet. OTA-active frame begins return result 2.
-H/T remain available for the selected host when OTA is idle; dashboard data and
-new clock writes pause during OTA.
+Frame A results: 0 stored and drawn now; 1 stored and accepted, drawn with the
+next minute boundary; 2 busy/invalid begin length; 3 incomplete/CRC/commit
+mismatch; 4 offset error; 5 display failure; 6 critical battery. Both 0 and 1 are
+success. The CRC is standard CRC-32/ISO-HDLC (same as Python `zlib.crc32`). Data
+must arrive at the exact next offset; no interleaving frames. Wait up to 30
+seconds for A. An unfinished frame expires after 15 seconds without a valid frame
+packet. OTA-active frame begins return result 2. Hellos and T remain available
+when OTA is idle; dashboard data and new clock writes pause during OTA.
+
+**Display timing.** The panel uses the full clear-and-draw waveform (a DU trial
+ghosted), so each draw is a full two-pass refresh. The panel redraws at most once
+per minute on its own: a valid frame is copied into the dashboard buffer and
+acknowledged with result 1 immediately, and the dashboard (with the new clock
+minute) is drawn at the next minute boundary. Only user-visible state changes
+draw immediately: the first frame after boot or wake (A result 0), a frame that
+answers a physical refresh press (A result 0), and the menu, OTA progress,
+rocker-hold notices, low-battery and power screens. Removing a notice banner, the
+refresh marker, or a changed Bluetooth indicator waits for the next minute
+draw. A minute draw is skipped entirely if nothing visible changed.
 
 ## 3. Device status (0004)
 
@@ -135,11 +216,21 @@ string. The following fields are required; omit optional diagnostics rather than
 exceeding the limit. Strings containing local names are not included here.
 
 ```json
-{"protocol":4,"firmware":"2026.9.1","board":"elecrow-crowpanel-2.13-v1.2-jd79661","selected_host":"7a1e1000-ff1b-4d9f-a023-0123456789ab","battery_percent":-1,"battery_mv":-1,"interval":60,"critical":false,"charge_state":"unknown","clock_synced":true,"menu":true,"discovery_nonce":4294967295,"discovery_remaining_ms":60000,"computers":8,"ota":false,"boot_health":"valid","last_update":"none","ota_target":""}
+{"protocol":4,"firmware":"2026.9.1","board":"elecrow-crowpanel-2.13-v1.2-jd79661","auth":1,"serial":"a1b2c3d4e5f6","selected":true,"secured":true,"challenge":"5f0c3a9e1b7d2c4e8a6f1d3b5c7e9a0b","battery_percent":-1,"battery_mv":-1,"interval":60,"critical":false,"charge_state":"unknown","clock_synced":true,"menu":true,"discovery_nonce":4294967295,"discovery_remaining_ms":60000,"computers":8,"ota":false,"boot_health":"valid","last_update":"none","ota_target":"","rssi":-61}
 ```
 
-The example identity is synthetic. `discovery_nonce` and remaining milliseconds
-are zero when closed; `selected_host` is empty before first physical selection.
+The example values are synthetic. The status **never names the selected
+computer** (the former `selected_host` field is gone): any nearby central can
+read it. `auth` is 1 for the pairing protocol of section 2.1. `serial` is the
+meter's stable eFuse MAC as 12 lower-case hex characters; computers key pairing
+secrets by it. `selected` says whether a computer is selected; `secured` whether
+that selection has a pairing secret (false only after migrating from pre-secret
+firmware). `challenge` is this connection's 32-hex-character challenge.
+`computers` is the number of rows in the open menu. `rssi` is an optional
+diagnostic, present only while an authorized link has a recent reading and only
+if it fits. `discovery_nonce` and remaining milliseconds are zero when closed.
+Pre-secret firmware reported `selected_host` and no `auth`; companions accept
+both formats.
 `boot_health` is `pending`, `valid` or `failed`; `last_update` is `none`, `pending`,
 `success`, `failed` or `rollback`; `ota_target` is the last attempted numeric
 version or empty. `pending` also covers a durable update intent whose boot
@@ -147,15 +238,23 @@ selection/outcome cannot yet be proved; it is never success or proof of rollback
 The 0007 binary status supplies OTA offsets/errors; do not duplicate a verbose
 OTA object in this JSON. Host parsers ignore optional unknown JSON keys.
 
-## 4. Physical computer picker
+## 4. Physical computer menu: pairing, switching and removal
 
 Long-bottom (3 seconds) opens a **60-second hard discovery window** and creates a
 fresh random nonzero 32-bit nonce. Only a physical button action opens/restarts
-the window; packets and rocker movement cannot extend its hard deadline. The
-list holds at most eight hosts, deduplicated by ID; include the previous selected
-host/name initially, when present. Registration adds/updates a list item and
-never selects it. Rocker up/down highlights; rocker center selects. Short-bottom
-cancels. Short-top explicitly restarts discovery with a fresh nonce and window.
+the window; packets and rocker movement cannot extend its hard deadline. The menu
+lists the paired computers first (the selected one, then most recently used),
+then computers that register while it is open, at most twelve rows,
+deduplicated by host ID. Each row shows a marker (`>` selected, `+` new, `!`
+conflicting identity), the name and the last four hex characters of the host
+ID, so equal names are distinguishable. Rocker up/down highlights.
+
+- **Rocker press** on a paired row switches to that computer at once; its stored
+  secret is reused, nothing is re-registered. On a new row it pairs and selects
+  that computer (replacing the least recently used pairing if eight exist).
+- **Rocker hold (3 s)** on a row asks "REMOVE COMPUTER"; rocker press confirms,
+  any other key keeps it. Removing the selected computer leaves none selected.
+- Short-bottom cancels. Short-top restarts discovery with a fresh nonce and window.
 
 Immediately notify dashboard control with this 9-byte event:
 
@@ -164,9 +263,11 @@ D:u8, discovery_nonce:u32, window_ms:u32
 ```
 
 An already connected companion stops frame submission and disconnects within one
-second of D, then enters discovery backoff. The device revokes H authorization
-when opening the menu and disconnects any remaining peer after two seconds.
-Discovery is not dependent on the old companion's 30-second status polling.
+second of D, then enters discovery backoff. The device revokes the link's
+authorization when opening the menu and disconnects any remaining peer after two
+seconds. While the menu is open the scan-response local name gains the suffix
+`-PAIR` (`Sweetmeter-ABCD-PAIR`, 22 bytes including its AD header), so computers
+that have never paired only probe a meter whose owner is actually pairing.
 
 A candidate connects, reads 0004, subscribes to 0002 and registers only if menu is
 open and nonce is nonzero. Registration uses these **control** messages (distinct
@@ -179,35 +280,48 @@ from all legacy commands):
 | Commit | `K:u8, session:u32` (5 bytes) |
 | ACK | `J:u8, result:u8, session:u32, next_offset:u32` (10 bytes) |
 
-A nonzero random session identifies one attempt. The assembled body is exactly
-`host_id:36 ASCII bytes, name_length:u8, name:name_length ASCII bytes`, 38–57
-bytes. Total must match that body; name length is 1–20. At the minimum MTU each
-fragment contains at most 11 payload bytes. One write and its J ACK precede the
-next write; ACK's next offset is zero after begin, received count after fragment,
-and total after successful commit. A duplicate ID updates its name without
-consuming a list slot. No unauthenticated registration can submit a frame.
+A nonzero random session identifies one attempt. With `"auth":1` the assembled
+body is exactly `host_id:36 ASCII bytes, name_length:u8, name:name_length ASCII
+bytes, secret:32 bytes`, **70–89 bytes**; the secret must not be all zero.
+(Pre-secret firmware accepts only the 38–57-byte body without the secret.) Total
+must match that body; name length is 1–20. At the minimum MTU each fragment
+contains at most 11 payload bytes. One write and its J ACK precede the next write;
+ACK's next offset is zero after begin, received count after fragment, and total
+after successful commit. A duplicate ID updates its row without consuming a slot.
+A paired computer that registers again (for example after forgetting the meter)
+may replace its stored secret once per window; if a second, different secret
+then claims the same ID the row is marked as a conflict and cannot be selected.
+No registration can submit a frame.
 
-J result values: 0 success; 1 malformed length/value/name/ID; 2 menu closed or
-nonce changed; 3 wrong session; 4 unexpected offset; 5 list full; 6 busy.
-Nonzero result ends this registration; disconnect, reread status on a later
-attempt, and start with a fresh session. Registration expires after five seconds
-without a valid packet or when its window closes; no partial body is persisted.
-Wait five seconds for a J ACK. Disconnect immediately after commit ACK/error.
-The device forcibly releases a discovery connection after eight seconds from its
-first status read/registration packet, or 15 seconds from physical connection,
-whichever comes first. This prevents one candidate occupying the full window.
+J result values: 0 success; 1 malformed length/value/name/ID/secret; 2 menu
+closed or nonce changed; 3 wrong session; 4 unexpected offset; 5 list full;
+6 busy; 7 too many registrations from this connection address in this window
+(two); 8 identity conflict. Nonzero result ends this registration; disconnect,
+reread status on a later attempt, and start with a fresh session. Registration
+expires after five seconds without a valid packet or when its window closes; no
+partial body is persisted. Wait five seconds for a J ACK. The device disconnects
+immediately after commit ACK/error. It forcibly releases a discovery connection
+after eight seconds from its first status read/registration packet, or 15
+seconds from physical connection, whichever comes first.
 
-Disconnected companions scan/retry with random 2–5 second delay. A host that
-registered successfully waits random 5–9 seconds before its next probe, and does
-not register twice for the same nonce unless its previous attempt failed. A
-nonselected host outside discovery disconnects and backs off 30–45 seconds.
-After physical selection, persist host/name, close the menu, disconnect any
-candidate, and advertise; only the chosen host's subsequent H enables data.
-The selected companion reconnects automatically; others back off.
+After selection, persist the registry, close the menu, disconnect any candidate
+and advertise; only the selected computer's next hello is authorized.
 
-Opening a physical menu temporarily suspends disconnect sleep for its bounded
-window. On cancel/expiry/selection, if no selected H connection exists, a host
-whose disconnect guard was already armed starts a fresh 30-second grace period.
+**Companion connection policy.** Scan 3 seconds at a time. When no meter is seen,
+back off 5, 10, 20, then 30 seconds between scans; reset on a user action
+(`Bluetooth.rescan()`), on forgetting, or when a meter appears. Per meter:
+reconnect at once after a session ends; after registering wait 5–9 seconds and
+do not register twice for one nonce unless the attempt failed; after `9` (paired
+but another computer selected) retry after 8–12 seconds, so switching back on the
+meter reconnects within about 15 seconds; after `7` or when another computer is
+selected and this one holds no secret, back off 30–45 seconds; when no computer
+is selected, 3–5 seconds. A meter showing the `-PAIR` suffix is probed
+immediately. Meters for which this computer holds a proven secret are tried
+first. Any number of meters can be paired; one is driven at a time.
+
+Opening the menu temporarily suspends disconnect sleep for its bounded window.
+On cancel/expiry/selection, if no authorized connection exists, a meter whose
+disconnect guard was already armed starts a fresh 30-second grace period.
 Registration/probing does not arm a never-connected device or count as target
 reconnection. Pressing top-long remains a physical shutdown request when no OTA
 commit is in progress.
@@ -248,11 +362,15 @@ No RSA fallback, key downloaded from the release, or unsigned fallback exists.
 | 124 | 16 | Trusted key ID, NUL-padded ASCII |
 | 140 | 20 | Reserved, all zero |
 
-Board ID is exactly `elecrow-crowpanel-2.13-v1.2-jd79661`; key ID is `release-1`.
-Both fixed strings contain one NUL terminator followed by **only zero padding**;
-reject missing termination, embedded extra data, and non-ASCII. The key ID selects
-an already embedded trusted public key. Additional IDs require a prior trusted
-key-rotation release; this field never authorizes an arbitrary public key.
+Board ID is exactly `elecrow-crowpanel-2.13-v1.2-jd79661`; current releases use
+key ID `release-1`. Both fixed strings contain one NUL terminator followed by
+**only zero padding**; reject missing termination, embedded extra data, and
+non-ASCII. The key ID selects one of the public keys embedded at build time: the
+firmware build embeds every `meter/assets/keys/<key-id>.pem` (uncompressed P-256
+SPKI, key ID `[a-z0-9][a-z0-9-]{0,14}`, at most eight, no duplicates, sorted by
+ID). An unknown ID is SIGNATURE. To rotate, first ship a release that embeds the
+backup public key; only later releases may be signed with it. This field never
+authorizes an arbitrary public key, and no private key is read by the build.
 
 Validate format, strict padding, signature, board, numeric version, protocol,
 minimum companion, nonzero size and actual inactive slot capacity **before erase**.
@@ -269,7 +387,7 @@ the running slot. The binary's ESP chip/image validation must also succeed.
 
 ## 6. OTA messages and application acknowledgements
 
-Subscribe to 0007 before writing 0005. OTA requires selected H authorization,
+Subscribe to 0007 before writing 0005. OTA requires an authorized link (section 2.1),
 closed discovery, no pending/receiving frame, and user confirmation in the desktop
 UI. All OTA operations use one nonzero random **32-bit session**. The host pauses
 normal frame traffic until the update ends. The firmware rejects another session
@@ -339,7 +457,7 @@ session 0 and MALFORMED. Never acknowledge an unwritten byte as received.
 | Error | Name | Meaning |
 | ---: | --- | --- |
 | 0 | OK | No error |
-| 1 | UNAUTHORIZED | No selected H authorization |
+| 1 | UNAUTHORIZED | Link not authorized for the selected computer |
 | 2 | BUSY | Another session, discovery/frame activity or queue full |
 | 3 | MALFORMED | Length, enum, reserved bits, encoding or bounds invalid |
 | 4 | SESSION | Nonzero session does not match |
@@ -478,7 +596,7 @@ persist success before the ESP OTA valid-state operation succeeds.
 After the expected reboot, the companion scans/reconnects for up to 120 seconds,
 reads status and requires firmware exactly equal to the requested version plus
 `boot_health == "valid"` and `last_update == "success"` for success. It then sends
-H/T and a normal frame and reports any display/connection failure separately.
+its hello, T and a normal frame and reports any display/connection failure separately.
 A previous version with last_update rollback is an explicit failed update. An
 unavailable device at 120 seconds is **unconfirmed**, not declared bricked or
 successful. Persist the pending target locally and reconcile on the next
@@ -533,7 +651,47 @@ instead of claiming automatic replacement succeeded. Installation success is
 reported by the newly launched actual version. Platform app signing/notarization
 is separate from these release signatures and must be stated accurately.
 
-The device cannot display that a computer is cryptographically authentic merely
-because its host ID matches, cannot measure USB power without additional
-hardware, and cannot claim complete Windows/Linux hardware acceptance from Mac
-BLE tests. These limitations are part of the product contract.
+A pairing secret authenticates a computer only as well as the registration
+that delivered it: registration happens over a Just Works link while the owner's
+menu is open, so an active attacker present at that moment (not a passive
+listener) could interpose. The legacy migration path trusts the first hello
+from the previously selected host ID. The device cannot measure USB power
+without additional hardware, and cannot claim complete Windows/Linux hardware
+acceptance from Mac BLE tests. These limitations are part of the product
+contract.
+
+## 9. Power, clock and bonds
+
+- **Disconnect sleep:** 30 seconds after the authorized computer's link is lost
+  (section 4 describes the menu exceptions).
+- **Idle power-off:** if no selected computer has been authorized for 30 minutes
+  (any key press restarts the period) and neither the menu nor OTA is active,
+  the meter shows OFF and deep-sleeps.
+- **Top wake:** after the release wait the top button is always armed as the
+  EXT0 wake source, so a press in that instant wakes the meter instead of
+  leaving it without one.
+- **Critical battery (valid MAX17048 only):** at ≤5% or ≤3350 mV; once latched
+  it clears only above 7% and 3450 mV. The gauge is read in `setup()` before BLE
+  or the panel start. The BATTERY LOW screen is drawn once per discharge (and
+  again on a top-button wake); 300-second timer wakes then only measure and
+  sleep. A pending-verify OTA image always finishes its health checks first.
+- **Clock:** deep sleep keeps time on the internal RC oscillator. The meter stores
+  the sleep-entry time in RTC memory; after a sleep longer than five minutes
+  `clock_synced` is false and the clock shows `--:--` until T arrives.
+- **Light/modem sleep:** not enabled. The pinned Arduino-ESP32 2.0.17 prebuilt
+  ESP-IDF 4.4.7 has `CONFIG_PM_ENABLE` off (no automatic light sleep or tickless
+  idle) and `CONFIG_BT_CTRL_SLEEP_MODE_EFF 0` (no controller modem sleep); both
+  need a rebuilt SDK and hardware validation. The CPU runs at 80 MHz and the
+  worker blocks instead of polling.
+- **Persistent-write retry:** a failed pairing-registry NVS write is retried with
+  exponential backoff from 1 to 60 seconds, logging once per attempt.
+- **Bonds:** `CONFIG_BT_SMP_MAX_BONDS` is 15. In ESP-IDF 4.4.7 Bluedroid keeps
+  bonds most-recent-first and, once more than 15 exist, silently deletes the
+  least recent ones (`btc_ble_storage.c`, `_btc_storage_save`). Stray phones and
+  menu candidates bond too, which could push out a paired computer's bond and
+  force the owner to forget the device in the OS. The meter therefore records
+  the bonded identity address (from `ESP_GAP_BLE_AUTH_CMPL_EVT`) of every link
+  that proves a pairing secret (up to eight, NVS `peers`), and at boot and after
+  each disconnect, if at least 12 bonds exist, removes every other bond with
+  `esp_ble_remove_bond_device`.
+

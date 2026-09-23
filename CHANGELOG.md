@@ -67,3 +67,12 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 
 - Hold the rocker for 3 seconds to check for firmware and install a newer version through the paired computer, with the result shown on the meter.
 - Reinstalling never reinstalls dependencies that are already present: source installs rerun pip only when requirements change, and Linux setup skips package checks for an existing installation.
+
+## [2026.9.15] - 2026-09-23
+
+- Pair the meter with up to eight computers, each with its own secret, and switch between them from the meter menu without re-pairing; nearby devices can no longer impersonate a paired computer.
+- The display now refreshes at most once a minute, the meter powers off after 30 minutes without a computer, and replacing a meter no longer requires deleting local files.
+- Switching Claude Code or Codex accounts updates the meter within a minute without showing the previous account's quota; Sweetmeter identifies itself honestly when reading Claude usage.
+- Sweetmeter recovers automatically from Bluetooth failures and damaged local indexes, and shows plain setup instructions for each operating system.
+- Add an uninstaller, automatic repair of a missing login item, quieter Windows startup, and Linux setup for apt, dnf, pacman and zypper.
+- Updates that lose Bluetooth access are rolled back with instructions, and releases are published only through the verified release workflow.

@@ -24,7 +24,13 @@ from .version import Version
 
 PROTOCOL = 4
 BOARD_ID = "elecrow-crowpanel-2.13-v1.2-jd79661"
+# The key new releases are signed with. Every *.pem under assets/keys is a
+# trusted verification key named by its key ID (see docs/RELEASING.md for
+# rotation): shipping the next key before switching KEY_ID lets installed
+# companions accept releases signed by either key during the transition.
 KEY_ID = "release-1"
+KEYS_DIR = Path(__file__).resolve().parent / "assets" / "keys"
+_KEY_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,14}", re.ASCII)
 REPOSITORY = "luvxinc/Sweetmeter"
 SERVICE_UUID, CONTROL_UUID, DATA_UUID, STATUS_UUID, OTA_CONTROL_UUID, OTA_DATA_UUID, OTA_STATUS_UUID = (
     f"7a1e000{i}-ff1b-4d9f-a023-47c7752c1a01" for i in range(1, 8)
@@ -141,10 +147,25 @@ def _public_key(value):
     return value
 
 
-def trusted_keys() -> dict:
-    """Only explicitly shipped keys are trust roots; release data cannot add one."""
-    resource = Path(__file__).resolve().parent / "assets" / "keys" / f"{KEY_ID}.pem"
-    return {KEY_ID: _public_key(resource)}
+def trusted_keys(directory=None) -> dict:
+    """Only explicitly shipped keys are trust roots; release data cannot add one.
+
+    Returns {key_id: public key} for every `<key_id>.pem` shipped with the
+    app. Key IDs fit the 16-byte firmware header field. A malformed file fails
+    closed rather than being skipped, and the current signing key must exist.
+    """
+    folder = Path(directory) if directory is not None else KEYS_DIR
+    keys = {}
+    for path in sorted(folder.glob("*.pem")):
+        key_id = path.stem
+        if not _KEY_ID_RE.fullmatch(key_id) or path.is_symlink():
+            raise ProtocolError("Invalid trusted key file name: " + path.name)
+        keys[key_id] = _public_key(path)
+    if directory is None and KEY_ID not in keys:
+        raise ProtocolError("Current release signing key is missing")
+    if not keys:
+        raise ProtocolError("No trusted release keys")
+    return keys
 
 
 def _verify_signature(data, signature, key_id, keys):

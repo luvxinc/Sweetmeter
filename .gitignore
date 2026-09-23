@@ -5,7 +5,7 @@ backups/
 *.sqlite3-*
 *.log
 *.pem
-!meter/assets/keys/release-1.pem
+!meter/assets/keys/release-*.pem
 *.key
 .env
 .env.*

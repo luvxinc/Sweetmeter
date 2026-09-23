@@ -28,13 +28,22 @@ class AppTests(unittest.TestCase):
             worker.start(); self.assertTrue(done.wait(3)); worker.close()
         self.assertEqual(len(set(ids)),1)
         self.assertNotEqual(ids[0],threading.get_ident())
-    def test_worker_initialization_failure_is_visible_to_health_gate(self):
-        with tempfile.TemporaryDirectory() as directory, patch('meter.app.TokenIndex',side_effect=OSError('denied')):
+    def test_token_index_failure_never_blocks_startup_or_quotas(self):
+        seen=[]
+        with tempfile.TemporaryDirectory() as directory, patch('meter.app.TokenIndex',side_effect=OSError('denied')), \
+                patch('meter.app.refresh',return_value={'providers':{}}):
             app=Application(directory,preview_only=True)
             try:
-                with self.assertRaises(RuntimeError): app.start()
-                self.assertTrue(app.provider.startup_error)
+                app.start()
+                self.assertIsNone(app.provider.startup_error)
+                self.assertEqual(app.provider.index_error,'OSError')
+                deadline=threading.Event()
+                for _ in range(40):
+                    seen.extend(e['event'] for e in app.pump())
+                    if 'snapshot' in seen: break
+                    deadline.wait(.05)
             finally: app.close()
+        self.assertIn('snapshot',seen)
     def test_transient_refresh_failure_recovers_on_refresh(self):
         done=threading.Event(); holder={}; failures=[]
         class Index:

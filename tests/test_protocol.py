@@ -524,6 +524,69 @@ class SigningToolsTests(unittest.TestCase):
                 self.assertEqual((output / "manifest.json").read_bytes(), raw)
 
 
+class KeyRotationTests(unittest.TestCase):
+    def pem(self, key):
+        return key.public_key().public_bytes(serialization.Encoding.PEM,
+                                             serialization.PublicFormat.SubjectPublicKeyInfo)
+
+    def test_every_shipped_key_is_trusted_by_its_id(self):
+        shipped = trusted_keys()
+        self.assertIn(KEY_ID, shipped)
+        self.assertEqual(set(shipped), {path.stem for path in KEYS_DIR.glob("*.pem")})
+
+    def test_manifest_signed_by_next_key_verifies_once_shipped(self):
+        next_key = ec.generate_private_key(ec.SECP256R1())
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "release-1.pem").write_bytes(self.pem(TEST_KEY))
+            (Path(folder) / "release-2.pem").write_bytes(self.pem(next_key))
+            keys = trusted_keys(folder)
+        self.assertEqual(set(keys), {"release-1", "release-2"})
+        manifest = sample_manifest()
+        manifest["key_id"] = "release-2"
+        raw = json.dumps(manifest).encode()
+        signature = next_key.sign(raw, ec.ECDSA(hashes.SHA256()))
+        self.assertEqual(verify_manifest(raw, signature, trusted_keys=keys)["key_id"], "release-2")
+        with self.assertRaises(ProtocolError):
+            verify_manifest(raw, signature, trusted_keys=TEST_TRUST)  # Not yet shipped: rejected.
+        with self.assertRaises(ProtocolError):
+            verify_manifest(raw, TEST_KEY.sign(raw, ec.ECDSA(hashes.SHA256())), trusted_keys=keys)
+
+    def test_firmware_envelope_with_rotated_key_id(self):
+        next_key = ec.generate_private_key(ec.SECP256R1())
+        metadata = replace(sample_metadata(), key_id="release-2")
+        envelope = sign_envelope(metadata, next_key)
+        keys = {"release-1": TEST_KEY.public_key(), "release-2": next_key.public_key()}
+        self.assertEqual(verify_envelope(envelope, trusted_keys=keys).key_id, "release-2")
+
+    def test_malformed_key_files_fail_closed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "Bad Name.pem").write_bytes(self.pem(TEST_KEY))
+            with self.assertRaises(ProtocolError):
+                trusted_keys(folder)
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "release-2.pem").write_bytes(b"not a key")
+            with self.assertRaises(ProtocolError):
+                trusted_keys(folder)
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(ProtocolError):
+                trusted_keys(folder)
+
+    def test_package_must_bundle_exactly_the_shipped_key_set(self):
+        extra = self.pem(ec.generate_private_key(ec.SECP256R1()))
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp) / "app.zip"
+            native_package_fixture(package, version="2026.9.2")
+            with zipfile.ZipFile(package, "a") as archive:
+                archive.writestr("Sweetmeter/_internal/meter/assets/keys/attacker.pem", extra)
+            receipt = Path(str(package) + ".build.json")
+            record = json.loads(receipt.read_text())
+            record["artifact_sha256"] = hashlib.sha256(package.read_bytes()).hexdigest()
+            receipt.write_text(json.dumps(record))
+            with self.assertRaisesRegex(ValueError, "trust differs"):
+                verify_companion_package(package, "2026.9.2", os_name="linux", arch="x86_64",
+                                         source_commit="a" * 40, source_tree="b" * 40)
+
+
 class BuildInjectionTests(unittest.TestCase):
     def test_guarded_fixture_overrides_and_public_only_include(self):
         spec = importlib.util.spec_from_file_location("firmware_build_test", ROOT / "scripts/firmware_build.py")

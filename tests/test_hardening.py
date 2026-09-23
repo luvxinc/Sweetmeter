@@ -1,0 +1,698 @@
+"""Release-hardening regressions: robustness of the local index, provider
+scheduling, per-row staleness, rendering bounds and app/GUI event wiring.
+Everything is synthetic; no network, Bluetooth or real account data."""
+import json
+import logging
+import os
+import queue
+import sqlite3
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from PIL import Image, ImageDraw
+
+from meter import providers
+from meter.app import (Application, LogLimiter, ProviderWorker, display_snapshot,
+                       display_time, next_render, BLUETOOTH_RESTARTS)
+from meter.gui import (BLUETOOTH_HELP, Desktop, bluetooth_help, plain, provider_summary,
+                       selection_text)
+from meter.providers import (NotSetUp, ProviderError, RateLimited, parse_claude, parse_codex,
+                             refresh)
+from meter.render import compact, fit, font, percent, printable, render
+from meter.tokens import TokenIndex, is_corrupt
+
+
+def claude_line(identity, timestamp=None, output=5):
+    return json.dumps({'type': 'assistant', 'timestamp': timestamp or time.time(),
+                       'message': {'id': identity, 'model': 'claude-test',
+                                   'usage': {'input_tokens': 10, 'output_tokens': output}}}) + '\n'
+
+
+# -- Item 2: a damaged index never blocks startup ---------------------------
+class CorruptIndexTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.path = self.root / 'tokens.sqlite3'
+
+    def test_garbage_file_is_discarded_and_rebuilt(self):
+        self.path.write_bytes(b'this is not a database' * 200)
+        Path(str(self.path) + '-journal').write_bytes(b'junk')
+        index = TokenIndex(self.path)
+        self.addCleanup(index.close)
+        self.assertTrue(index.recovered)
+        self.assertEqual(index.db.execute('PRAGMA user_version').fetchone()[0], 3)
+        self.assertFalse(Path(str(self.path) + '-journal').exists())
+        logs = self.root / 'logs'
+        logs.mkdir()
+        (logs / 'a.jsonl').write_text(claude_line('m1'))
+        self.assertEqual(index.scan([(logs, 'claude')]), {'claude'})
+        self.assertEqual(index.total('claude', 0, time.time() + 10), 15)
+
+    def test_unwritable_location_falls_back_to_memory(self):
+        blocker = self.root / 'file'
+        blocker.write_text('x')
+        index = TokenIndex(blocker / 'tokens.sqlite3')  # Parent is a file.
+        self.addCleanup(index.close)
+        self.assertEqual(index.total('claude', 0, 1), 0)
+
+    def test_corruption_during_use_is_rebuilt_by_worker(self):
+        worker = ProviderWorker(self.root, lambda event: None)
+        index = Mock()
+        index.scan.side_effect = sqlite3.DatabaseError('database disk image is malformed')
+        result, available, ok = worker._scan(index)
+        index.rebuild.assert_called_once()
+        self.assertEqual((available, ok), (set(), False))
+        index.reset_mock()
+        index.scan.side_effect = sqlite3.OperationalError('database is locked')
+        worker._scan(index)
+        index.rebuild.assert_not_called()
+
+    def test_corruption_classification(self):
+        self.assertTrue(is_corrupt(sqlite3.DatabaseError('file is not a database')))
+        self.assertFalse(is_corrupt(sqlite3.OperationalError('database is locked')))
+        self.assertFalse(is_corrupt(ValueError()))
+
+    def test_worker_emits_quotas_when_scan_fails_completely(self):
+        events, done = [], threading.Event()
+        holder = {}
+
+        class Broken:
+            activity = {}
+            def __init__(self, path): self.db = self
+            def scan(self): raise RuntimeError('boom')
+            def total(self, *a, **k): raise AssertionError('not reached')
+            def close(self): pass
+
+        def emit(event):
+            events.append(event)
+            if event['event'] == 'snapshot':
+                holder['worker'].stop.set()
+                done.set()
+
+        cache = {'providers': {'claude': {'rows': parse_claude({'five_hour': {'utilization': 40}}),
+                                          'fetched_at': time.time(), 'next_poll': time.time() + 60}}}
+        with patch('meter.app.TokenIndex', Broken), patch('meter.app.refresh', return_value=cache):
+            worker = holder['worker'] = ProviderWorker(self.root, emit)
+            worker.start()
+            self.assertTrue(done.wait(3))
+            worker.close()
+        snapshot = events[-1]['snapshot']
+        self.assertEqual(snapshot['rows'][0]['used'], 40)
+        self.assertIsNone(snapshot['rows'][0]['tokens'])
+
+
+# -- Items 3 and 6: per-file errors and incremental scanning ---------------
+class ScanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.logs = self.root / 'projects'
+        self.logs.mkdir()
+        self.index = TokenIndex(self.root / 'tokens.sqlite3')
+        self.addCleanup(self.index.close)
+
+    def test_unreadable_and_undecodable_files_do_not_abort_scan(self):
+        (self.logs / 'good.jsonl').write_text(claude_line('good'))
+        (self.logs / 'binary.jsonl').write_bytes(b'\xff\xfe"usage"\x80\n' + claude_line('after').encode())
+        locked = self.logs / 'locked.jsonl'
+        locked.write_text(claude_line('locked'))
+        real_open = Path.open
+
+        def guarded(path, *args, **kwargs):
+            if path.name == 'locked.jsonl':
+                raise PermissionError('synthetic')
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(Path, 'open', guarded):
+            self.assertEqual(self.index.scan([(self.logs, 'claude')]), {'claude'})
+        self.assertEqual(self.index.skipped, 1)
+        self.assertEqual(self.index.total('claude', 0, time.time() + 10), 30)
+        # The skipped file is retried and counted once it becomes readable.
+        self.index.scan([(self.logs, 'claude')])
+        self.assertEqual(self.index.total('claude', 0, time.time() + 10), 45)
+
+    def test_unchanged_files_are_not_reopened(self):
+        (self.logs / 'a.jsonl').write_text(claude_line('a'))
+        self.index.scan([(self.logs, 'claude')])
+        with patch.object(Path, 'open', side_effect=AssertionError('reopened')):
+            self.index.scan([(self.logs, 'claude')])
+        with (self.logs / 'a.jsonl').open('a') as handle:
+            handle.write(claude_line('b'))
+        self.index.scan([(self.logs, 'claude')])
+        self.assertEqual(self.index.total('claude', 0, time.time() + 10), 30)
+        self.assertGreater(self.index.activity['claude'], 0)
+
+    def test_codex_session_metadata_is_read_once_and_fork_order_kept(self):
+        sessions = self.root / 'sessions'
+        sessions.mkdir()
+        now = time.time()
+        usage = {'type': 'event_msg', 'timestamp': now, 'payload': {'type': 'token_count', 'info': {
+            'last_token_usage': {'input_tokens': 100, 'output_tokens': 10},
+            'total_token_usage': {'input_tokens': 100, 'output_tokens': 10}}}}
+        # The child sorts first by name; its parent must still be scanned first.
+        (sessions / 'a-child.jsonl').write_text('\n'.join(map(json.dumps, [
+            {'type': 'session_meta', 'payload': {'id': 'child', 'forked_from_id': 'parent',
+                                                 'instructions': 'x' * 100000}},
+            {**usage, 'timestamp': now + 50}])) + '\n')
+        (sessions / 'b-parent.jsonl').write_text('\n'.join(map(json.dumps, [
+            {'type': 'session_meta', 'payload': {'id': 'parent'}}, usage])) + '\n')
+        with patch('meter.tokens._session_meta', wraps=__import__('meter.tokens').tokens._session_meta) as meta:
+            self.index.scan([(sessions, 'codex')])
+            self.index.scan([(sessions, 'codex')])
+        self.assertEqual(meta.call_count, 2)  # Once per file, not once per scan.
+        self.assertEqual(self.index.total('codex', 0, now + 100), 110)
+        self.assertEqual(self.index.total('codex', now + 10, now + 100), 0)
+
+    def test_deep_fork_chain_does_not_recurse(self):
+        sessions = self.root / 'sessions'
+        sessions.mkdir()
+        for i in range(1500):
+            payload = {'id': f's{i}'}
+            if i:
+                payload['forked_from_id'] = f's{i - 1}'
+            (sessions / f'{i}.jsonl').write_text(json.dumps({'type': 'session_meta', 'payload': payload}) + '\n')
+        self.assertEqual(self.index.scan([(sessions, 'codex')]), {'codex'})
+
+    def test_old_codex_date_folders_are_pruned_and_rows_forgotten(self):
+        sessions = self.root / 'sessions'
+        old = sessions / '2001/01/01'
+        old.mkdir(parents=True)
+        (old / 'x.jsonl').write_text('{}\n')
+        (sessions / 'recent.jsonl').write_text('{}\n')
+        with patch('meter.tokens.Path.stat', autospec=True, side_effect=Path.stat) as stat:
+            self.index.scan([(sessions, 'codex')])
+        self.assertNotIn(old / 'x.jsonl', [c.args[0] for c in stat.call_args_list])
+        (sessions / 'recent.jsonl').unlink()
+        self.index.scan([(sessions, 'codex')])
+        self.assertEqual(self.index.db.execute('SELECT COUNT(*) FROM files').fetchone()[0], 0)
+
+
+# -- Items 5, 6 and 7: provider scheduling and identification ---------------
+class ProviderScheduleTests(unittest.TestCase):
+    def test_forced_refresh_bypasses_error_backoff(self):
+        calls = []
+
+        def signed_out():
+            calls.append(1)
+            raise providers.SignInExpired('Claude Code sign-in expired. Open Claude Code once to renew it.')
+
+        cache = refresh({}, 1000, {'claude': signed_out})
+        self.assertEqual(cache['providers']['claude']['next_poll'], 1300)
+        cache = refresh(cache, 1100, {'claude': lambda: parse_claude({})}, force=True)
+        self.assertIsNone(cache['providers']['claude']['error'])
+
+    def test_forced_refresh_respects_rate_limit_and_press_floor(self):
+        def limited():
+            raise RateLimited('Claude HTTP 429: slow down', retry_after=1200)
+        cache = refresh({}, 1000, {'claude': limited})
+        self.assertEqual(cache['providers']['claude']['next_poll'], 2200)
+        good = Mock(return_value=parse_claude({}))
+        refresh(cache, 1100, {'claude': good}, force=True)
+        good.assert_not_called()
+        cache = refresh({}, 1000, {'claude': good})
+        refresh(cache, 1005, {'claude': good}, force=True)
+        self.assertEqual(good.call_count, 1)
+
+    def test_codex_idle_interval_and_wake(self):
+        read = Mock(return_value=parse_codex({}))
+        cache = refresh({}, 1000, {'codex': read}, relaxed={'codex': 900})
+        self.assertEqual(cache['providers']['codex']['next_poll'], 1900)
+        refresh(cache, 1100, {'codex': read}, relaxed={'codex': 900})
+        self.assertEqual(read.call_count, 1)
+        refresh(cache, 1100, {'codex': read}, relaxed={'codex': 900}, wake={'codex'})
+        self.assertEqual(read.call_count, 2)
+
+    def test_clock_moving_backwards_does_not_freeze_polling(self):
+        read = Mock(return_value=parse_claude({}))
+        cache = refresh({}, 10 ** 9, {'claude': read})
+        refresh(cache, 10 ** 9 - 10 * 86400, {'claude': read})
+        self.assertEqual(read.call_count, 2)
+
+    def test_not_set_up_clears_rows(self):
+        cache = refresh({}, 1000, {'codex': lambda: parse_codex({'rateLimits': {'planType': 'pro'}})})
+        def missing():
+            raise NotSetUp('Codex is not installed')
+        cache = refresh(cache, 2000, {'codex': missing})
+        entry = cache['providers']['codex']
+        self.assertEqual(entry['error_code'], 'not_set_up')
+        self.assertNotIn('rows', entry)
+
+    def test_unexpected_errors_are_plain(self):
+        import requests
+        for error in (requests.ConnectionError('secret body'), ValueError('secret'), KeyError('x')):
+            code, message = providers.describe_error('claude', error)
+            self.assertNotIn('secret', message)
+            self.assertNotRegex(message, r'Error|Exception')
+
+    def test_user_agent_is_sweetmeter_and_token_stays_in_header(self):
+        response = SimpleNamespace(status_code=200, headers={}, json=lambda: {'five_hour': {'utilization': 3}},
+                                   close=lambda: None)
+        with patch.object(providers, 'claude_credentials', return_value={'accessToken': 'synthetic-token'}), \
+                patch.object(providers, 'get_version', return_value='2026.9.9'), \
+                patch.object(providers.requests, 'get', return_value=response) as get:
+            rows = providers.fetch_claude()
+        headers = get.call_args.kwargs['headers']
+        self.assertEqual(headers['User-Agent'], 'Sweetmeter/2026.9.9')
+        self.assertNotIn('claude-code', json.dumps(headers).lower())
+        self.assertEqual(headers['anthropic-beta'], 'oauth-2025-04-20')
+        self.assertNotIn('synthetic-token', json.dumps(rows))
+
+    def test_codex_signed_out_is_not_set_up(self):
+        import io
+        process = Mock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(''.join(json.dumps(m) + '\n' for m in [
+            {'id': 1, 'result': {}}, {'id': 2, 'error': {'message': 'synthetic'}},
+            {'id': 4, 'result': {'account': None, 'requiresOpenaiAuth': True}}]))
+        process.poll.return_value = None
+        with patch.object(providers, 'codex_command', return_value=['codex', 'app-server']), \
+                patch.object(providers.sys, 'platform', 'linux'), \
+                patch.object(providers.subprocess, 'Popen', return_value=process):
+            with self.assertRaises(NotSetUp):
+                providers.fetch_codex()
+
+    def test_missing_codex_is_not_set_up(self):
+        with patch.object(providers.shutil, 'which', return_value=None), \
+                patch.object(providers, '_codex_candidates', return_value=iter(())), \
+                patch.dict(os.environ, {'SWEETMETER_CODEX_PATH': ''}):
+            with self.assertRaises(NotSetUp):
+                providers.codex_command()
+
+    def test_http_failures_map_to_plain_messages_without_token(self):
+        for status, kind in ((401, providers.SignInExpired), (429, RateLimited), (503, ProviderError)):
+            response = SimpleNamespace(status_code=status, headers={'Retry-After': '120'}, close=lambda: None)
+            with self.subTest(status=status), \
+                    patch.object(providers, 'claude_credentials', return_value={'accessToken': 'synthetic-token'}), \
+                    patch.object(providers.requests, 'get', return_value=response):
+                with self.assertRaises(kind) as caught:
+                    providers.fetch_claude()
+                self.assertNotIn('synthetic-token', str(caught.exception))
+
+
+# -- Item 4: staleness per provider/row --------------------------------------
+class RowStateTests(unittest.TestCase):
+    def test_missing_codex_is_absent_and_claude_is_not_stale(self):
+        now = 10_000
+        cache = {'providers': {
+            'claude': {'rows': parse_claude({'five_hour': {'utilization': 20, 'resets_at': now + 3600}}),
+                       'fetched_at': now - 30, 'next_poll': now + 30, 'error': None},
+            'codex': {'error': 'Codex is not installed', 'error_code': 'not_set_up', 'next_poll': now + 300}}}
+        snapshot = display_snapshot(cache, None, set(), now)
+        states = [row['state'] for row in snapshot['rows']]
+        self.assertEqual(states, ['ok', 'ok', 'ok', 'absent'])
+        self.assertFalse(snapshot['stale'])
+        self.assertIsNone(snapshot['rows'][3]['used'])
+        self.assertEqual(snapshot['rows'][3]['subscription_label'], '')
+
+    def test_error_marks_only_that_provider_stale(self):
+        now = 10_000
+        cache = {'providers': {
+            'claude': {'rows': parse_claude({}), 'fetched_at': now - 30, 'next_poll': now + 30},
+            'codex': {'rows': parse_codex({}), 'fetched_at': now - 60, 'next_poll': now + 240,
+                      'error': 'Codex did not answer in time.'}}}
+        states = [row['state'] for row in display_snapshot(cache, None, set(), now)['rows']]
+        self.assertEqual(states, ['ok', 'ok', 'ok', 'stale'])
+
+    def test_relaxed_codex_poll_is_not_stale(self):
+        now = 10_000
+        cache = {'providers': {'codex': {'rows': parse_codex({}), 'fetched_at': now - 1000,
+                                         'next_poll': now - 100 + 900}}}
+        self.assertEqual(display_snapshot(cache, None, set(), now)['rows'][-1]['state'], 'ok')
+        cache['providers']['codex']['fetched_at'] = now - 5000
+        self.assertEqual(display_snapshot(cache, None, set(), now)['rows'][-1]['state'], 'stale')
+
+    def test_render_marks_only_stale_rows(self):
+        rows = parse_claude({}) + parse_codex({})
+        for row in rows:
+            row['state'] = 'ok'
+        rows[3]['state'] = 'absent'
+        clean = render(dict(rows=rows, as_of=1789870000, stale=True))
+        rows[0]['state'] = 'stale'
+        marked = render(dict(rows=rows, as_of=1789870000, stale=False))
+        diff = [(x, y) for x in range(250) for y in range(15, 42)
+                if clean.getpixel((x, y)) != marked.getpixel((x, y))]
+        self.assertTrue(diff)
+        self.assertTrue(all(y < 30 for _x, y in diff))
+
+
+# -- Item 8: rendering bounds -------------------------------------------------
+class RenderBoundsTests(unittest.TestCase):
+    def test_compact_rolls_over_units(self):
+        self.assertEqual(compact(999_999), '1M')
+        self.assertEqual(compact(999_999_999), '1B')
+        self.assertEqual(compact(999_499), '999.5K')
+        self.assertEqual(compact(999), '999')
+        self.assertEqual(compact(1_280_000), '1.28M')
+        self.assertEqual(compact(182_600_000), '182.6M')
+        self.assertEqual(compact(-5), '0')
+        self.assertEqual(compact(float('nan')), '--')
+        self.assertEqual(compact(True), '--')
+
+    def test_percent_format(self):
+        self.assertEqual(percent(38), '38%')
+        self.assertEqual(percent(.5), '0.5%')
+        self.assertEqual(percent(99.96), '100%')
+        self.assertEqual(percent(150.25), '150%')
+        self.assertEqual(percent(12345), '999+%')
+        self.assertEqual(percent(None), '--')
+
+    def test_large_usage_never_touches_bar(self):
+        for used in (100, 150.25, 999, 12345, 99.95):
+            rows = parse_claude({}) + parse_codex({})
+            rows[0]['used'] = used
+            screen = render(dict(rows=rows, as_of=1789870000, stale=False))
+            # Columns between the bar outline (x<=201) and the percent box (x>=205).
+            gap = [screen.getpixel((x, y)) for x in range(202, 205) for y in range(15, 40)]
+            self.assertTrue(all(gap), used)
+
+    def test_long_firmware_and_plan_stay_in_boxes(self):
+        rows = parse_claude({}, 'ENTERPRISE WITH A VERY LONG PLAN NAME 日本語') + parse_codex({})
+        device = {'firmware': '2026.12.4294967295-' + 'x' * 200 + '‮\x00'}
+        screen = render(dict(rows=rows, as_of=1789870000, stale=False, device=device))
+        # Header is black; firmware text (white) must end before "BT" at x=90.
+        self.assertTrue(all(screen.getpixel((x, y)) == 0 for x in range(87, 90) for y in range(0, 12)))
+        # The plan label ends before the bar at x=80.
+        self.assertTrue(all(screen.getpixel((x, y)) for x in range(77, 80) for y in range(28, 40)))
+
+    def test_printable_and_fit(self):
+        self.assertEqual(printable('MAX 20×\x00日本'), 'MAX 20×')
+        draw = ImageDraw.Draw(Image.new('1', (10, 10)))
+        text, face = fit(draw, 'W' * 50, 40, (9, 8))
+        self.assertLessEqual(draw.textlength(text, font=face), 40)
+        self.assertTrue(text.endswith('…'))
+
+    def test_display_time_is_next_minute_and_render_leads_it(self):
+        self.assertEqual(display_time(120.0), 180)
+        self.assertEqual(display_time(179.9), 180)
+        self.assertEqual(next_render(100, 60), 105)
+        self.assertEqual(next_render(118, 60), 165)
+        self.assertEqual(next_render(100, 300), 285)
+
+
+# -- Items 1 and 9: app wiring -----------------------------------------------
+class FakeRadio:
+    instances = []
+
+    def __init__(self, state_dir):
+        self.events = queue.Queue()
+        self.ready = threading.Event()
+        self.ready.set()
+        self.startup_error = None
+        self.health = 'ok'
+        self.sent, self.forgot, self.closed = [], 0, False
+        FakeRadio.instances.append(self)
+
+    def poll(self, timeout=0):
+        try:
+            return self.events.get_nowait()
+        except queue.Empty:
+            return None
+
+    def send(self, frame):
+        self.sent.append(frame)
+
+    def forget(self):
+        self.forgot += 1
+        self.events.put({'event': 'forgotten'})
+
+    def close(self):
+        self.closed = True
+
+    def update_notice(self, code):
+        pass
+
+
+class AppWiringTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        FakeRadio.instances = []
+        self.app = Application(self.tmp.name, bluetooth_factory=FakeRadio)
+        self.app.provider = Mock()
+        self.app.updates = Mock()
+        self.app.updates.lock = threading.Lock()
+        self.app.radio = self.app._new_radio()
+
+    def status(self, trusted, **status):
+        return {'event': 'status', 'device_id': 'AA', 'trusted': trusted,
+                'status': {'protocol': 4, 'firmware': '2026.9.1', **status}}
+
+    def test_untrusted_status_is_ignored_for_device_updates_and_disk(self):
+        self.app.radio.events.put(self.status(False, interval=300))
+        events = self.app.pump()
+        self.assertEqual(self.app.device, {})
+        self.app.updates.set_device.assert_not_called()
+        self.assertFalse((Path(self.tmp.name) / 'bluetooth.json').exists())
+        self.assertEqual(events[0]['event'], 'status')
+
+    def test_trusted_status_is_saved_and_merged(self):
+        path = Path(self.tmp.name) / 'bluetooth.json'
+        path.write_text(json.dumps({'device_id': 'AA', 'pairing': 'kept'}))
+        self.app.radio.events.put(self.status(True, interval=300))
+        self.app.pump()
+        self.assertEqual(self.app.device['interval'], 300)
+        self.app.updates.set_device.assert_called_once()
+        saved = json.loads(path.read_text())
+        self.assertEqual(saved['pairing'], 'kept')
+        self.assertEqual(saved['status']['interval'], 300)
+
+    def test_forget_clears_device(self):
+        self.app.device = {'firmware': 'x'}
+        self.app.forget_meter()
+        self.app.pump()
+        self.assertEqual(self.app.radio.forgot, 1)
+        self.assertEqual(self.app.device, {})
+        self.app.updates.set_device.assert_called_with({}, False)
+
+    def test_unexpected_exit_restarts_a_bounded_number_of_times(self):
+        self.app.last_frame = b'\0' * 4000
+        shown = []
+        for attempt in range(BLUETOOTH_RESTARTS):
+            self.app.radio.events.put({'event': 'exit'})
+            shown += self.app.pump()
+            self.assertIsNone(self.app.radio)
+            self.app.restart_at = 0
+            shown += self.app.pump()
+            self.assertIs(self.app.updates.radio, self.app.radio)
+            self.assertEqual(self.app.radio.sent, [b'\0' * 4000])
+        self.app.radio.events.put({'event': 'exit'})
+        shown += self.app.pump()
+        kinds = [event['event'] for event in shown]
+        self.assertEqual(kinds.count('bluetooth_restarted'), BLUETOOTH_RESTARTS)
+        self.assertEqual(kinds[-1], 'exit')
+        self.assertEqual(len(FakeRadio.instances), BLUETOOTH_RESTARTS + 1)
+        self.assertTrue(all(radio.closed for radio in FakeRadio.instances))
+
+    def test_exit_during_shutdown_is_passed_through(self):
+        self.app.closing = True
+        self.app.radio.events.put({'event': 'exit'})
+        self.assertEqual([e['event'] for e in self.app.pump()], ['exit'])
+        self.assertEqual(len(FakeRadio.instances), 1)
+
+    def test_repeated_errors_are_logged_once_then_counted(self):
+        with self.assertLogs(level='INFO') as logs:
+            for _ in range(20):
+                self.app.radio.events.put({'event': 'error', 'code': 'scan', 'error': 'Meter not found'})
+                self.app.pump()
+            self.app.radio.events.put({'event': 'connected', 'device_id': 'AA'})
+            self.app.pump()
+        joined = '\n'.join(logs.output)
+        self.assertEqual(joined.count('Meter not found'), 2)  # First, then the summary.
+        self.assertIn('repeated 19 more times', joined)
+
+    def test_log_limiter_summarises_long_runs(self):
+        clock = iter(range(0, 10_000, 100)).__next__
+        limiter = LogLimiter(clock=clock, summary_after=600)
+        with self.assertLogs(level='INFO') as logs:
+            for _ in range(20):
+                limiter.log(logging.WARNING, 'same')
+        self.assertLess(len(logs.output), 6)
+
+
+# -- Items 1 and 10: GUI texts ------------------------------------------------
+class GuiTextTests(unittest.TestCase):
+    def test_bluetooth_help_is_os_specific(self):
+        for state in ('off', 'unauthorized', 'error'):
+            texts = {bluetooth_help(state, platform) for platform in ('darwin', 'win32', 'linux')}
+            self.assertEqual(len(texts), 3)
+        self.assertIn('Privacy & Security', bluetooth_help('unauthorized', 'darwin'))
+        self.assertIn('Bluetooth & devices', bluetooth_help('off', 'win32'))
+        self.assertEqual(bluetooth_help('ok', 'darwin'), '')
+        self.assertEqual(bluetooth_help('weird', 'linux'), BLUETOOTH_HELP['error']['linux'])
+
+    def test_plain_hides_exception_names(self):
+        self.assertEqual(plain('Bluetooth: BleakError', 'fallback'), 'fallback')
+        self.assertEqual(plain('Update check failed: ValueError', 'fallback'), 'fallback')
+        self.assertEqual(plain('Meter is out of range.'), 'Meter is out of range.')
+
+    def test_selection_reasons(self):
+        heading, text = selection_text('other_computer', 'Studio')
+        self.assertIn('another computer', heading)
+        self.assertIn('Studio', text)
+        self.assertIn('this computer', selection_text('unpaired', None)[1])
+
+    def test_provider_summary(self):
+        text = provider_summary({'codex': {'error': 'x', 'code': 'not_set_up'},
+                                 'claude': {'error': 'Claude HTTP 503: unavailable', 'code': 'error'}})
+        self.assertIn('Codex: not set up', text)
+        self.assertIn('Claude Code: Claude HTTP 503', text)
+        self.assertEqual(provider_summary({'claude': {'error': None}}), '')
+
+    def test_desktop_events_without_window(self):
+        desktop = Desktop.__new__(Desktop)
+        for name in ('connection', 'setup_heading', 'setup_help', 'provider_status', 'update_status'):
+            setattr(desktop, name, Mock())
+        desktop.progress_window = None
+        desktop.event({'event': 'bluetooth_state', 'state': 'off'})
+        self.assertIn('Bluetooth', desktop.setup_help.set.call_args.args[0])
+        desktop.event({'event': 'selection_required', 'reason': 'other_computer', 'name': 'Mac'})
+        self.assertIn('another computer', desktop.setup_heading.set.call_args.args[0])
+        desktop.event({'event': 'error', 'code': 'x', 'error': 'Bluetooth: TimeoutError'})
+        self.assertNotIn('TimeoutError', desktop.connection.set.call_args.args[0])
+        desktop.event({'event': 'update_error', 'error': 'Update check failed: JSONDecodeError'})
+        self.assertNotIn('JSONDecodeError', desktop.update_status.set.call_args.args[0])
+        desktop.event({'event': 'status', 'trusted': False, 'status': {'protocol': 3}})
+        desktop.update_status.set.assert_called_once()
+
+    def test_poll_survives_a_bad_event(self):
+        desktop = Desktop.__new__(Desktop)
+        desktop.running = True
+        desktop.app = SimpleNamespace(state_dir=Path(tempfile.gettempdir()) / 'no-such-sweetmeter',
+                                      pump=lambda: [{'event': 'registered'}, {'event': 'ack'}])
+        desktop.root = Mock()
+        desktop.event = Mock(side_effect=[KeyError('name'), None])
+        with self.assertLogs(level='ERROR'):
+            desktop.poll()
+        self.assertEqual(desktop.event.call_count, 2)
+        desktop.root.after.assert_called_once()
+
+
+class AccountSwitchTests(unittest.TestCase):
+    def test_changed_account_drops_cache_and_polls_immediately(self):
+        read = Mock(return_value=parse_codex({'rateLimits': {'planType': 'pro'}}))
+        cache = refresh({}, 1000, {'codex': read}, relaxed={'codex': 900}, accounts={'codex': 'id:a'})
+        entry = cache['providers']['codex']
+        self.assertEqual((entry['account'], entry['account_since']), ('id:a', 0))
+        # Same account inside the idle cadence: not polled.
+        refresh(cache, 1100, {'codex': read}, relaxed={'codex': 900}, accounts={'codex': 'id:a'})
+        self.assertEqual(read.call_count, 1)
+
+        def limited():
+            raise RateLimited('Codex HTTP 429')
+        read.side_effect = None
+        cache = refresh(cache, 1200, {'codex': read}, force=True, accounts={'codex': 'id:a'})
+        cache['providers']['codex'].update(error='Codex HTTP 429', error_code='rate_limited', next_poll=5000)
+        new = Mock(return_value=parse_codex({'rateLimits': {'planType': 'plus'}}))
+        cache = refresh(cache, 1300, {'codex': new}, relaxed={'codex': 900}, accounts={'codex': 'id:b'})
+        entry = cache['providers']['codex']
+        new.assert_called_once()  # Backoff and idle cadence belonged to the old account.
+        self.assertEqual(entry['rows'][0]['subscription_label'], 'PLUS')
+        self.assertIsNone(entry['error'])
+        self.assertEqual((entry['account'], entry['account_since']), ('id:b', 1300))
+
+    def test_switch_discards_rows_even_when_the_new_poll_fails(self):
+        cache = refresh({}, 1000, {'claude': lambda: parse_claude({'five_hour': {'utilization': 90}}, 'MAX')},
+                        accounts={'claude': 'id:a'})
+        def offline():
+            raise ProviderError("Can't reach Claude.")
+        cache = refresh(cache, 1060, {'claude': offline}, accounts={'claude': 'id:b'})
+        entry = cache['providers']['claude']
+        self.assertNotIn('rows', entry)
+        self.assertEqual(entry['account'], 'id:b')
+        snapshot = display_snapshot(cache, None, set(), 1100)
+        self.assertTrue(all(row['used'] is None and row['subscription_label'] == '--'
+                            for row in snapshot['rows'][:3]))
+
+    def test_unknown_identity_and_token_rotation(self):
+        read = Mock(return_value=parse_claude({}))
+        cache = refresh({}, 1000, {'claude': read}, accounts={'claude': 'token:1'})
+        refresh(cache, 1010, {'claude': read}, accounts={'claude': None})
+        self.assertEqual(read.call_count, 1)  # Unknown identity is not a switch.
+        cache = refresh(cache, 1020, {'claude': read}, accounts={'claude': 'token:2'})
+        self.assertEqual(read.call_count, 2)  # Quota is re-read...
+        self.assertEqual(cache['providers']['claude']['account_since'], 0)  # ...tokens not cut.
+
+    def test_tokens_count_from_the_switch(self):
+        now = 100_000
+        rows = parse_claude({'five_hour': {'utilization': 5, 'resets_at': now + 3600}})
+        cache = {'providers': {'claude': {'rows': rows, 'fetched_at': now, 'next_poll': now + 60,
+                                          'account': 'id:b', 'account_since': now - 600}}}
+        starts = []
+        display_snapshot(cache, None, {'claude'}, now,
+                         totals=lambda name, start, end, fable=False: starts.append(start) or 0)
+        self.assertEqual(starts[0], now - 600)  # Not the window start (now - 14400).
+
+    def test_fingerprints_are_salted_and_contain_no_ids_or_tokens(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / '.claude.json').write_text(json.dumps({'oauthAccount': {
+                'accountUuid': 'acct-123', 'organizationUuid': 'org-9', 'emailAddress': 'a@example.invalid'}}))
+            codex = home / '.codex'
+            codex.mkdir()
+            (codex / 'auth.json').write_text(json.dumps({'tokens': {
+                'account_id': 'chatgpt-acct', 'refresh_token': 'synthetic-refresh'}}))
+            with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home', return_value=home):
+                first = providers.account_fingerprints(b'a' * 32)
+                self.assertEqual(first, providers.account_fingerprints(b'a' * 32))
+                self.assertNotEqual(first, providers.account_fingerprints(b'b' * 32))
+                blob = json.dumps(first)
+                for secret in ('acct-123', 'org-9', 'chatgpt-acct', 'synthetic-refresh', 'example'):
+                    self.assertNotIn(secret, blob)
+                (home / '.claude.json').write_text(json.dumps({'oauthAccount': {
+                    'accountUuid': 'acct-456', 'organizationUuid': 'org-9'}}))
+                (codex / 'auth.json').unlink()
+                second = providers.account_fingerprints(b'a' * 32)
+                self.assertNotEqual(first['claude'], second['claude'])
+                self.assertEqual(second['codex'], 'signed-out')
+
+    def test_worker_persists_salt_privately(self):
+        from meter.app import account_salt
+        with tempfile.TemporaryDirectory() as folder:
+            salt = account_salt(folder)
+            self.assertEqual(salt, account_salt(folder))
+            if os.name == 'posix':
+                self.assertEqual((Path(folder) / 'account-salt').stat().st_mode & 0o077, 0)
+
+
+class MultiComputerTests(AppWiringTests):
+    def test_other_meter_status_is_not_reused_on_connect(self):
+        self.app.radio.events.put(self.status(True, interval=300))
+        self.app.pump()
+        self.app.radio.events.put({'event': 'connected', 'device_id': 'BB'})
+        self.app.pump()
+        self.assertEqual(self.app.device, {})
+        self.app.updates.set_device.assert_called_with({}, True, 'BB')
+        self.app.provider.redraw.set.assert_called()
+
+    def test_reconnect_to_same_meter_redraws_current_dashboard(self):
+        self.app.radio.events.put(self.status(True))
+        self.app.radio.events.put({'event': 'connected', 'device_id': 'AA'})
+        self.app.radio.events.put({'event': 'disconnected'})
+        self.app.radio.events.put({'event': 'connected', 'device_id': 'AA'})
+        self.app.pump()
+        self.assertEqual(self.app.device['firmware'], '2026.9.1')
+        self.assertEqual(self.app.provider.redraw.set.call_count, 2)
+
+    def test_update_success_needs_ack_from_updated_meter(self):
+        self.app.radio.events.put(self.status(True))
+        self.app.pump()
+        self.app.events.put({'event': 'firmware_verified', 'version': '2026.9.2'})
+        self.app.pump()
+        self.app.radio.events.put({'event': 'connected', 'device_id': 'BB'})
+        self.app.radio.events.put({'event': 'ack', 'sequence': 1, 'crc32': '0', 'ack': 'FULL'})
+        self.assertNotIn('update_success', [e['event'] for e in self.app.pump()])
+        self.app.radio.events.put({'event': 'connected', 'device_id': 'AA'})
+        self.app.radio.events.put({'event': 'ack', 'sequence': 2, 'crc32': '0', 'ack': 'FULL'})
+        self.assertIn('update_success', [e['event'] for e in self.app.pump()])
+
+
+if __name__ == '__main__':
+    unittest.main()

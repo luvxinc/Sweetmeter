@@ -45,15 +45,15 @@ struct Fixture {
  }
 };
 static void parserTests() {
- Metadata m;assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,"release-1",m)==OtaError::Ok);
+ Metadata m;assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Ok);
  assert(m.size==512 && m.version.sequence==2);
  assert(strictSignature(protocol4_fixture_signature,sizeof(protocol4_fixture_signature)));
  uint8_t bad[234];memcpy(bad,protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope));
- bad[15]=1;assert(parseEnvelope(bad,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,"release-1",m)==OtaError::Metadata);
+ bad[15]=1;assert(parseEnvelope(bad,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Metadata);
  memcpy(bad,protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope));bad[60]=1;
- assert(parseEnvelope(bad,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,"release-1",m)==OtaError::Board);
- assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,2},{2026,9,1},0x330000,"release-1",m)==OtaError::Version);
- assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,8,100},0x330000,"release-1",m)==OtaError::Companion);
+ assert(parseEnvelope(bad,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Board);
+ assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,2},{2026,9,1},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Version);
+ assert(parseEnvelope(protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,8,100},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Companion);
  assert(compare({2026,10,1},{2026,9,999})>0);assert(compare({2027,1,1},{2026,12,999})>0);
  assert(!strictSignature((const uint8_t*)"12345678",8));
  const uint8_t nonminimal[]={0x30,7,2,2,0,1,2,1,1};assert(!strictSignature(nonminimal,sizeof(nonminimal)));
@@ -111,15 +111,56 @@ static void radioTests() {
  assert(radio.update(true,true)==RadioChange::Fast);
 }
 static void discoveryTests() {
- Discovery d;const char *id="7a1e1000-ff1b-4d9f-a023-0123456789ab";
- d.begin(100,123,"","");uint8_t body[40];memcpy(body,id,36);body[36]=3;memcpy(body+37,"Mac",3);
- uint8_t begin[11]={'J'};put32(begin+1,456);put32(begin+5,123);begin[9]=40;uint32_t sid,next;
- assert(d.handle(begin,11,100,sid,next)==0 && next==0);
- for(size_t at=0;at<40;) {uint8_t p[20]={'j'};put32(p+1,456);put32(p+5,at);size_t n=40-at;if(n>11)n=11;memcpy(p+9,body+at,n);assert(d.handle(p,n+9,101,sid,next)==0);at+=n;}
- uint8_t commit[5]={'K'};put32(commit+1,456);assert(d.handle(commit,5,102,sid,next)==0 && next==40 && d.count==1 && !strcmp(d.computers[0].id,id));
+ Discovery d;const char *id="7a1e1000-ff1b-4d9f-a023-0123456789ab";const uint8_t peer[6]={1,2,3,4,5,6};
+ Registry none;
+ uint8_t secret[32];for(int i=0;i<32;++i)secret[i]=uint8_t(i+1);
+ d.begin(100,123,none);uint8_t body[72];memcpy(body,id,36);body[36]=3;memcpy(body+37,"Mac",3);memcpy(body+40,secret,32);
+ uint8_t begin[11]={'J'};put32(begin+1,456);put32(begin+5,123);begin[9]=72;uint32_t sid,next;
+ auto registerBody=[&](Discovery &target,uint32_t session,const uint8_t *bytes,size_t size,uint32_t now,const uint8_t *from)->uint8_t {
+  uint8_t b[11]={'J'};put32(b+1,session);put32(b+5,target.nonce);b[9]=uint8_t(size);
+  uint8_t r=target.handle(b,11,now,sid,next,from);if(r)return r;
+  for(size_t at=0;at<size;) {uint8_t p[20]={'j'};put32(p+1,session);put32(p+5,at);size_t n=size-at;if(n>11)n=11;memcpy(p+9,bytes+at,n);r=target.handle(p,n+9,now,sid,next,from);if(r)return r;at+=n;}
+  uint8_t k[5]={'K'};put32(k+1,session);return target.handle(k,5,now,sid,next,from);
+ };
+ assert(d.handle(begin,11,100,sid,next,peer)==0 && next==0);
+ for(size_t at=0;at<72;) {uint8_t p[20]={'j'};put32(p+1,456);put32(p+5,at);size_t n=72-at;if(n>11)n=11;memcpy(p+9,body+at,n);assert(d.handle(p,n+9,101,sid,next,peer)==0);at+=n;}
+ uint8_t commit[5]={'K'};put32(commit+1,456);assert(d.handle(commit,5,102,sid,next,peer)==0 && next==72 && d.count==1 && !strcmp(d.computers[0].id,id));
+ assert(d.computers[0].hasSecret && !memcmp(d.computers[0].secret,secret,32));
+ // Old 38..57-byte bodies without a secret are refused.
+ begin[9]=40;assert(d.handle(begin,11,103,sid,next,peer)==RegMalformed);
+ // Same secret re-registration updates; a second secret for one ID is a conflict.
+ assert(registerBody(d,500,body,72,104,peer)==RegOk && d.count==1);
+ const uint8_t other[6]={9,9,9,9,9,9};uint8_t forged[72];memcpy(forged,body,72);forged[71]^=0x55;
+ assert(registerBody(d,501,forged,72,105,other)==RegConflict && d.computers[0].conflict && !d.selectable(0));
+ assert(!memcmp(d.computers[0].secret,secret,32));
+ // A zero secret is malformed.
+ uint8_t zero[72];memcpy(zero,body,40);memset(zero+40,0,32);zero[35]='c';
+ assert(registerBody(d,502,zero,72,106,other)==RegMalformed);
+ // One sender cannot fill the list.
+ Discovery s;s.begin(0,9,none);
+ for(int i=0;i<3;++i){uint8_t b[72];memcpy(b,body,72);b[35]=uint8_t('0'+i);assert(registerBody(s,600+i,b,72,1,peer)==(i<2?RegOk:RegRateLimited));}
+ assert(s.count==2);
  assert(d.remaining(60100)==0);d.tick(60100);assert(!d.open);
- d.begin(10,7,id,"Mac");assert(d.count==1);put32(begin+5,7);assert(d.handle(begin,11,10,sid,next)==0);d.tick(5010);assert(d.handle(commit,5,5011,sid,next)==3);
+ // Paired computers are listed first (selected, then most recent) with their
+ // stored secrets; a paired computer that re-registers replaces its secret once.
+ Registry paired;uint8_t stored[32];memset(stored,7,32);
+ int mac=paired.add(id,"Mac",stored,true);int pc=paired.add("7a1e1000-ff1b-4d9f-a023-00000000000a","Office",stored,true);
+ paired.add("7a1e1000-ff1b-4d9f-a023-00000000000b","Old",stored,true);paired.select(mac);paired.select(pc);paired.select(mac);
+ d.begin(10,7,paired);assert(d.count==3 && d.computers[0].paired==mac && !strcmp(d.computers[1].name,"Office") && !strcmp(d.computers[2].name,"Old"));
+ assert(d.computers[0].hasSecret && d.computers[0].secret[0]==7 && !d.computers[0].registered);
+ assert(registerBody(d,700,body,72,11,peer)==RegOk && d.count==3 && !memcmp(d.computers[0].secret,secret,32) && d.computers[0].registered);
+ // Removing a registry entry renumbers later rows.
+ d.removeAt(1,true);assert(d.count==2 && d.computers[1].paired==1 && !strcmp(d.computers[1].name,"Old"));
+ put32(begin+1,456);put32(begin+5,7);begin[9]=72;assert(d.handle(begin,11,10,sid,next,peer)==0);d.tick(5020);assert(d.handle(commit,5,5021,sid,next,peer)==RegSession);
  assert(!hostId((const uint8_t*)"7a1e1000-ff1b-4d9f-a023-0123456789aZ",36));
  DisconnectSleep sleep;sleep.freshGrace(1);assert(!sleep.counting());sleep.targetConnected();sleep.freshGrace(500);assert(!sleep.expired(30499));assert(sleep.expired(30500));
 }
-int main() { parserTests();otaTests();bootTests();radioTests();discoveryTests();puts("OTA firmware state, failure, discovery and rollback tests passed"); }
+static void keyTableTests() {
+ // The header's key ID selects its own embedded public key.
+ uint8_t envelope[234];memcpy(envelope,protocol4_fixture_envelope,sizeof(protocol4_fixture_envelope));
+ Metadata m;assert(parseEnvelope(envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Ok && m.keyIndex==0);
+ envelope[132]='2';assert(parseEnvelope(envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Ok && m.keyIndex==1);
+ envelope[132]='3';assert(parseEnvelope(envelope,sizeof(protocol4_fixture_envelope),{2026,9,1},{2026,9,1},0x330000,SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,m)==OtaError::Signature);
+ { Fixture f;f.metadata();f.op('S');assert(f.manager.status.state==OtaState::Image && fake::parsedKey==(const unsigned char*)SWEETMETER_TRUSTED_KEY_PEMS[0]); }
+}
+int main() { parserTests();otaTests();bootTests();radioTests();discoveryTests();keyTableTests();puts("OTA firmware state, failure, discovery and rollback tests passed"); }

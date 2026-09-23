@@ -78,13 +78,14 @@ def main():
                 serial_lines = [event['value'] for event in evidence['events'][first_event:]
                                 if event['kind'] == 'serial']
                 if (any('panic\'ed' in line or 'Guru Meditation' in line for line in serial_lines) or
-                        sum('READY QM' in line for line in serial_lines) > 1):
+                        sum(('READY QM' in line or 'READY SWEETMETER' in line) for line in serial_lines) > 1):
                     result = {'cycle': cycle + 1, 'pass': False,
                               'reason': 'Panic or unexpected second boot during recovery'}
                     break
                 if (status.get('seen_at', 0) > started and
                         device.get('clock_synced') and
-                        device.get('selected_host') == expected_host and
+                        (device.get('selected') is True if device.get('auth') == 1
+                         else device.get('selected_host') == expected_host) and
                         device.get('uptime_ms', 9999999) < (time.time() - started + 3) * 1000 and
                         ack.get('received_at', 0) > started):
                     result = {'cycle': cycle + 1, 'pass': True,

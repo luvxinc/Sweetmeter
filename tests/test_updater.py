@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
@@ -44,6 +45,10 @@ class Feed:
 class UpdateTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.state=Path(self.temp.name)
+        home=self.state/'home'
+        sandbox=patch.dict(os.environ,HOME=str(home),USERPROFILE=str(home),XDG_DATA_HOME=str(home/'data'),
+                           LOCALAPPDATA=str(home/'local'),APPDATA=str(home/'roaming'))
+        sandbox.start(); self.addCleanup(sandbox.stop)
         self.events=[]; self.feed=Feed(); self.radio=Mock()
         self.service=UpdateService(self.state,self.radio,self.events.append,downloader=self.feed,
                                    version='2026.9.1',trusted_keys=TEST_TRUST)
@@ -168,6 +173,57 @@ class UpdateTests(unittest.TestCase):
         self.service.state['retry_at']=time.time()+60
         self.service.check_now(manual=True)
         self.assertFalse(self.feed.calls)
+    def test_repeated_rocker_holds_reuse_a_fresh_manifest(self):
+        self.service.set_device({**self.service.device,'firmware':'2026.9.2'},True,'device-one')
+        for _ in range(3): self.device_update()
+        self.assertEqual(len(self.feed.calls),3)  # One GitHub check: API + manifest + signature.
+        self.assertEqual([c.args[0] for c in self.radio.update_notice.call_args_list],[2,2,2])
+        self.service.checked_monotonic-=61
+        self.device_update()
+        self.assertEqual(len(self.feed.calls),6)
+    def test_rocker_hold_respects_skipped_companion(self):
+        self.check(); self.service.decide(self.service.offers['companion'],'skip')
+        self.service.checked_monotonic=None; self.events.clear()
+        self.device_update()
+        self.radio.install_firmware.assert_called_once()
+        self.assertFalse(any(e['event']=='update_offer' for e in self.events))
+    def test_rocker_hold_respects_companion_later(self):
+        self.check(); self.service.decide(self.service.offers['companion'],'later')
+        self.events.clear(); self.device_update()
+        self.assertFalse(any(e['event']=='update_offer' for e in self.events))
+    def test_windows_arm64_falls_back_to_x64_package(self):
+        self.feed.manifest['artifacts'][1].update(os='windows',arch='x86_64',asset='Sweetmeter-windows-x86_64.zip',
+            url='https://github.com/luvxinc/Sweetmeter/releases/download/2026.9.2/Sweetmeter-windows-x86_64.zip')
+        with patch('meter.updater.platform_id',return_value=('windows','arm64')): self.service.check_now()
+        self.assertEqual(self.service.offers['companion'].artifact['arch'],'x86_64')
+        with patch('meter.updater.platform_id',return_value=('linux','arm64')): self.service.check_now()
+        self.assertNotIn('companion',self.service.offers)
+    def test_cleanup_removes_finished_downloads_but_not_in_use(self):
+        old=self.state/'downloads/update-old'; old.mkdir(parents=True)
+        staging=self.state/'updates/companion-old'; staging.mkdir(parents=True)
+        manual=self.state/'updates/companion-manual'; manual.mkdir(parents=True)
+        self.service.state['manual_staging']=str(manual)
+        with patch('meter.self_update.data_dir',return_value=self.state):
+            self.service.busy=True; self.service.cleanup()
+            self.assertTrue(old.exists())
+            self.service.busy=False; self.service.cleanup()
+        self.assertFalse(old.exists()); self.assertFalse(staging.exists()); self.assertTrue(manual.exists())
+    def test_rollback_result_is_shown_once_and_clears_pending(self):
+        self.service.state['pending']={'kind':'companion','target':'2026.9.2'}
+        (self.state/'companion-update-result.json').write_text(json.dumps(
+            {'status':'rollback','version':'2026.9.2','reason':'Bluetooth permission is not available'}))
+        self.service.report_companion_result()
+        self.assertIn('Bluetooth permission',self.events[-1]['error'])
+        self.assertNotIn('pending',self.service.state)
+        self.events.clear(); self.service.report_companion_result()
+        self.assertFalse(self.events)
+    def test_state_is_saved_durably_and_atomically(self):
+        from meter.updater import save_json
+        with patch('meter.updater.os.fsync') as fsync:
+            save_json(self.state/'x.json',{'a':1},durable=True)
+        self.assertTrue(fsync.called)
+        self.assertEqual(json.loads((self.state/'x.json').read_text()),{'a':1})
+        self.assertEqual(sorted(p.name for p in self.state.iterdir() if p.name.startswith('.')),[])
 
 class Response:
     def __init__(self,status=200,data=b'x',headers=None):

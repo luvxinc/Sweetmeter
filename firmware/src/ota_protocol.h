@@ -60,11 +60,12 @@ inline bool strictSignature(const uint8_t *p,size_t n) {
   }
   return at==n;
 }
-struct Metadata { Version version{}, minimumCompanion{}; uint32_t size=0; uint8_t digest[32]{}; };
+struct Metadata { Version version{}, minimumCompanion{}; uint32_t size=0; uint8_t digest[32]{}; size_t keyIndex=0; };
 // Only structural checks here. Signature verification precedes erase in OtaManager.
+// `keyIds` is the compiled-in trusted key table; the header selects one entry.
 inline OtaError parseEnvelope(const uint8_t *p, size_t n, const Version &running,
                              const Version &companion, uint32_t capacity,
-                             const char *keyId, Metadata &out) {
+                             const char *const *keyIds, size_t keyCount, Metadata &out) {
   static const uint8_t magic[8] = {'S','W','M','O','T','A','4',0};
   if(n<170 || n>maxEnvelope || memcmp(p,magic,8) || u16(p+8)!=1 ||
      u16(p+10)!=headerSize || u16(p+14) || !zeroes(p+140,20)) return OtaError::Metadata;
@@ -72,7 +73,9 @@ inline OtaError parseEnvelope(const uint8_t *p, size_t n, const Version &running
   if(signature<8 || signature>72 || n!=size_t(162)+signature) return OtaError::Metadata;
   if(u16(p+12)!=protocol) return OtaError::Protocol;
   if(!padded(p+16,48,boardId)) return OtaError::Board;
-  if(!padded(p+124,16,keyId)) return OtaError::Signature;
+  out.keyIndex=keyCount;
+  for(size_t i=0;i<keyCount;++i) if(padded(p+124,16,keyIds[i])) { out.keyIndex=i; break; }
+  if(out.keyIndex==keyCount) return OtaError::Signature;
   out.version=versionAt(p+64); out.minimumCompanion=versionAt(p+76); out.size=u32(p+88);
   memcpy(out.digest,p+92,32);
   if(!validVersion(out.version) || compare(out.version,running)<=0) return OtaError::Version;

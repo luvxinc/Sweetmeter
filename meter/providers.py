@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import hashlib
 import math
 import os
@@ -19,6 +20,40 @@ from pathlib import Path
 import requests
 
 from .version import get_version
+
+# A forced refresh (Refresh button / meter button) is honoured immediately,
+# except during a server rate-limit backoff and when pressed repeatedly.
+FORCE_FLOOR = 10
+# Default error backoff, and the bounded range accepted from Retry-After.
+ERROR_BACKOFF = 300
+RATE_LIMIT_BACKOFF = 900
+
+
+class ProviderError(RuntimeError):
+    """A sanitized adapter error whose text is safe to show a user.
+
+    Messages are fixed strings written here; they never contain credentials,
+    HTTP bodies or exception text from third-party libraries.
+    """
+    code = "error"
+
+    def __init__(self, message, *, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class NotSetUp(ProviderError):
+    """The provider is not installed or not signed in. This is an absent
+    provider, not stale data: its rows are cleared rather than flagged."""
+    code = "not_set_up"
+
+
+class SignInExpired(ProviderError):
+    code = "signed_out"
+
+
+class RateLimited(ProviderError):
+    code = "rate_limited"
 
 
 def epoch(value):
@@ -52,7 +87,8 @@ def parse_claude(data, subscription_label="--"):
     rows = []
     for key, label, duration in [("five_hour", "CLAUDE 5H", 18000),
                                  ("seven_day", "CLAUDE 7D", 604800)]:
-        obj = data.get(key) or {}
+        obj = data.get(key)
+        obj = obj if isinstance(obj, dict) else {}
         rows.append(window(key, label, duration, obj.get("utilization"), obj.get("resets_at")))
     # Claude Code /usage selects kind=weekly_scoped and scope.model.display_name.
     # Do not infer Fable from an opaque top-level flag or the aggregate weekly %.
@@ -69,6 +105,7 @@ def parse_claude(data, subscription_label="--"):
 def parse_codex(data):
     buckets = data.get("rateLimitsByLimitId")
     obj = (buckets.get("codex") if isinstance(buckets, dict) else None) or data.get("rateLimits") or {}
+    obj = obj if isinstance(obj, dict) else {}
     # Some accounts expose the weekly quota as primary, with secondary=null.
     weekly = [obj[k] for k in ("primary", "secondary") if isinstance(obj.get(k), dict)
               and obj[k].get("windowDurationMins") == 10080]
@@ -147,13 +184,15 @@ def claude_credentials():
         except OSError:
             pass
     if credentials is None:
-        raise RuntimeError("Claude login required for the selected profile")
+        raise NotSetUp("Claude Code is not signed in (login required for the selected profile). "
+                       "Open Claude Code and sign in to show its quota.")
     expires = credentials.get("expiresAt")
     if expires is not None:
         if isinstance(expires, bool) or not isinstance(expires, (int, float)) or not math.isfinite(expires):
-            raise RuntimeError("Claude login metadata is invalid; open Claude Code")
+            raise SignInExpired("Claude Code sign-in details look damaged (login metadata is invalid). "
+                                "Open Claude Code and sign in again.")
         if expires <= time.time() * 1000:
-            raise RuntimeError("Claude login expired; open Claude Code")
+            raise SignInExpired("Claude Code sign-in expired. Open Claude Code once to renew it.")
     return credentials
 
 
@@ -161,17 +200,143 @@ def claude_token():
     return claude_credentials()["accessToken"]
 
 
+# --- Account identity -------------------------------------------------------
+# Switching the Claude Code or Codex account must never show the previous
+# account's quota. Each cycle derives a non-secret fingerprint of the signed-in
+# account: a salted SHA-256 of stable account/organization ids. Only if a CLI
+# stores no ids is a salted hash of its long-lived refresh token used. Neither
+# the ids nor any token are stored; only the salted digest is.
+
+_json_cache = {}
+
+
+def _read_json_cached(path):
+    """Parse a small JSON config again only when its size/mtime changes."""
+    try:
+        st = path.stat()
+    except OSError:
+        _json_cache.pop(str(path), None)
+        return None
+    key = (st.st_size, st.st_mtime_ns)
+    cached = _json_cache.get(str(path))
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        value = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        value = None
+    value = value if isinstance(value, dict) else None
+    _json_cache[str(path)] = (key, value)
+    return value
+
+
+def _digest(salt, *parts):
+    material = "\0".join(str(p) for p in parts).encode("utf-8")
+    return hashlib.sha256(salt + b"\0" + material).hexdigest()[:24]
+
+
+def claude_global_config():
+    """Claude Code's global config (holds oauthAccount ids, no secrets)."""
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        candidates = [claude_config_dir() / ".claude.json"]
+    else:
+        candidates = [Path.home() / ".claude.json"]
+    candidates.append(claude_config_dir() / ".config.json")  # Legacy location.
+    for path in candidates:
+        document = _read_json_cached(path)
+        if document is not None:
+            return document
+    return None
+
+
+def claude_account(salt):
+    """Fingerprint of the Claude account in use, or 'signed-out'."""
+    explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if explicit:
+        return "env:" + _digest(salt, "env", explicit)
+    config = claude_global_config() or {}
+    account = config.get("oauthAccount")
+    if isinstance(account, dict) and (account.get("accountUuid") or account.get("organizationUuid")):
+        return "id:" + _digest(salt, "claude", account.get("accountUuid"), account.get("organizationUuid"))
+    try:
+        credentials = claude_credentials()
+    except ProviderError:
+        return "signed-out"
+    secret = credentials.get("refreshToken") or credentials.get("accessToken")
+    return "token:" + _digest(salt, "claude-token", secret)
+
+
+def codex_account(salt):
+    """Fingerprint of the Codex login, or None when it is not observable
+    (for example credentials kept in the OS keyring)."""
+    auth = _read_json_cached(codex_home() / "auth.json")
+    if auth is None:
+        return None if (codex_home() / "auth.json").exists() else "signed-out"
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+    if tokens.get("account_id"):
+        return "id:" + _digest(salt, "codex", tokens["account_id"])
+    secret = tokens.get("refresh_token") or auth.get("OPENAI_API_KEY")
+    if secret:
+        return "token:" + _digest(salt, "codex-token", secret)
+    return "signed-out"
+
+
+def account_fingerprints(salt):
+    result = {}
+    for name, read in (("claude", claude_account), ("codex", codex_account)):
+        try:
+            result[name] = read(salt)
+        except Exception:  # Identity is best effort; never break a refresh.
+            result[name] = None
+    return result
+
+
+def user_agent():
+    """Identify honestly as Sweetmeter; never as another client."""
+    return "Sweetmeter/" + get_version()
+
+
+def _retry_after(headers):
+    try:
+        value = float(headers.get("Retry-After", ""))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def fetch_claude():
     credentials = claude_credentials()
-    response = requests.get("https://api.anthropic.com/api/oauth/usage", headers={
-        "Authorization": "Bearer " + credentials["accessToken"],
-        "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.121",
-        "Accept": "application/json"}, timeout=20, allow_redirects=False)
-    if response.status_code != 200:
-        raise RuntimeError(f"Claude HTTP {response.status_code}")
-    data = response.json()
-    if data.get("error"):
-        raise RuntimeError("Claude usage endpoint error")
+    # The token only ever lives in this request's memory; Sweetmeter never
+    # logs, caches or writes it anywhere.
+    try:
+        response = requests.get("https://api.anthropic.com/api/oauth/usage", headers={
+            "Authorization": "Bearer " + credentials["accessToken"],
+            "anthropic-beta": "oauth-2025-04-20", "User-Agent": user_agent(),
+            "Accept": "application/json"}, timeout=20, allow_redirects=False)
+    except requests.Timeout as error:
+        raise ProviderError("Claude did not answer in time. Retrying automatically.") from error
+    except requests.RequestException as error:
+        raise ProviderError("Can't reach Claude. Check the Internet connection; "
+                            "Sweetmeter retries automatically.") from error
+    try:
+        status = response.status_code
+        if status == 429:
+            raise RateLimited("Claude HTTP 429: Claude asked Sweetmeter to slow down. "
+                              "Retrying in a few minutes.", retry_after=_retry_after(response.headers))
+        if status in (401, 403):
+            raise SignInExpired(f"Claude HTTP {status}: Claude did not accept the saved sign-in. "
+                                "Open Claude Code and sign in again.")
+        if status != 200:
+            raise ProviderError(f"Claude HTTP {status}: Claude's usage service is unavailable. "
+                                "Retrying automatically.")
+        try:
+            data = response.json()
+        except ValueError as error:
+            raise ProviderError("Claude sent an unexpected usage reply. Retrying automatically.") from error
+    finally:
+        response.close()
+    if not isinstance(data, dict) or data.get("error"):
+        raise ProviderError("Claude sent an unexpected usage reply. Retrying automatically.")
     return parse_claude(data, claude_subscription(credentials))
 
 
@@ -237,7 +402,8 @@ def codex_command(binary=None):
         found = shutil.which("codex")
         path = Path(found) if found else next((p for p in _codex_candidates() if p.is_file()), None)
         if path is None:
-            raise RuntimeError("Codex CLI was not found; install it or set SWEETMETER_CODEX_PATH")
+            raise NotSetUp("Codex is not installed on this computer (Codex CLI was not found). "
+                           "Install Codex to show its quota, or ignore this if you don't use it.")
     if sys.platform == "win32" and path.suffix.lower() in {".cmd", ".bat"}:
         command = _npm_codex_command(path)
     elif path.suffix.lower() in {".cmd", ".bat", ".ps1"}:
@@ -276,7 +442,8 @@ def fetch_codex(binary=None):
                                    stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
                                    errors="replace", shell=False, **options)
     except OSError as error:
-        raise RuntimeError("Cannot start Codex CLI; check its executable and installation") from error
+        raise ProviderError("Cannot start Codex. Reinstall or update Codex; "
+                            "Sweetmeter retries automatically.") from error
     incoming = queue.Queue()
 
     def reader():
@@ -309,10 +476,15 @@ def fetch_codex(binary=None):
                 break
             if isinstance(msg, dict) and msg.get("id") == number:
                 if "error" in msg:
-                    raise RuntimeError("Codex account/rateLimits/read failed")
+                    raise ProviderError("Codex could not read its usage limits. Retrying automatically.")
                 result = msg.get("result", {})
                 return result if isinstance(result, dict) else {}
-        raise RuntimeError("Codex app-server timeout")
+        raise ProviderError("Codex did not answer in time. Retrying automatically.")
+
+    def signed_in():
+        """Only the account's presence is inspected; identifiers are discarded."""
+        send({"id": 4, "method": "account/read", "params": {"refreshToken": False}})
+        return isinstance(receive(4, timeout=5).get("account"), dict)
 
     try:
         send({"id": 1, "method": "initialize", "params": {
@@ -321,7 +493,17 @@ def fetch_codex(binary=None):
         receive(1)
         send({"method": "initialized", "params": {}})
         send({"id": 2, "method": "account/rateLimits/read", "params": {}})
-        rows = parse_codex(receive(2))
+        try:
+            rows = parse_codex(receive(2))
+        except ProviderError:
+            try:
+                present = signed_in()
+            except (ProviderError, OSError, ValueError):
+                present = True  # Unknown: report the original, retryable failure.
+            if not present:
+                raise NotSetUp("Codex is installed but not signed in. Run Codex and sign in "
+                               "to show its quota.") from None
+            raise
         if rows[0]["subscription_label"] == "--":
             # Older app-server builds provide planType only through account/read.
             # Keep only the plan label; never retain email/account identifiers.
@@ -342,19 +524,112 @@ def fetch_codex(binary=None):
             process.stdout.close()
 
 
-def refresh(previous, now=None, readers=None, *, force=False, interval=60):
+PROVIDER_NAMES = {"claude": "Claude", "codex": "Codex"}
+
+
+def describe_error(name, error):
+    """Return (code, user-facing message) without exception class names,
+    credentials or third-party response text."""
+    if isinstance(error, ProviderError):
+        return error.code, str(error)
+    title = PROVIDER_NAMES.get(name, str(name).title())
+    if isinstance(error, (requests.Timeout, TimeoutError, subprocess.TimeoutExpired)):
+        return ProviderError.code, f"{title} did not answer in time. Retrying automatically."
+    if isinstance(error, requests.RequestException):
+        return ProviderError.code, f"Can't reach {title}. Check the Internet connection; retrying automatically."
+    if type(error) is RuntimeError:
+        # Legacy adapters raise plain RuntimeError with fixed, sanitized text.
+        text = str(error)[:200]
+        return (RateLimited.code if "429" in text else ProviderError.code), text
+    return ProviderError.code, f"{title} usage could not be read. Retrying automatically."
+
+
+def rate_limited(entry):
+    return entry.get("error_code") == RateLimited.code or "429" in str(entry.get("error") or "")
+
+
+def is_due(entry, now, *, force=False, wake=False, interval=60):
+    """Decide whether a provider should be polled now.
+
+    - ``next_poll`` is the normal schedule (or an error backoff).
+    - A server 429 backoff is always honoured, even for a forced refresh.
+    - A forced refresh bypasses every other wait, including an error backoff,
+      so signing in again and pressing Refresh works immediately; repeated
+      presses within FORCE_FLOOR seconds are coalesced.
+    - ``wake`` shortens a relaxed idle schedule back to ``interval`` when there
+      is evidence the quota changed (new local activity, reset nearby).
+    """
+    next_poll = entry.get("next_poll", 0)
+    if not isinstance(next_poll, (int, float)) or next_poll - now > 2 * 86400:
+        return True  # Damaged cache or the wall clock moved backwards.
+    if now >= next_poll:
+        return True
+    if rate_limited(entry):
+        return False
+    if force:
+        attempted = entry.get("attempted_at", 0)
+        return not isinstance(attempted, (int, float)) or not 0 <= now - attempted < FORCE_FLOOR
+    if wake and not entry.get("error"):
+        fetched = entry.get("fetched_at", 0)
+        return not isinstance(fetched, (int, float)) or now >= fetched + interval
+    return False
+
+
+def switch_account(old, account, now):
+    """Return the entry to use for ``account``. A changed fingerprint drops
+    everything learned for the previous account: rows, plan labels, errors
+    and backoff (so it is polled immediately). ``account_since`` marks when
+    this account's local token counting starts (0 = no known earlier account)."""
+    if account is None or old.get("account") == account:
+        return old
+    previous = old.get("account")
+    known_before = "account" in old
+    if known_before:
+        logging.info("Signed-in account changed; discarding the previous account's cached quota")
+    # Local logs carry no account id, so token counting restarts at a real
+    # switch. A rotated refresh token (token->token, only when a CLI stores no
+    # account ids) cannot be told apart from a switch: its quota is still
+    # re-read, but token counting is not cut short.
+    rotated = str(previous).startswith("token:") and account.startswith("token:")
+    since = old.get("account_since", 0) if rotated else (now if known_before else 0)
+    return {"account": account, "account_since": since}
+
+
+def refresh(previous, now=None, readers=None, *, force=False, interval=60, relaxed=None, wake=(),
+            accounts=None):
+    """Poll due providers. ``relaxed`` maps a provider to a longer idle
+    interval; ``wake`` names providers that should use ``interval`` now;
+    ``accounts`` maps a provider to its current account fingerprint."""
     now = now or time.time()
-    providers = dict(previous.get("providers", {}))
+    relaxed = relaxed or {}
+    accounts = accounts or {}
+    providers = dict(previous.get("providers", {})) if isinstance(previous.get("providers"), dict) else {}
     for name, read in (readers or {"claude": fetch_claude, "codex": fetch_codex}).items():
         old = providers.get(name, {})
-        if now < old.get("next_poll", 0) and (not force or old.get("error")):
+        if not isinstance(old, dict):
+            old = {}
+        old = switch_account(old, accounts.get(name), now)
+        providers[name] = old
+        if not is_due(old, now, force=force, wake=name in wake, interval=interval):
             continue
+        identity = {k: old[k] for k in ("account", "account_since") if k in old}
         try:
             rows = read()
-            providers[name] = {"rows": rows, "fetched_at": now, "next_poll": now + interval, "error": None}
+            providers[name] = {"rows": rows, "fetched_at": now, "attempted_at": now,
+                               "next_poll": now + relaxed.get(name, interval),
+                               "error": None, "error_code": None, **identity}
         except Exception as error:
             # Only bounded, sanitized adapter messages; never log credentials or HTTP bodies.
-            message = str(error) if isinstance(error, RuntimeError) else type(error).__name__
-            delay = 900 if "429" in message else 300
-            providers[name] = {**old, "error": message, "next_poll": now + delay}
+            code, message = describe_error(name, error)
+            delay = ERROR_BACKOFF
+            if code == RateLimited.code:
+                retry = getattr(error, "retry_after", None)
+                delay = min(3600, max(ERROR_BACKOFF, retry)) if retry else RATE_LIMIT_BACKOFF
+            entry = {**old, "error": message, "error_code": code,
+                     "attempted_at": now, "next_poll": now + delay}
+            if code == NotSetUp.code:
+                # Absent, not stale: never keep an old login's quota around.
+                for key in ("rows", "fetched_at"):
+                    entry.pop(key, None)
+            providers[name] = entry
     return {"providers": providers, "updated_at": now}

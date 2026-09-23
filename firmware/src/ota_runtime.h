@@ -248,7 +248,9 @@ class OtaManager {
   bool signatureValid() {
     mbedtls_pk_context key; mbedtls_pk_init(&key); uint8_t digest[32];
     bool ok=strictSignature(envelope_+162,u16(envelope_+160)) && mbedtls_sha256_ret(envelope_,headerSize,digest,0)==0 &&
-      mbedtls_pk_parse_public_key(&key,reinterpret_cast<const unsigned char*>(SWEETMETER_PUBLIC_KEY_PEM),sizeof(SWEETMETER_PUBLIC_KEY_PEM))==0 &&
+      metadata_.keyIndex<SWEETMETER_TRUSTED_KEY_COUNT &&
+      mbedtls_pk_parse_public_key(&key,reinterpret_cast<const unsigned char*>(SWEETMETER_TRUSTED_KEY_PEMS[metadata_.keyIndex]),
+                                  SWEETMETER_TRUSTED_KEY_PEM_SIZES[metadata_.keyIndex])==0 &&
       mbedtls_pk_can_do(&key,MBEDTLS_PK_ECDSA) && mbedtls_pk_ec(key)->grp.id==MBEDTLS_ECP_DP_SECP256R1 &&
       mbedtls_pk_verify(&key,MBEDTLS_MD_SHA256,digest,sizeof(digest),envelope_+162,u16(envelope_+160))==0;
     mbedtls_pk_free(&key); return ok;
@@ -256,7 +258,8 @@ class OtaManager {
   void prepare() {
     partition_=esp_ota_get_next_update_partition(nullptr);
     if(!partition_ || partition_->address==esp_ota_get_running_partition()->address) { terminal(OtaError::Size,'S'); return; }
-    OtaError error=parseEnvelope(envelope_,status.total,runningVersion,companion_,partition_->size,SWEETMETER_TRUSTED_KEY_ID,metadata_);
+    OtaError error=parseEnvelope(envelope_,status.total,runningVersion,companion_,partition_->size,
+                                   SWEETMETER_TRUSTED_KEY_IDS,SWEETMETER_TRUSTED_KEY_COUNT,metadata_);
     if(error!=OtaError::Ok) { terminal(error,'S'); return; }
     if(!signatureValid()) { terminal(OtaError::Signature,'S'); return; }
     status.signature=true;

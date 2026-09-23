@@ -40,8 +40,8 @@ image quality.
 | Display power path | 7 | Low-side panel power control; signal pins float for deep sleep |
 | Indicator LED | 19 | Disabled during normal operation |
 | Top Menu button | 2 | Active low; deep-sleep wake input |
-| Bottom Exit button | 1 | Active low |
-| Rocker up / down / press | 6 / 4 / 5 | Computer selection; hold press 3 s for a firmware check |
+| Bottom Exit button | 1 | Active low; hold 3 s opens the computer menu |
+| Rocker up / down / press | 6 / 4 / 5 | Computer menu; hold press 3 s: firmware check (dashboard) or remove the highlighted computer (menu) |
 | Optional gauge SDA / SCL | 40 / 41 | 3.3 V I²C logic, shared ground |
 
 The display mapping and power handling also follow the board schematic linked
@@ -78,12 +78,39 @@ charge; it does not replace the charging circuit or cell protection.
 Firmware enables gauge-based behavior only after validating the chip version
 and a plausible voltage. A valid level at or below 15% reduces quota polling to
 five minutes; a valid level at or below 5%, or voltage at or below 3.35 V,
-triggers low-battery sleep and a later check. With no valid gauge, no inferred
-percentage controls these decisions.
+triggers low-battery sleep. The gauge is read at the start of every boot, before
+Bluetooth or the panel start: the BATTERY LOW screen is drawn once per discharge
+(and again when the top button wakes the meter), and each 300-second timer wake
+afterwards only measures and sleeps again. Normal start resumes only above 7% and
+3.45 V, so a recovering cell does not bounce between the two states. With no
+valid gauge, no inferred percentage controls these decisions.
 
 **Battery wiring, charge recovery, low-battery behavior and runtime are not
 hardware-validated.** There is no measured 3000 mAh battery-life claim. Deep
 sleep is a software state, not a physical disconnect of every board component.
+
+## Power management
+
+- The ESP32-S3 runs at 80 MHz; the firmware's worker task blocks until a packet,
+  button or connection event instead of polling every millisecond. Buttons are
+  still polled every 10 ms (the tick interrupt runs at 1 kHz regardless).
+- **Automatic light sleep and Bluetooth modem sleep are not enabled.** The pinned
+  Arduino-ESP32 2.0.17 prebuilt ESP-IDF 4.4.7 SDK has `CONFIG_PM_ENABLE` off and
+  `CONFIG_BT_CTRL_SLEEP_MODE_EFF 0`, so neither can be switched on from the
+  sketch; doing so needs a rebuilt SDK (for example an ESP-IDF component build)
+  and hardware validation of BLE timing, button wake and panel power.
+- Deep sleep: 30 s after the selected computer disconnects, 30 minutes without a
+  selected computer connecting (outside the menu and updates), top-button hold,
+  and critical battery. The top button is always armed as the wake source.
+- Deep sleep keeps time on the internal RC oscillator (roughly ±5%). After more
+  than five minutes asleep the clock shows `--:--` until the computer resets it.
+- The Bluedroid bond table holds 15 bonds and silently drops the least recent
+  one when full. The firmware removes stale bonds itself (keeping computers that
+  recently proved a pairing secret) once 12 exist, so a paired computer's bond is
+  not lost to stray phones; see `docs/PROTOCOL.md` section 9.
+
+**None of these power paths, the low-battery flow, bond eviction or the
+authenticated pairing flow has been validated on hardware yet.**
 
 ## First installation and recovery
 
@@ -146,6 +173,10 @@ After replacing legacy QM3 firmware by USB, macOS may retain the old three-
 characteristic GATT cache. Dashboard reads can work while OTA reports a missing
 characteristic. In System Settings → Bluetooth, forget **only the Sweetmeter
 device**, then let the companion reconnect and pair again. This preserves the
-computer selection stored on the meter. Do not erase NVS or reset the Mac's
+computer selection stored on the meter.
+
+Firmware with authenticated pairing keeps the computer that was selected before
+the update: on its first connection that computer stores a pairing secret
+automatically (one-time migration). Other computers pair through the menu. Do not erase NVS or reset the Mac's
 entire Bluetooth configuration. Subsequent protocol-4 updates keep the same
 six-characteristic service. This migration recovery was exercised on one Mac.

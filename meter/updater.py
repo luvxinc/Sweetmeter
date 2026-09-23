@@ -3,8 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import os
-import platform
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -16,22 +16,39 @@ import requests
 from .protocol import (BOARD_ID, MAX_MANIFEST_SIZE, select_artifact, validate_asset_url,
                        validate_download_url, verify_manifest, verify_artifact,
                        verify_envelope, match_firmware_artifact, firmware_image_version)
+from .paths import compatible_platforms, platform_id as host_platform
 from .version import Version, get_version
 
 RELEASE_API = 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest'
 INTERVAL = 6 * 3600
+# A rocker hold, or several, never causes more than one GitHub check per minute.
+DEVICE_CHECK_MAX_AGE = 60
 # Results shown on the meter after its rocker is held (protocol `u` codes).
 NOTICE_CURRENT, NOTICE_INSTALLING, NOTICE_FAILED, NOTICE_COMPANION = 2, 3, 4, 5
 
-def save_json(path, value):
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    temp.replace(path)
+def save_json(path, value, *, durable=False):
+    """Atomic JSON replace; `durable` also survives power loss (update decisions)."""
+    path = Path(path)
+    descriptor, name = tempfile.mkstemp(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+            output.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+            if durable:
+                output.flush()
+                os.fsync(output.fileno())
+        os.replace(name, path)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
+    if durable and os.name != 'nt':
+        folder = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
 
 def platform_id():
-    system = {'Darwin': 'macos', 'Windows': 'windows', 'Linux': 'linux'}.get(platform.system())
-    arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x86_64', 'AMD64': 'x86_64'}.get(platform.machine())
-    return system, arch
+    return host_platform()
 
 class RateLimited(RuntimeError):
     def __init__(self, retry_at):
@@ -175,11 +192,43 @@ class UpdateService:
         self.awaiting_until = None
         self._reconciled = False
         self.prompted = set()
+        self.checked_monotonic = None
+        self.download_dir = None
 
     def start(self):
+        self.report_companion_result()
         self.thread = threading.Thread(target=self._run, name='sweetmeter-updates', daemon=True)
         self.thread.start()
         self.requests.put('automatic')
+
+    def report_companion_result(self):
+        """Show the outcome the update helper recorded (success or rollback reason)."""
+        path = self.state_dir / 'companion-update-result.json'
+        try:
+            if path.stat().st_size > 16384:
+                raise ValueError('Oversized update result')
+            result = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            result = {}
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if not isinstance(result, dict):
+            return
+        version = str(result.get('version', ''))[:20]
+        if result.get('status') == 'rollback':
+            with self.lock:
+                pending = self.state.get('pending')
+                if pending and pending.get('kind') == 'companion':
+                    self.state['failed'] = {**pending, 'outcome': 'rollback'}
+                    self.state.pop('pending', None)
+                    self._save()
+            reason = str(result.get('reason') or 'The updated app did not start correctly.')[:600]
+            self.emit({'event': 'update_error',
+                       'error': 'Companion update ' + version + ' was not kept; this version was restored. ' + reason})
 
     def check(self):
         self.requests.put('check')
@@ -189,9 +238,27 @@ class UpdateService:
         self.requests.put('device')
 
     def _save(self):
-        save_json(self.path, self.state)
+        save_json(self.path, self.state, durable=True)
+
+    def cleanup(self):
+        """Remove finished download/staging folders; keep what an operation still needs."""
+        with self.lock:
+            if self.busy or self.state.get('pending'):
+                return
+            keep = self.state.get('manual_staging')
+        downloads = self.state_dir / 'downloads'
+        if downloads.is_dir():
+            for folder in downloads.glob('update-*'):
+                if folder.is_dir() and not folder.is_symlink():
+                    shutil.rmtree(folder, ignore_errors=True)
+        try:
+            from .self_update import cleanup_staging
+            cleanup_staging(self.state_dir, keep=[keep] if isinstance(keep, str) else [])
+        except (OSError, RuntimeError):
+            pass
 
     def _run(self):
+        self.cleanup()
         next_check = time.monotonic() + INTERVAL
         while not self.stop.is_set():
             try:
@@ -205,12 +272,19 @@ class UpdateService:
                 self.device_update()
             else:
                 self.check_now(manual=request == 'check')
+                if request == 'automatic':
+                    self.cleanup()
             next_check = time.monotonic() + INTERVAL
 
-    def check_now(self, *, manual=False, quiet=()):
+    def check_now(self, *, manual=False, quiet=(), max_age=None):
+        """Check GitHub; with `max_age`, reuse a manifest verified that recently."""
         with self.lock:
             if self.busy:
                 return False
+            if (max_age is not None and self.manifest is not None and self.checked_monotonic is not None
+                    and time.monotonic() - self.checked_monotonic < max_age):
+                self._offers(manual, quiet=quiet)
+                return True
             if time.time() < self.state.get('retry_at', 0):
                 self.emit({'event': 'update_notice', 'message': 'Update checks are waiting for the server retry time.'})
                 return False
@@ -238,6 +312,7 @@ class UpdateService:
             manifest = verify_manifest(manifest_raw, signature, trusted_keys=self.trusted_keys)
             with self.lock:
                 self.manifest = manifest
+                self.checked_monotonic = time.monotonic()
                 self.state.update(manifest=base64.b64encode(manifest_raw).decode(),
                                   signature=base64.b64encode(signature).decode(),
                                   etag=response_headers.get('ETag', self.state.get('etag', '')),
@@ -272,7 +347,9 @@ class UpdateService:
             self._notify_device(NOTICE_INSTALLING)
             return
         self.emit({'event': 'update_notice', 'message': 'Firmware check requested on the meter…'})
-        if not self.check_now(manual=True, quiet=('firmware',)):
+        # The rocker confirms firmware only. A companion offer the user skipped
+        # or postponed stays quiet (manual=False respects those choices).
+        if not self.check_now(manual=False, quiet=('firmware',), max_age=DEVICE_CHECK_MAX_AGE):
             self._notify_device(NOTICE_FAILED)
             return
         with self.lock:
@@ -304,7 +381,12 @@ class UpdateService:
             return
         manifest, offers = self.manifest, {}
         os_name, arch = platform_id()
-        package = select_artifact(manifest, 'companion', os=os_name, arch=arch)
+        package = None
+        # Most preferred runnable package first (Windows on Arm falls back to x64).
+        for os_choice, arch_choice in compatible_platforms(os_name, arch):
+            package = select_artifact(manifest, 'companion', os=os_choice, arch=arch_choice)
+            if package:
+                break
         if package and Version.parse(package['version']) > Version.parse(self.version):
             offers['companion'] = self._offer(package, self.version)
         firmware = select_artifact(manifest, 'firmware', board=self.device.get('board'))
@@ -434,7 +516,11 @@ class UpdateService:
             self.emit({'event': 'ota_progress', 'phase': 'Downloading verified update', 'percent': 0, 'cancellable': True})
             staging = self.state_dir / 'downloads'
             staging.mkdir(exist_ok=True)
+            for old in staging.glob('update-*'):
+                if old.is_dir() and not old.is_symlink():
+                    shutil.rmtree(old, ignore_errors=True)
             directory = Path(tempfile.mkdtemp(prefix='update-', dir=staging))
+            self.download_dir = directory
             artifact = offer.artifact
             image = self.downloader.artifact(artifact, directory, self.cancel_download)
             if offer.kind == 'firmware':
@@ -460,7 +546,9 @@ class UpdateService:
                                                 companion_version=self.version, usb_power=usb_power)
             else:
                 from .self_update import stage_update
-                staged = stage_update(image, artifact, self.state_dir)
+                staged = stage_update(image, artifact, self.state_dir,
+                                      bluetooth_baseline=getattr(self.radio, 'health', None))
+                shutil.rmtree(directory, ignore_errors=True)  # Verified and unpacked.
                 if self.cancel_download.is_set():
                     raise RuntimeError('Update cancelled')
                 if staged.supported:
@@ -471,6 +559,10 @@ class UpdateService:
                     staged.launch()
                     self.emit({'event': 'companion_restart'})
                 else:
+                    with self.lock:
+                        # Keep only this verified package for the user to install by hand.
+                        self.state['manual_staging'] = str(staged.manual_path.parent.parent)
+                        self._save()
                     self.emit({'event': 'companion_manual', 'message': staged.reason, 'path': str(staged.manual_path)})
                     self.busy = False
         except Exception as error:
