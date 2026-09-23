@@ -827,28 +827,34 @@ class SlowProviderTests(unittest.TestCase):
                     patch.object(app_module, 'FIRST_FRAME_WAIT', .5):
                 worker = ProviderWorker(folder, lambda event: event['event'] == 'snapshot' and snapshots.put(
                     (time.monotonic(), event['snapshot'])))
-                self.addCleanup(worker.close)
-                self.addCleanup(release.set)
                 started = time.monotonic()
                 worker.start()
-                shown_at, first = snapshots.get(timeout=5)
-                self.assertLess(shown_at - started, 2.5)
-                rows = {row['key']: row for row in first['rows']}
-                self.assertEqual(rows['five_hour']['used'], 7)  # Claude's fresh rows...
-                self.assertEqual(rows['codex']['used'], 33)     # ...with Codex's previous ones.
-                # Refresh button while Codex still hangs: a frame at once, and
-                # the hung provider is not asked a second time.
-                pressed = time.monotonic()
-                worker.force.set()
-                shown_at, _ = snapshots.get(timeout=5)
-                self.assertLess(shown_at - pressed, 2.5)
-                self.assertEqual(len(codex_calls), 1)
-                # The late answer is shown as soon as it arrives.
-                answered = time.monotonic()
-                release.set()
-                shown_at, late = snapshots.get(timeout=5)
-                self.assertLess(shown_at - answered, 2)
-                self.assertEqual({row['key']: row for row in late['rows']}['codex']['used'], 44)
+                try:
+                    self._exercise(worker, release, snapshots, started, codex_calls)
+                finally:
+                    # Close inside the folder: Windows cannot delete an open SQLite file.
+                    release.set()
+                    worker.close()
+
+    def _exercise(self, worker, release, snapshots, started, codex_calls):
+        shown_at, first = snapshots.get(timeout=5)
+        self.assertLess(shown_at - started, 2.5)
+        rows = {row['key']: row for row in first['rows']}
+        self.assertEqual(rows['five_hour']['used'], 7)  # Claude's fresh rows...
+        self.assertEqual(rows['codex']['used'], 33)     # ...with Codex's previous ones.
+        # Refresh button while Codex still hangs: a frame at once, and
+        # the hung provider is not asked a second time.
+        pressed = time.monotonic()
+        worker.force.set()
+        shown_at, _ = snapshots.get(timeout=5)
+        self.assertLess(shown_at - pressed, 2.5)
+        self.assertEqual(len(codex_calls), 1)
+        # The late answer is shown as soon as it arrives.
+        answered = time.monotonic()
+        release.set()
+        shown_at, late = snapshots.get(timeout=5)
+        self.assertLess(shown_at - answered, 2)
+        self.assertEqual({row['key']: row for row in late['rows']}['codex']['used'], 44)
 
     def test_identity_probe_is_skipped_while_codex_is_in_backoff(self):
         now = time.time()

@@ -89,3 +89,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 - Pairing is bound to the meter's Bluetooth address and the meter proves the pairing secret back, so a device copying the meter's serial number cannot take over pairing; the top button now redraws the screen immediately.
 - Account switches show within one refresh cycle (Codex keyring logins within about five minutes), and a hung Codex no longer delays Claude quotas or the Refresh button.
 - Installers never interrupt an update's health check or downgrade a newer installation, and the Windows single-instance lock closes safely.
+
+## [2026.9.18] - 2026-09-23
+
+- Windows detects the processor architecture reliably when choosing which update package to install.

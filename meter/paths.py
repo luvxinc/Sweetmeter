@@ -96,7 +96,8 @@ def platform_id():
     if sys.platform == 'win32':
         # A 64-bit Windows process under emulation may report its own
         # architecture; the native processor is the more useful answer.
-        machine = os.environ.get('PROCESSOR_ARCHITEW6432') or machine
+        machine = (os.environ.get('PROCESSOR_ARCHITEW6432') or machine
+                   or os.environ.get('PROCESSOR_ARCHITECTURE', ''))
     arch = _ARCHITECTURES.get(machine.lower())
     if system == 'macos' and arch == 'x86_64' and _macos_arm64_hardware():
         arch = 'arm64'

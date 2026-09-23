@@ -237,6 +237,11 @@ if not getattr(socket.getaddrinfo, '_sweetmeter_guarded', False):
     _getaddrinfo._sweetmeter_guarded = True
     socket.getaddrinfo = _getaddrinfo
 
+# platform.uname() is computed once and cached. Warm it with the real
+# environment so a test that clears os.environ cannot poison the cache.
+import platform as _platform
+_platform.uname()
+
 # --- Private home ------------------------------------------------------------
 SANDBOX = tempfile.mkdtemp(prefix='sweetmeter-tests-')
 atexit.register(shutil.rmtree, SANDBOX, True)
