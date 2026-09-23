@@ -11,6 +11,12 @@ namespace sweetmeter {
 // dashboard answering a physical refresh press are user-visible immediately.
 constexpr uint8_t frameDisplayed = 0, frameDeferred = 1;
 inline bool drawFrameNow(bool firstFrame, bool userRefresh) { return firstFrame || userRefresh; }
+// A draw normally skips the panel when nothing visible changed. The frame that
+// answers a top-button press is refreshed even if identical: that refresh is
+// the press's only visible acknowledgement (one refresh per press).
+inline bool panelRefreshNeeded(bool contentChanged, bool panelReady, bool answersPress) {
+  return contentChanged || !panelReady || answersPress;
+}
 
 // The companion sends T every 30 seconds. Its whole-second clock and the BLE
 // latency make it differ from the meter's by up to a second; stepping the

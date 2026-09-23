@@ -144,7 +144,66 @@ static void registryLruAndPersistence() {
   helloPacket(packet,registry.entries[seven].secret,challenge,registry.entries[seven].host);
   assert(registry.matchProof(packet+1,challenge,serial)==seven);
 }
+static void nonceHello(LinkAuth &link,const uint8_t *nonce) {
+  uint8_t packet[17]={'N'};memcpy(packet+1,nonce,16);
+  AuthOutcome o=link.nonce(packet,17,false);
+  assert(o.quiet && !o.drop && !link.authorized());
+}
+static void mutualAuthentication() {
+  // Vector from Python: hmac.new(bytes(range(1,33)), b"SWM-METER-1"+bytes(range(0xa0,0xb0))
+  //   + bytes(range(0x10,0x20)) + b"a1b2c3d4e5f6" + host, hashlib.sha256).digest()[:16]
+  uint8_t secret[32],challenge[16],nonce[16],proof[16];char hex[33];
+  for(int i=0;i<32;++i) secret[i]=uint8_t(i+1);
+  for(int i=0;i<16;++i) { challenge[i]=uint8_t(0xa0+i); nonce[i]=uint8_t(0x10+i); }
+  assert(computeMeterProof(secret,challenge,nonce,serial,hostA,proof));
+  hexEncode(proof,16,hex);assert(!strcmp(hex,"8b2739822a4b9a04626344b72fad7e91"));
+  uint8_t secretA[32],secretB[32],packet[17];memset(secretA,0x11,32);memset(secretB,0x22,32);
+  Registry registry;int a=registry.add(hostA,"Mac",secretA,true);registry.add(hostB,"PC",secretB,true);registry.select(a);
+  { // After N the selected computer is authorized and the meter proves the same secret.
+    LinkAuth link;nonceHello(link,nonce);helloPacket(packet,secretA,challenge,hostA);
+    AuthOutcome o=link.proofHello(packet,17,registry,challenge,serial,false,false);
+    uint8_t expected[16];assert(computeMeterProof(secretA,challenge,nonce,serial,hostA,expected));
+    assert(o.result==helloOk && link.authorized() && o.proofLength==16 && !memcmp(o.proof,expected,16));
+  }
+  { // Without N the reply stays two bytes (companions before mutual authentication).
+    LinkAuth link;helloPacket(packet,secretA,challenge,hostA);
+    AuthOutcome o=link.proofHello(packet,17,registry,challenge,serial,false,false);
+    assert(o.result==helloOk && o.proofLength==0 && !o.quiet);
+  }
+  { // Paired but not selected: 9 with the proof of that computer's own secret.
+    LinkAuth link;nonceHello(link,nonce);helloPacket(packet,secretB,challenge,hostB);
+    AuthOutcome o=link.proofHello(packet,17,registry,challenge,serial,false,false);
+    uint8_t expected[16];assert(computeMeterProof(secretB,challenge,nonce,serial,hostB,expected));
+    assert(o.result==helloNotSelected && o.drop && o.proofLength==16 && !memcmp(o.proof,expected,16));
+  }
+  { // Menu open: after N a paired computer learns it is still known (9), never authorized;
+    // an unknown secret gets 7; without N the menu refuses every hello as before.
+    LinkAuth known;nonceHello(known,nonce);helloPacket(packet,secretA,challenge,hostA);
+    AuthOutcome o=known.proofHello(packet,17,registry,challenge,serial,true,false);
+    assert(o.result==helloNotSelected && o.drop && !known.authorized() && o.proofLength==16);
+    uint8_t forgotten[32];memset(forgotten,0x33,32);
+    LinkAuth unknown;nonceHello(unknown,nonce);helloPacket(packet,forgotten,challenge,hostA);
+    o=unknown.proofHello(packet,17,registry,challenge,serial,true,false);
+    assert(o.result==helloRejected && o.drop && o.proofLength==0);
+    LinkAuth plain;helloPacket(packet,secretA,challenge,hostA);
+    assert(plain.proofHello(packet,17,registry,challenge,serial,true,false).result==helloRejected);
+  }
+  { // N only once, only before the hello, exact length; nothing selected still answers 9.
+    LinkAuth twice;nonceHello(twice,nonce);uint8_t n[17]={'N'};
+    assert(twice.nonce(n,17,false).result==helloRejected && twice.state==LinkAuth::State::Closed);
+    LinkAuth late;helloPacket(packet,secretA,challenge,hostA);late.proofHello(packet,17,registry,challenge,serial,false,false);
+    assert(late.nonce(n,17,false).result==helloRejected);
+    LinkAuth shortNonce;assert(shortNonce.nonce(n,16,false).result==helloRejected);
+    LinkAuth reset;nonceHello(reset,nonce);reset.reset();helloPacket(packet,secretA,challenge,hostA);
+    assert(reset.proofHello(packet,17,registry,challenge,serial,false,false).proofLength==0);  // a new link forgets N
+    LinkAuth otaLink;assert(otaLink.nonce(n,17,true).quiet && otaLink.state==LinkAuth::State::Open);
+    Registry none=registry;none.select(-1);
+    LinkAuth unselected;nonceHello(unselected,nonce);helloPacket(packet,secretA,challenge,hostA);
+    AuthOutcome o=unselected.proofHello(packet,17,none,challenge,serial,false,false);
+    assert(o.result==helloNotSelected && o.proofLength==16);
+  }
+}
 int main() {
-  proofMatchesCompanion();linkAuthorization();legacyMigration();registryLruAndPersistence();
-  puts("PASS: pairing proof vector, selected/unselected/rejected hello, OTA hello, legacy migration, registry LRU/NVS");
+  proofMatchesCompanion();linkAuthorization();legacyMigration();registryLruAndPersistence();mutualAuthentication();
+  puts("PASS: pairing proof vector, selected/unselected/rejected hello, OTA hello, legacy migration, registry LRU/NVS, mutual proof");
 }

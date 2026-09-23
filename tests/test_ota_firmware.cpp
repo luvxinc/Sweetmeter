@@ -142,14 +142,18 @@ static void discoveryTests() {
  Discovery s;s.begin(0,9,none);
  for(int i=0;i<3;++i){uint8_t b[72];memcpy(b,body,72);b[35]=uint8_t('0'+i);assert(registerBody(s,600+i,b,72,1,peer)==(i<2?RegOk:RegRateLimited));}
  assert(s.count==2);
+ // Only an address that completed a registration counts for the menu-race
+ // bond grace; a failed attempt (conflict, malformed) does not.
+ assert(d.registeredPeer(peer) && !d.registeredPeer(other));
  assert(d.remaining(60100)==0);d.tick(60100);assert(!d.open);
+ assert(d.registeredPeer(peer));  // still known right after the window closed
  // Paired computers are listed first (selected, then most recent) with their
  // stored secrets; a paired computer that re-registers with a different secret
  // is marked and needs an explicit confirmation before it can be switched to.
  Registry paired;uint8_t stored[32];memset(stored,7,32);
  int mac=paired.add(id,"Mac",stored,true);int pc=paired.add("7a1e1000-ff1b-4d9f-a023-00000000000a","Office",stored,true);
  paired.add("7a1e1000-ff1b-4d9f-a023-00000000000b","Old",stored,true);paired.select(mac);paired.select(pc);paired.select(mac);
- d.begin(10,7,paired);assert(d.count==3 && d.computers[0].paired==mac && !strcmp(d.computers[1].name,"Office") && !strcmp(d.computers[2].name,"Old"));
+ d.begin(10,7,paired);assert(d.count==3 && !d.registeredPeer(peer) && d.computers[0].paired==mac && !strcmp(d.computers[1].name,"Office") && !strcmp(d.computers[2].name,"Old"));
  assert(d.computers[0].hasSecret && d.computers[0].secret[0]==7 && !d.computers[0].registered);
  assert(d.selectable(0) && !d.needsKeyConfirmation(0));
  assert(registerBody(d,700,body,72,11,peer)==RegOk && d.count==3 && !memcmp(d.computers[0].secret,secret,32) && d.computers[0].registered);

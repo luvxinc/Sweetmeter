@@ -122,7 +122,12 @@ login startup and opens Sweetmeter. Running it again over an existing
 installation is safe and says what it did: a current, healthy copy (it passes
 its own offline self-test) is kept and only its login startup is repaired; an
 older, damaged or failing copy is replaced with the verified latest release in
-one atomic swap (an interrupted swap is rolled back at the next login). Without
+one atomic swap (an interrupted swap is rolled back at the next login, and the
+app then says an interrupted installation was undone). A newer installed copy
+is never downgraded because its self-test was merely slow: a timeout is retried
+once with more time and, if it still does not finish, the copy is kept. While
+an in-app update is being installed and health-checked, the installer stops
+nothing and asks you to try again in a minute. Without
 Internet access it checks and repairs the installed copy instead. A "Start at
 login" choice you turned off stays off. Later updates remain **Install / Later / Skip**.
 
@@ -262,7 +267,8 @@ On macOS use `/Applications/Sweetmeter.app/...` if that is where the app is.
 Only Sweetmeter's own managed locations and files are removed. Every way of
 uninstalling (the app's **Uninstall…** button, the commands above and Windows
 Settings > Apps) waits for no update to be in progress: while a companion
-update is being swapped in, it stops with a plain message instead. The app is
+update is being swapped in or health-checked, it stops with a plain message
+before stopping the running app (so a good update is never rolled back). The app is
 first moved aside in one step and only then deleted, so a failed uninstall
 never leaves a half-deleted app behind (the app and its login item are put
 back and nothing is deleted). After an uninstall, select another computer on

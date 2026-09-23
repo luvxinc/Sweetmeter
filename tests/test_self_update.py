@@ -42,9 +42,13 @@ class UpdateTests(unittest.TestCase):
         self.temp.cleanup()
 
     def artifact(self):
-        return dict(kind='companion', version='2026.9.2',
-                    os={'darwin': 'macos', 'win32': 'windows'}.get(sys.platform, 'linux'),
-                    arch={'aarch64': 'arm64', 'amd64': 'x86_64'}.get(platform.machine().lower(), platform.machine().lower()),
+        # A package for this computer as the product itself detects it (on
+        # Windows that includes PROCESSOR_ARCHITEW6432 and x64 emulation on
+        # Arm), rather than a second, simplified copy of that detection.
+        choices = update.compatible_platforms()
+        self.assertTrue(choices, 'Unrecognized host architecture %r' % platform.machine())
+        os_name, arch = choices[0]
+        return dict(kind='companion', version='2026.9.2', os=os_name, arch=arch,
                     size=self.package.stat().st_size,
                     sha256=hashlib.sha256(self.package.read_bytes()).hexdigest())
 

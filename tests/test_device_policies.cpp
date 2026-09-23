@@ -113,12 +113,15 @@ static void bondTests() {
   // A second end for the same link, or an end for another link, does nothing.
   assert(link.ended(8,after,out)==0);
   link.connected(9,full);assert(link.ended(10,after,out)==0);
-  // The menu race: closing during the link, or a link starting shortly after
-  // the menu closed, keeps the bond the central's OS already stored.
-  assert(menuRaceEarnsBond(true,0,0,true));
-  assert(menuRaceEarnsBond(false,15000,10000,true) && !menuRaceEarnsBond(false,20000,10000,true));
-  assert(!menuRaceEarnsBond(false,500,0,false));    // the menu was never open
-  assert(!menuRaceEarnsBond(false,9000,10000,true));  // began before it closed (then "during" applies)
+  // The menu race: a central that registered in the window keeps its bond when
+  // the menu closes during its link or shortly before its link began.
+  assert(menuRaceEarnsBond(true,0,0,true,true));
+  assert(menuRaceEarnsBond(false,15000,10000,true,true) && !menuRaceEarnsBond(false,20000,10000,true,true));
+  assert(!menuRaceEarnsBond(false,500,0,false,true));    // the menu was never open
+  assert(!menuRaceEarnsBond(false,9000,10000,true,true));  // began before it closed (then "during" applies)
+  // A central that never registered (a stray phone connected at the timeout,
+  // or just after the close) earns nothing from the race.
+  assert(!menuRaceEarnsBond(true,0,0,true,false) && !menuRaceEarnsBond(false,15000,10000,true,false));
 }
 static void clockDisplayTests() {
   // T jitter below two seconds never steps a synchronized clock.
@@ -140,6 +143,10 @@ static void clockDisplayTests() {
   minute.firstClock(2000);assert(minute.due(29000005,2000+MinuteRedraw::firstClockDeferMs));  // no frame: draw after 5 s
   // Frame A results.
   assert(drawFrameNow(true,false) && drawFrameNow(false,true) && !drawFrameNow(false,false));
+  // The frame answering a refresh press refreshes the panel even when it is
+  // identical to what is shown (the refresh is the press's acknowledgement).
+  assert(panelRefreshNeeded(false,true,true) && panelRefreshNeeded(true,true,false) && panelRefreshNeeded(false,false,false));
+  assert(!panelRefreshNeeded(false,true,false));
 }
 static void refreshTests() {
   // With a computer: the press is not drawn; its frame is drawn (one refresh).
@@ -185,7 +192,7 @@ static void statusTests() {
   int length=formatStatus(out,sizeof(out),f,offset);
   assert(length>0 && length<512 && out[length-1]=='}');
   assert(!strncmp(out+offset,challengePlaceholder,32) && out[offset+32]=='"');
-  assert(!strstr(out,"selected_host") && strstr(out,"\"auth\":1") && strstr(out,"\"serial\":\"a1b2c3d4e5f6\""));
+  assert(!strstr(out,"selected_host") && strstr(out,"\"auth\":1,\"mutual\":1,") && strstr(out,"\"serial\":\"a1b2c3d4e5f6\""));
   assert(!strstr(out,"rssi"));  // optional diagnostic omitted rather than exceeding 512
   f.target="";length=formatStatus(out,sizeof(out),f,offset);
   assert(length>0 && length<512 && strstr(out,",\"rssi\":-127}"));

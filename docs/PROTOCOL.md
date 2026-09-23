@@ -68,6 +68,15 @@ bleak 3.0.2 reports the scan response's manufacturer data on macOS
 (CoreBluetooth merges it), Windows (WinRT pairs advertisement and scan
 response) and Linux (BlueZ `ManufacturerData`) with its default active scan.
 
+A scanner (or adapter/driver) that drops manufacturer data makes pairing
+firmware look pre-secret, so the companion probes it once. The status read is
+authoritative: `"auth":1` with the menu closed at an address this computer is
+not paired or pairing with closes the link at once, before any write (the
+meter then removes the unearned bond; only the computer's OS may keep a stale
+key from that one probe), and the address is remembered as pairing firmware
+so it is not probed again while its marker stays invisible. The `-PAIR` name
+suffix still reveals an open menu.
+
 The device requests MTU 185. New fragmented packets use at most 182-byte GATT
 values and must also work with MTU 23 (20-byte values). Start with a 20-byte value
 budget if the platform has no reliable negotiated limit; a BlueZ-reported MTU of
@@ -104,10 +113,11 @@ The old Swift helper which requires `protocol == 3` itself needs replacement.
 
 | Direction/characteristic | Layout |
 | --- | --- |
+| Host → control, mutual-authentication nonce | `N:u8, host_nonce:16` (directly before P; no reply; section 2.1) |
 | Host → control, authenticated hello | `P:u8, proof:16` (section 2.1) |
 | Host → control, legacy hello | `H:u8, host_id:36 ASCII bytes, name:0..20 ASCII bytes` (migration only) |
 | Host → control, provision secret | `Y:u8, secret:32` (only directly after a legacy H answered `8`) |
-| Device → control, hello ACK (H and P) | `H:u8, result:u8` |
+| Device → control, hello ACK (H and P) | `H:u8, result:u8`, plus `meter_proof:16` for results 0 and 9 when this link sent N |
 | Device → control, provision ACK | `Y:u8, result:u8` (`0` stored and authorized, `2` busy, `5` storage failed, `7` refused) |
 | Host → control, clock | `T:u8, unix_seconds:u32, UTC_offset_seconds:i32` |
 | Host → control, begin frame | `B:u8, sequence:u32, CRC32:u32, length:u16` (length 4000) |
@@ -143,8 +153,10 @@ Hello results: `0` authorized; `2` busy (queue full, retry, link stays open);
 `7` rejected (unknown secret, replayed/second hello, menu open, legacy H refused
 or outside its migration window);
 `8` legacy H accepted, send Y now; `9` the proof is valid but that computer is
-not the one selected on the meter. Every result except 0 and 2 is followed by a
-disconnect. P (17 bytes) fits the minimum 20-byte value budget. H (37–57 bytes)
+not the one selected on the meter (or the menu is open, below). Every result
+except 0 and 2 is followed by a disconnect. N and P (17 bytes each) fit the
+minimum 20-byte value budget, and so does the 18-byte ACK with a meter proof.
+A busy N is answered `H 2` like a busy hello. H (37–57 bytes)
 and Y (33 bytes) use a write-with-response long write if they exceed the ATT
 value budget; do not split them into separate writes. Registration below is
 explicitly fragmented and does not depend on long writes.
@@ -174,29 +186,77 @@ proof = HMAC-SHA256(secret, "SWM-AUTH-1" || challenge(16 raw bytes)
 
 and sends `P || proof`. The meter tries each stored secret (constant-time
 comparison) so the hello never names a computer. A match for the selected
-computer authorizes the link (`0`); a match for another paired computer returns
-`9`; no match returns `7`. Each link allows one hello; the challenge cannot be
-reused, and a new connection gets a new one. A hello while OTA is active never
-changes or revokes authorization.
+computer authorizes the link (`0`); a match for another paired computer, or any
+match while nothing is selected, returns `9`; no match returns `7`. Each link
+allows one hello; the challenge cannot be reused, and a new connection gets a
+new one. A hello while OTA is active never changes or revokes authorization.
+
+**Mutual authentication.** The hello above only convinces the meter. Firmware
+that reports `"mutual":1` also proves the secret back: a computer sends
+`N || host_nonce` (16 fresh random bytes) directly before P, and the ACK to 0
+or 9 then carries
+
+```
+meter_proof = HMAC-SHA256(secret, "SWM-METER-1" || challenge(16 raw bytes)
+                          || host_nonce(16) || serial (12 ASCII) || host_id (36 ASCII))[0:16]
+```
+
+for the secret that matched. N is accepted once per link, only before the
+hello and only with exactly 16 bytes; anything else is refused (`H 7`,
+disconnect). Without N the ACK stays two bytes, so older companions are
+unaffected; firmware without mutual authentication ignores N. A companion
+that sent N treats a 0 or 9 without a valid meter proof as a device that is
+not its meter: it sends no clock, frame, notice or firmware on that link,
+disconnects, and changes no pairing record. Once a meter has proven itself,
+the companion records that and refuses that serial whenever its status lacks
+`"mutual":1` (a downgrade). Reinstalling pre-mutual firmware over USB
+therefore needs Forget on the computer.
+
+While the physical menu is open a hello never authorizes, but after N the
+meter still answers it: `9` with the meter proof when the secret belongs to a
+paired computer, `7` otherwise. This lets a paired computer learn cheaply
+whether the owner removed it (section 4). P without N is refused in the menu
+as before.
 
 **Secrets on the computer.** A secret is transmitted exactly once, in the
 registration that created it, and a computer never sends a secret the meter
 has already proven it stores. The companion keeps per meter (keyed by serial)
-at most one **confirmed** secret and, per BLE address, one **pending** secret:
+at most one **confirmed** secret, **bound to the BLE address at which the meter
+proved it**, and, per BLE address, one **pending** secret:
 
 - Every registration generates a fresh pending secret and saves it before
-  sending it. It becomes the confirmed secret only after the meter accepts an
+  sending it; a registration never moves the confirmed secret's address. A
+  pending secret becomes the confirmed one only after the meter accepts an
   authenticated hello (`P` → `0`) with it; a refused pending secret (`7`) is
   discarded and the confirmed one is tried on the next connection (one hello
   per link). `9` leaves the pending secret pending.
-- A computer whose confirmed secret the meter accepted does not register again
-  in an open menu (switching back to it needs no registration). It registers
-  again only after the meter refused that secret, reported no selection, or
-  the user chose Forget.
+- Only the meter at the bound address can revoke the confirmed secret: a `7`
+  for it there marks it refused. A `7` from any other address changes nothing.
+  With nothing selected the companion still sends its hello: `9` means it is
+  still paired (it keeps its secret and does not register again), `7` at the
+  bound address means the meter forgot it.
+- A pending secret accepted at another address replaces the confirmed one only
+  after the meter at the bound address refused it (the owner reset that meter
+  or removed this computer); until then the old record stays, the pending
+  secret stays pending and that device is not driven.
+- A device at another address that accepts the confirmed secret is driven, and
+  the binding moved to its address, only if it also proved the secret (meter
+  proof). Without mutual authentication a peripheral that accepts any proof
+  is indistinguishable from the meter, so it is ignored instead.
+- A computer holding a confirmed secret that has not been refused does not
+  register in an open menu (switching back to it needs no registration). With
+  `"mutual":1` it checks its membership there instead (N, P → 9 or 7); a `7`
+  from the bound address marks the secret refused and it registers on its next
+  connection, so a removed or evicted computer reappears in the same menu. With
+  older pairing firmware it learns this only from its next hello outside the
+  menu. It also registers again after the user chose Forget.
 - A peripheral that copies a meter's public `serial` therefore never obtains a
-  secret that the real meter holds: it can at most receive a fresh pending
-  secret that the real meter never stored. The proof also binds the meter's
-  serial, so a secret is useless with any other meter.
+  secret that the real meter holds and cannot demote, replace or move the
+  pairing with the real meter: it can at most receive a fresh pending secret
+  (only after the real meter refused ours) that the real meter never stored.
+  The proof also binds the meter's serial, so a secret is useless with any
+  other meter. A device that also spoofs the real meter's BLE address is out
+  of scope (the address is where the binding lives).
 
 **Migration from pre-secret firmware (2026.9.8, 2026.9.13).** Those meters stored
 only a selected host ID. After updating, the status shows `"selected":true,
@@ -279,9 +339,15 @@ visible changed.
   with the corrected time in a single refresh.
 - **Top-button refresh.** With an authorized computer the press itself is not
   drawn: the meter notifies `R` and draws the answering frame at once (A
-  result 0). If no frame arrives within 10 seconds, the `*` marker is drawn to
+  result 0), refreshing the panel even if the frame is identical to what is
+  shown (that refresh is the press's acknowledgement; one refresh per press).
+  If no frame arrives within 10 seconds, the `*` marker is drawn to
   acknowledge the press; a frame within 30 seconds of the press still counts
   as its answer. Without an authorized computer the marker is drawn at once.
+  On `R` the companion forces a provider refresh and sends the first frame
+  the app renders after the request, **even if it equals the last frame
+  sent** (otherwise unchanged data would send nothing and the meter would
+  fall back to the marker). Later identical frames are not resent.
 
 ## 3. Device status (0004)
 
@@ -290,12 +356,15 @@ string. The following fields are required; omit optional diagnostics rather than
 exceeding the limit. Strings containing local names are not included here.
 
 ```json
-{"protocol":4,"firmware":"2026.9.1","board":"elecrow-crowpanel-2.13-v1.2-jd79661","auth":1,"serial":"a1b2c3d4e5f6","selected":true,"secured":true,"challenge":"5f0c3a9e1b7d2c4e8a6f1d3b5c7e9a0b","battery_percent":-1,"battery_mv":-1,"interval":60,"critical":false,"charge_state":"unknown","clock_synced":true,"menu":true,"discovery_nonce":4294967295,"discovery_remaining_ms":60000,"computers":8,"ota":false,"boot_health":"valid","last_update":"none","ota_target":"","rssi":-61}
+{"protocol":4,"firmware":"2026.9.1","board":"elecrow-crowpanel-2.13-v1.2-jd79661","auth":1,"mutual":1,"serial":"a1b2c3d4e5f6","selected":true,"secured":true,"challenge":"5f0c3a9e1b7d2c4e8a6f1d3b5c7e9a0b","battery_percent":-1,"battery_mv":-1,"interval":60,"critical":false,"charge_state":"unknown","clock_synced":true,"menu":true,"discovery_nonce":4294967295,"discovery_remaining_ms":60000,"computers":8,"ota":false,"boot_health":"valid","last_update":"none","ota_target":"","rssi":-61}
 ```
 
 The example values are synthetic. The status **never names the selected
 computer** (the former `selected_host` field is gone): any nearby central can
-read it. `auth` is 1 for the pairing protocol of section 2.1. `serial` is the
+read it. `auth` is 1 for the pairing protocol of section 2.1. `mutual` is 1
+when the firmware implements mutual authentication (N and the meter proof,
+section 2.1); it is omitted by earlier pairing firmware and only valid with
+`auth`. `serial` is the
 meter's stable eFuse MAC as 12 lower-case hex characters; computers key pairing
 secrets by it. `selected` says whether a computer is selected; `secured` whether
 that selection has a pairing secret (false only after migrating from pre-secret
@@ -356,8 +425,12 @@ only the name), so computers that have never paired only probe a meter with
 pairing firmware whose owner is actually pairing.
 
 A candidate connects, reads 0004, subscribes to 0002 and registers only if menu is
-open and nonce is nonzero (and, per section 2.1, only when it holds no secret
-the meter has accepted). Registration uses these **control** messages (distinct
+open and nonce is nonzero (and, per section 2.1, only when it holds no
+confirmed secret that the meter at its bound address has not refused). A
+computer that holds such a secret and sees `"mutual":1` sends N and P once per
+nonce instead: `9` (with a valid meter proof) means it is still listed, so it
+does not register; `7` from the bound address means the owner removed it, so
+it registers on its next connection (within about two seconds, same window). Registration uses these **control** messages (distinct
 from all legacy commands):
 
 | Command | Layout |
@@ -419,9 +492,10 @@ therefore decides from the advertisement (section 1) before connecting:
 
 - Pairing firmware, menu open: connect and register.
 - Pairing firmware, menu closed: connect only if this computer is paired or
-  pairing with that meter (a confirmed secret, a pending registration or a
-  pre-secret pin for that address). Otherwise do not connect; a companion that
-  has never paired shows the selection instructions from the advertisement.
+  pairing with that meter (a confirmed secret bound to that address, a pending
+  registration or a pre-secret pin for that address). Otherwise do not
+  connect; a companion that has never paired shows the selection instructions
+  from the advertisement.
 - Pre-secret firmware (no marker; it never removes bonds): probe as before. If
   its menu is open, register with the legacy body; if it names this computer
   as selected, use the legacy hello; if nothing is selected, show the
@@ -430,6 +504,8 @@ therefore decides from the advertisement (section 1) before connecting:
   section 2.1 applies (that computer holds the pre-secret record for the
   meter's address).
 - Undecided (no scan response yet): do not connect this scan.
+- Marker not reported although the status says `"auth":1`: see section 1;
+  the status decides and the link is closed at once.
 
 Status read before this link authenticated is reported to the application as
 untrusted: a copied serial proves nothing. A firmware job is bound to the BLE
@@ -824,9 +900,12 @@ contract.
   removed, and nothing is removed at boot. A link earns its bonds when it
   proves a pairing secret (hello `0` or `9`, or a migration `Y`), completes a
   menu registration (J `0`, or `9` for an old app that will register again
-  after updating), or when the physical menu closes during the link or closed
-  less than 10 seconds before it began (a computer that lost the race with the
-  owner's choice keeps the bond its OS already stored). A probe that connects
+  after updating), or, for a central whose connection address completed a
+  registration (J `0`) in the menu window that closed, when that menu closes
+  during the link or closed less than 10 seconds before it began (a computer
+  that lost the race with the owner's choice keeps the bond its OS already
+  stored). Any other central connected at the close or the timeout, or within
+  10 seconds after it, earns nothing from the race. A probe that connects
   while the menu is open and ends without registering loses its bond.
   Bluedroid's LRU remains the backstop; it can still drop a paired computer's
   bond only if more than 15 centrals earned bonds. A hello queued at the moment

@@ -23,6 +23,7 @@ class AppTests(unittest.TestCase):
                 with self.assertRaises(OSError): InstanceLock(path)
             finally: one.close()
             two=InstanceLock(path); two.close()
+            two.close(); one.close()  # Closing twice is harmless (Windows msvcrt too).
     def test_sqlite_created_and_closed_on_same_provider_thread(self):
         ids=[]; done=threading.Event(); holder={}
         class Index:

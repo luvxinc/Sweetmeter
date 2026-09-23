@@ -330,6 +330,52 @@ class CodexRpcTests(SyntheticHome):
         self.assertGreaterEqual(FakeAppServer.instances[0].terminated, 1)
         self.assertGreaterEqual(popen.call_count, 1)
 
+    def test_hung_server_costs_one_short_timeout_without_fallback_or_waiting_for_its_exit(self):
+        import time
+        self.assertLessEqual(providers.CODEX_TIMEOUT, 10)
+        self.assertLessEqual(providers.CODEX_SESSION_MAX_AGE, 300)
+
+        class Stubborn(FakeAppServer):
+            """Ignores the polite stop request; only kill ends it."""
+            def terminate(self):
+                self.terminated += 1
+
+            def kill(self):
+                self.exit(-9)
+
+            def wait(self, timeout=None):
+                if self.exit_code is None:
+                    time.sleep(min(timeout or 0, .3))
+                    if self.exit_code is None:
+                        raise subprocess.TimeoutExpired("codex", timeout)
+                return self.exit_code
+
+        popen = self.serve({})
+        popen.side_effect = lambda *a, **k: Stubborn({"account/rateLimits/read": None,
+                                                      "account/read": {"account": {"type": "chatgpt"}}})
+        with patch.object(providers, "CODEX_TIMEOUT", .2):
+            started = time.monotonic()
+            with self.assertRaises(providers.CodexNoAnswer):
+                providers.fetch_codex()
+            self.assertLess(time.monotonic() - started, .6)  # Not the 5 s stop + wait.
+        server = FakeAppServer.instances[0]
+        # No account/read fallback (and no second process) after a timeout.
+        self.assertEqual(server.methods(), ["initialize", "initialized", "account/rateLimits/read"])
+        self.assertEqual(popen.call_count, 1)
+        self.assertGreaterEqual(server.terminated, 1)  # Asked to stop at once...
+        deadline = time.monotonic() + 3
+        while server.exit_code is None and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(server.exit_code, -9)  # Killed in the background.
+
+    def test_rpc_error_asks_the_same_process_whether_anyone_is_signed_in(self):
+        popen = self.serve({"account/rateLimits/read": {"error": {"message": "synthetic"}},
+                            "account/read": {"account": None}})
+        with self.assertRaises(providers.NotSetUp):
+            providers.fetch_codex()
+        popen.assert_called_once()
+        self.assertEqual(FakeAppServer.instances[0].methods()[-2:], ["account/rateLimits/read", "account/read"])
+
     def test_stale_answer_to_an_earlier_request_is_ignored(self):
         self.serve({"account/rateLimits/read": WEEKLY})
         providers.fetch_codex()
@@ -418,6 +464,19 @@ class CodexIdentityTests(SyntheticHome):
                                                                             "email": "two@example.invalid"}}
         self.assertNotEqual(first, providers.codex_account(self.salt))
         self.assertEqual(len(FakeAppServer.instances), 1)  # Asked the running server.
+
+    def test_keyring_login_switch_is_seen_by_the_five_minute_restart_backstop(self):
+        # An app-server that keeps answering with the login it loaded at start.
+        self.serve({"type": "chatgpt", "email": "one@example.invalid"})
+        first = providers.codex_account(self.salt)
+        providers.codex_session().started -= providers.CODEX_SESSION_MAX_AGE + 1
+        # Meanwhile the keyring holds another login; only a new server sees it.
+        with patch.object(providers.subprocess, "Popen", side_effect=lambda *a, **k: FakeAppServer(
+                {"account/read": {"account": {"type": "chatgpt", "email": "two@example.invalid"}}})):
+            second = providers.codex_account(self.salt)
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(FakeAppServer.instances), 2)
+        self.assertGreaterEqual(FakeAppServer.instances[0].terminated, 1)
 
     def test_signed_out_unknown_and_missing_codex(self):
         self.serve(None)

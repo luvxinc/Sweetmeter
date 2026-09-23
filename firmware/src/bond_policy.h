@@ -18,9 +18,11 @@ namespace sweetmeter {
 //
 // A link earns its bonds when the central proves a pairing secret (authorized,
 // or "paired but not selected"), completes a menu registration (including an
-// old app's registration that is told to update), or when the physical menu
-// closed during the link or shortly before it began, so a computer that lost
-// the race with the owner's selection keeps the bond its OS already stored.
+// old app's registration that is told to update), or -- for a central that
+// completed a registration from the same address in the window that just
+// closed -- when the menu closed during the link or shortly before it began,
+// so a computer that lost the race with the owner's selection keeps the bond
+// its OS already stored. Any other central loses its bond.
 constexpr size_t bondListCapacity = 16;              // >= CONFIG_BT_SMP_MAX_BONDS
 constexpr uint32_t bondMenuGraceMs = 10000;          // after the menu closes
 
@@ -66,10 +68,12 @@ class LinkBonds {
 };
 
 // The menu closed while this link was open, or the link began within the
-// grace period after it closed: the central may have lost that race.
+// grace period after it closed, and this central registered in that window:
+// it may have lost the race with the owner's choice. A central that merely
+// happened to be connected (or connected just after) earns nothing.
 inline bool menuRaceEarnsBond(bool menuClosedDuringLink, uint32_t linkStartedAt, uint32_t menuClosedAt,
-                              bool menuEverClosed) {
-  return menuClosedDuringLink ||
-         (menuEverClosed && uint32_t(linkStartedAt - menuClosedAt) < bondMenuGraceMs);
+                              bool menuEverClosed, bool peerRegistered) {
+  return peerRegistered && (menuClosedDuringLink ||
+         (menuEverClosed && uint32_t(linkStartedAt - menuClosedAt) < bondMenuGraceMs));
 }
 }  // namespace sweetmeter

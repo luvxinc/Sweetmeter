@@ -11,7 +11,8 @@ import threading
 import time
 from pathlib import Path
 from PIL import Image
-from .providers import NotSetUp, account_fingerprints, close_codex, parse_claude, parse_codex, refresh
+from .providers import (NotSetUp, account_fingerprints, close_codex, in_backoff, parse_claude, parse_codex,
+                        refresh)
 from .tokens import TokenIndex, is_corrupt
 from .render import render, pack_frame
 from .updater import save_json, UpdateService
@@ -19,7 +20,12 @@ from .updater import save_json, UpdateService
 # Claude and Codex quotas are both read every render interval (about once a
 # minute). Codex is asked through one long-lived `codex app-server` process
 # (see providers.CodexSession), so a poll is a single JSON-RPC request rather
-# than a new process. A forced refresh polls both at once.
+# than a new process. A forced refresh polls both at once. Each provider is
+# polled on its own thread; a frame is published once both answered or after
+# FIRST_FRAME_WAIT seconds, whichever is first, so a slow or hung provider
+# never delays the other one's rows (or the Refresh button's frame).
+PROVIDERS = ('claude', 'codex')
+FIRST_FRAME_WAIT = 3
 # A provider row is stale when its data is older than the expected poll plus
 # this grace period, or its last poll failed.
 STALE_GRACE = 300
@@ -136,6 +142,15 @@ def display_snapshot(cache, index, available, now, totals=None):
 
 
 class ProviderWorker:
+    """Owns provider polling, the token index and frame rendering.
+
+    Claude and Codex are polled on their own short-lived threads so neither
+    can hold up the other: a frame is published as soon as both answered, or
+    after FIRST_FRAME_WAIT seconds with whatever has arrived (a provider still
+    being asked keeps its previous rows), and again when a late answer comes.
+    A provider whose previous poll is still running is not asked again.
+    """
+
     def __init__(self, state_dir, emit, device=lambda: {}):
         self.state_dir, self.emit, self.device = Path(state_dir), emit, device
         self.stop, self.force = threading.Event(), threading.Event()
@@ -144,6 +159,8 @@ class ProviderWorker:
         self.ready = threading.Event()
         self.startup_error = None
         self.index_error = None
+        self.results = queue.Queue()
+        self.polling = {}  # Provider name -> thread still asking it.
         self.thread = threading.Thread(target=self.run, name='sweetmeter-providers', daemon=True)
 
     def start(self):
@@ -177,6 +194,82 @@ class ProviderWorker:
             logging.warning('Token scan failed (%s); quotas are still shown', type(error).__name__)
             return index, set(), False
 
+    # -- provider polls (one thread per provider) ---------------------------
+    def _poll(self, name, entry, now, forced, interval, salt):
+        """Runs on the provider's own thread: confirm its account identity
+        (a changed one is re-read after a short settle delay) and poll it."""
+        try:
+            # While Codex is in an error backoff its app-server is not asked
+            # for the identity either; a hung server is not waited on again.
+            probe = not in_backoff(entry, now, force=forced)
+            known = {name: entry['account']} if entry.get('account') is not None else {}
+            accounts = account_fingerprints(salt, known, names=(name,), probe=probe, wait=self.stop.wait)
+            result = refresh({'providers': {name: dict(entry)}}, now, force=forced, interval=interval,
+                             accounts={name: (accounts or {}).get(name)}, names=(name,))
+            self.results.put((name, result.get('providers', {}).get(name)))
+        except Exception as error:
+            logging.warning('Reading %s usage failed (%s); retrying', name, type(error).__name__)
+            self.results.put((name, error))
+
+    def _start_polls(self, cache, now, forced, interval, salt):
+        providers = cache.setdefault('providers', {})
+        for name in PROVIDERS:
+            running = self.polling.get(name)
+            if running is not None and running.is_alive():
+                continue  # Still waiting for its previous answer; keep its rows.
+            entry = providers.get(name)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            thread = threading.Thread(target=self._poll, args=(name, entry, now, forced, interval, salt),
+                                      name='sweetmeter-poll-' + name, daemon=True)
+            self.polling[name] = thread
+            thread.start()
+
+    def _merge(self, cache, block_until=None):
+        """Apply finished polls. With ``block_until`` (monotonic), first wait
+        until every running poll finished or that time passed. Returns True
+        when a poll failed unexpectedly."""
+        failed = False
+        while True:
+            running = [name for name, thread in self.polling.items() if thread.is_alive()]
+            timeout = None
+            if block_until is not None and running:
+                timeout = block_until - time.monotonic()
+            try:
+                if timeout is None or timeout <= 0:
+                    name, entry = self.results.get_nowait()
+                else:
+                    name, entry = self.results.get(timeout=min(timeout, .25))
+            except queue.Empty:
+                if timeout is None or timeout <= 0 or self.stop.is_set():
+                    return failed
+                continue
+            self.polling.pop(name, None)
+            if isinstance(entry, Exception):
+                failed = True
+            elif isinstance(entry, dict):
+                cache.setdefault('providers', {})[name] = entry
+
+    def _publish(self, cache, index, device):
+        save_json(self.state_dir / 'providers.json', cache)
+        index, available, _ok = self._scan(index)
+        now = time.time()
+        shown_at = display_time(now)
+        snapshot = display_snapshot(cache, index, available, shown_at)
+        snapshot.update(device=device, clock_at=shown_at)
+        save_json(self.state_dir / 'snapshot.json', snapshot)
+        screen = render(snapshot)
+        screen.save(self.state_dir / 'screen.png')
+        screen.resize((1000, 488), Image.Resampling.NEAREST).save(self.state_dir / 'screen-4x.png')
+        self.emit({'event': 'snapshot', 'frame': pack_frame(screen), 'snapshot': snapshot,
+                   'providers': {name: {'error': value.get('error'), 'code': value.get('error_code')}
+                                 for name, value in cache.get('providers', {}).items()
+                                 if isinstance(value, dict)}})
+        return index
+
+    def _refresh_failed(self):
+        self.emit({'event': 'provider_error', 'code': 'refresh_failed',
+                   'error': 'Couldn’t update the dashboard from local data. Retrying in a few seconds.'})
+
     def run(self):
         # Never construct SQLite on the UI/asyncio thread then use it here.
         index = None
@@ -199,32 +292,29 @@ class ProviderWorker:
                 if hasattr(time, 'tzset'):
                     time.tzset()  # Follow time-zone changes (travel, DST rules) while running.
                 try:
-                    now = time.time()
-                    # Checked every cycle: a switched account is noticed and its
-                    # predecessor's rows, plan labels, errors and backoff dropped.
-                    accounts = account_fingerprints(salt)
-                    cache = refresh(cache, now, force=forced, interval=interval, accounts=accounts)
-                    save_json(self.state_dir / 'providers.json', cache)
-                    index, available, _ok = self._scan(index)
-                    now = time.time()
-                    shown_at = display_time(now)
-                    snapshot = display_snapshot(cache, index, available, shown_at)
-                    snapshot.update(device=device, clock_at=shown_at)
-                    save_json(self.state_dir / 'snapshot.json', snapshot)
-                    screen = render(snapshot)
-                    screen.save(self.state_dir / 'screen.png')
-                    screen.resize((1000, 488), Image.Resampling.NEAREST).save(self.state_dir / 'screen-4x.png')
-                    self.emit({'event': 'snapshot', 'frame': pack_frame(screen), 'snapshot': snapshot,
-                               'providers': {name: {'error': value.get('error'), 'code': value.get('error_code')}
-                                             for name, value in cache.get('providers', {}).items()
-                                             if isinstance(value, dict)}})
+                    # Every cycle checks each account (a switched account is
+                    # noticed and its predecessor's rows, plan labels, errors
+                    # and backoff dropped) and polls the providers that are due.
+                    self._start_polls(cache, time.time(), forced, interval, salt)
+                    failed = self._merge(cache, block_until=time.monotonic() + FIRST_FRAME_WAIT)
+                    index = self._publish(cache, index, device)
                     wall_until = next_render(time.time(), interval)
+                    if failed:
+                        self._refresh_failed()
+                        wall_until = min(wall_until, time.time() + 10)
                 except Exception as error:
                     logging.warning('Local data refresh failed (%s); retrying', type(error).__name__)
-                    self.emit({'event': 'provider_error', 'code': 'refresh_failed',
-                               'error': 'Couldn’t update the dashboard from local data. Retrying in a few seconds.'})
+                    self._refresh_failed()
                     wall_until = time.time() + 10
-                self._wait(wall_until)
+                # A late answer (a slow provider) is shown as soon as it
+                # arrives, without waiting for the next render time.
+                while self._wait(wall_until) == 'result':
+                    try:
+                        if self._merge(cache):
+                            self._refresh_failed()
+                        index = self._publish(cache, index, device)
+                    except Exception as error:
+                        logging.warning('Local data refresh failed (%s); retrying', type(error).__name__)
         except Exception as error:
             self.startup_error = type(error).__name__
             logging.error('Provider worker stopped (%s)', self.startup_error)
@@ -238,13 +328,17 @@ class ProviderWorker:
 
     def _wait(self, wall_until):
         """Wait on both clocks: the monotonic clock may pause during system
-        sleep and the wall clock may jump, so wake on whichever says so."""
+        sleep and the wall clock may jump, so wake on whichever says so.
+        Returns 'result' when a provider poll finished meanwhile."""
         limit = time.monotonic() + max(0, min(wall_until - time.time(), 3600))
         while not self.stop.is_set():
             if time.time() >= wall_until or time.monotonic() >= limit:
-                return
+                return 'time'
             if self.force.wait(.25) or self.redraw.is_set():
-                return
+                return 'wake'
+            if not self.results.empty():
+                return 'result'
+        return 'stop'
 
     def close(self):
         self.stop.set()

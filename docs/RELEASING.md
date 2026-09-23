@@ -360,6 +360,12 @@ next login finishes it. Login startup uses a stable launcher outside the
 application: after a crash/reboot it restores an unconfirmed backup or finishes
 confirmed cleanup before starting the app. Recovery and apply share an exclusive
 lock; recovery also refuses to replace a surviving running app until it exits.
+Installers and uninstallers take that lock *before* stopping the running app
+and refuse while it is held, because the helper holds it during the health
+check: stopping the app under check would roll back a good update. The journal
+records the swap's origin (`update` or `installer`); recovering an interrupted
+installer swap reports "installation undone", never a failed companion update,
+and marks no version as failed.
 After the new version is confirmed healthy, the helper atomically replaces the
 launcher with the one from the new bundle, so launcher fixes reach existing
 installations.

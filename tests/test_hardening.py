@@ -590,6 +590,55 @@ class GuiTextTests(unittest.TestCase):
         desktop.root.after.assert_called_once()
 
 
+class StartAtLoginCheckboxTests(unittest.TestCase):
+    """Changing "Start at login" never blocks the Tk thread."""
+
+    def desktop(self, wanted):
+        desktop = Desktop.__new__(Desktop)
+        desktop.root = Mock()
+        desktop.start_at_login = Mock(get=Mock(return_value=wanted))
+        desktop.start_at_login_box = Mock()
+        return desktop
+
+    def drain(self, desktop, limit=5):
+        """Run the Tk after() callbacks the handler scheduled (as Tk would)."""
+        deadline = time.monotonic() + limit
+        while desktop.root.after.call_args_list and time.monotonic() < deadline:
+            delay, callback = desktop.root.after.call_args_list.pop(0).args
+            time.sleep(delay / 1000)
+            callback()
+
+    def test_slow_change_runs_on_a_worker_and_the_ui_is_updated_later(self):
+        release, threads = threading.Event(), []
+
+        def slow(enabled):
+            threads.append(threading.get_ident())
+            release.wait(5)
+        desktop = self.desktop(False)
+        with patch('meter.installation.set_start_at_login', side_effect=slow):
+            started = time.monotonic()
+            desktop.toggle_start_at_login()
+            self.assertLess(time.monotonic() - started, .5)  # Returned at once.
+            desktop.start_at_login_box.configure.assert_called_with(state='disabled')
+            desktop.toggle_start_at_login()  # A second click meanwhile is ignored.
+            release.set()
+            self.drain(desktop)
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
+        desktop.start_at_login_box.configure.assert_called_with(state='normal')
+        desktop.start_at_login.set.assert_not_called()
+
+    def test_failure_restores_the_checkbox_and_explains_on_the_tk_thread(self):
+        from meter.installation import InstallError
+        desktop = self.desktop(True)
+        with patch('meter.installation.set_start_at_login', side_effect=InstallError('Another setup is running.')), \
+                patch('meter.gui.messagebox') as box:
+            desktop.toggle_start_at_login()
+            self.drain(desktop)
+        desktop.start_at_login.set.assert_called_once_with(False)
+        self.assertIn('Another setup is running.', box.showerror.call_args.args[1])
+
+
 class AccountSwitchTests(unittest.TestCase):
     def test_changed_account_drops_cache_and_polls_immediately(self):
         read = Mock(return_value=parse_codex({'rateLimits': {'planType': 'pro'}}))
@@ -602,17 +651,14 @@ class AccountSwitchTests(unittest.TestCase):
         cache = refresh(cache, 1200, {'codex': read}, force=True, accounts={'codex': 'id:a'})
         cache['providers']['codex'].update(error='Codex HTTP 429', error_code='rate_limited', next_poll=5000)
         new = Mock(return_value=parse_codex({'rateLimits': {'planType': 'plus'}}))
-        # First sighting of another account is only a candidate...
+        # A (confirmed) other account switches in the same cycle, dropping
+        # the old backoff: the owner requirement is one refresh cycle.
         cache = refresh(cache, 1260, {'codex': new}, accounts={'codex': 'id:b'})
-        self.assertEqual(cache['providers']['codex']['account'], 'id:a')
-        new.assert_not_called()
-        # ...the second consecutive one switches, dropping the old backoff.
-        cache = refresh(cache, 1300, {'codex': new}, accounts={'codex': 'id:b'})
         entry = cache['providers']['codex']
         new.assert_called_once()
         self.assertEqual(entry['rows'][0]['subscription_label'], 'PLUS')
         self.assertIsNone(entry['error'])
-        self.assertEqual((entry['account'], entry['account_since']), ('id:b', 1300))
+        self.assertEqual((entry['account'], entry['account_since']), ('id:b', 1260))
 
     def test_switch_discards_rows_even_when_the_new_poll_fails(self):
         cache = refresh({}, 1000, {'claude': lambda: parse_claude({'five_hour': {'utilization': 90}}, 'MAX')},
@@ -638,18 +684,68 @@ class AccountSwitchTests(unittest.TestCase):
         self.assertEqual(read.call_count, 2)  # Quota is re-read...
         self.assertEqual(cache['providers']['claude']['account_since'], 0)  # ...tokens not cut.
 
-    def test_mid_write_config_and_other_kind_never_switch(self):
+    def test_unknown_identity_never_switches_and_a_brief_other_kind_keeps_the_count(self):
         read = Mock(return_value=parse_claude({'five_hour': {'utilization': 40}}, 'MAX'))
         cache = refresh({}, 1000, {'claude': read}, accounts={'claude': 'id:a'})
         cache['providers']['claude']['account_since'] = 500
-        # Config unreadable (None), then a token fingerprint for one cycle
-        # (oauthAccount missing mid-write), then the id again.
-        for now, seen in ((1060, None), (1120, 'token:x'), (1180, 'id:a'), (1240, 'token:x'), (1300, 'id:a')):
-            cache = refresh(cache, now, {'claude': read}, accounts={'claude': seen})
-            entry = cache['providers']['claude']
-            self.assertEqual((entry['account'], entry['account_since']), ('id:a', 500), now)
-            self.assertIn('rows', entry)
-        self.assertNotIn('account_candidate', cache['providers']['claude'])
+        cache['providers']['claude']['account_candidate'] = 'id:z'  # Written by an older version.
+        cache = refresh(cache, 1060, {'claude': read}, accounts={'claude': None})
+        entry = cache['providers']['claude']
+        self.assertEqual((entry['account'], entry['account_since']), ('id:a', 500))
+        self.assertNotIn('account_candidate', entry)
+        # A confirmed token fingerprint (config lost its ids) re-reads the
+        # quota; the ids coming back resume the original token count.
+        cache = refresh(cache, 1120, {'claude': read}, accounts={'claude': 'token:x'})
+        cache = refresh(cache, 1180, {'claude': read}, accounts={'claude': 'id:a'})
+        entry = cache['providers']['claude']
+        self.assertEqual((entry['account'], entry['account_since']), ('id:a', 500))
+        self.assertIn('rows', entry)
+
+    def test_changed_fingerprint_is_confirmed_within_the_same_cycle(self):
+        readings = {'claude': ['id:b', 'id:b'], 'codex': ['app:2', 'app:3']}
+        waits = []
+
+        def reader(name):
+            return lambda salt, fresh=False, probe=True: readings[name].pop(0)
+        with patch.dict(providers.ACCOUNT_READERS, {'claude': reader('claude'), 'codex': reader('codex')}):
+            result = providers.account_fingerprints(b's' * 32, {'claude': 'id:a', 'codex': 'app:1'},
+                                                    wait=waits.append)
+        # One short settle delay, not a whole cycle; a stable reading is the
+        # new account, a reading that changed again (mid-write) is unknown.
+        self.assertEqual(waits, [providers.ACCOUNT_SETTLE])
+        self.assertLessEqual(providers.ACCOUNT_SETTLE, 5)
+        self.assertEqual(result, {'claude': 'id:b', 'codex': None})
+
+    def test_unchanged_fingerprint_needs_no_second_read(self):
+        calls = []
+
+        def read(salt, fresh=False, probe=True):
+            calls.append(fresh)
+            return 'id:a'
+        with patch.dict(providers.ACCOUNT_READERS, {'claude': read}):
+            result = providers.account_fingerprints(b's' * 32, {'claude': 'id:a'}, names=('claude',),
+                                                    wait=lambda seconds: self.fail('no wait expected'))
+        self.assertEqual((result, calls), ({'claude': 'id:a'}, [False]))
+
+    def test_half_written_config_is_re_read_without_the_cache(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            config = home / '.claude.json'
+            config.write_text(json.dumps({'oauthAccount': {'accountUuid': 'a'}}))
+            salt = b'h' * 32
+            with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home', return_value=home):
+                known = providers.claude_account(salt)
+
+                def rewrite(seconds):
+                    # The CLI finishes writing another account during the settle delay.
+                    config.write_text(json.dumps({'oauthAccount': {'accountUuid': 'ccc'}}))
+                config.write_text(json.dumps({'oauthAccount': {'accountUuid': 'bb'}}))
+                result = providers.account_fingerprints(salt, {'claude': known}, names=('claude',),
+                                                        wait=rewrite)
+                self.assertIsNone(result['claude'])  # Changed again while settling: unknown.
+                result = providers.account_fingerprints(salt, {'claude': known}, names=('claude',),
+                                                        wait=lambda seconds: None)
+                self.assertNotIn(result['claude'], (None, known))  # Stable: the new account.
 
     def test_sign_out_is_immediate_and_signing_back_in_keeps_the_count(self):
         read = Mock(return_value=parse_claude({}))
@@ -706,6 +802,70 @@ class AccountSwitchTests(unittest.TestCase):
             self.assertEqual(salt, account_salt(folder))
             if os.name == 'posix':
                 self.assertEqual((Path(folder) / 'account-salt').stat().st_mode & 0o077, 0)
+
+
+class SlowProviderTests(unittest.TestCase):
+    """A hung Codex never delays Claude's rows or the Refresh button's frame."""
+
+    def test_hung_codex_never_delays_claude_or_the_refresh_button(self):
+        from meter import app as app_module
+        release, snapshots = threading.Event(), queue.Queue()
+        codex_calls = []
+
+        def codex():
+            codex_calls.append(time.monotonic())
+            release.wait(20)
+            return parse_codex({'rateLimits': {'primary': {'windowDurationMins': 10080, 'usedPercent': 44}}})
+        claude = Mock(return_value=parse_claude({'five_hour': {'utilization': 7}}))
+        with tempfile.TemporaryDirectory() as folder:
+            now = time.time()
+            old_codex = parse_codex({'rateLimits': {'primary': {'windowDurationMins': 10080, 'usedPercent': 33}}})
+            (Path(folder) / 'providers.json').write_text(json.dumps({'providers': {'codex': {
+                'rows': old_codex, 'fetched_at': now - 90, 'next_poll': now - 30}}}))
+            with patch.object(providers, 'fetch_claude', claude), patch.object(providers, 'fetch_codex', codex), \
+                    patch('meter.app.account_fingerprints', return_value={}), patch('meter.app.close_codex'), \
+                    patch.object(app_module, 'FIRST_FRAME_WAIT', .5):
+                worker = ProviderWorker(folder, lambda event: event['event'] == 'snapshot' and snapshots.put(
+                    (time.monotonic(), event['snapshot'])))
+                self.addCleanup(worker.close)
+                self.addCleanup(release.set)
+                started = time.monotonic()
+                worker.start()
+                shown_at, first = snapshots.get(timeout=5)
+                self.assertLess(shown_at - started, 2.5)
+                rows = {row['key']: row for row in first['rows']}
+                self.assertEqual(rows['five_hour']['used'], 7)  # Claude's fresh rows...
+                self.assertEqual(rows['codex']['used'], 33)     # ...with Codex's previous ones.
+                # Refresh button while Codex still hangs: a frame at once, and
+                # the hung provider is not asked a second time.
+                pressed = time.monotonic()
+                worker.force.set()
+                shown_at, _ = snapshots.get(timeout=5)
+                self.assertLess(shown_at - pressed, 2.5)
+                self.assertEqual(len(codex_calls), 1)
+                # The late answer is shown as soon as it arrives.
+                answered = time.monotonic()
+                release.set()
+                shown_at, late = snapshots.get(timeout=5)
+                self.assertLess(shown_at - answered, 2)
+                self.assertEqual({row['key']: row for row in late['rows']}['codex']['used'], 44)
+
+    def test_identity_probe_is_skipped_while_codex_is_in_backoff(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as folder, \
+                patch('meter.app.account_fingerprints', return_value={}) as accounts, \
+                patch('meter.app.refresh', return_value={'providers': {}}):
+            worker = ProviderWorker(folder, lambda event: None)
+            backoff = {'error': 'Codex did not answer in time.', 'attempted_at': now - 60, 'next_poll': now + 240}
+            worker._poll('codex', backoff, now, False, 60, b's' * 32)
+            self.assertIs(accounts.call_args.kwargs['probe'], False)
+            worker._poll('codex', backoff, now, True, 60, b's' * 32)  # Refresh button polls it anyway.
+            self.assertIs(accounts.call_args.kwargs['probe'], True)
+            worker._poll('codex', {'next_poll': now - 1, 'account': 'app:1'}, now, False, 60, b's' * 32)
+            self.assertIs(accounts.call_args.kwargs['probe'], True)
+            self.assertEqual(accounts.call_args.args[1], {'codex': 'app:1'})
+        with patch.object(providers, 'codex_session', side_effect=AssertionError('no app-server')):
+            self.assertIsNone(providers.codex_account(b's' * 32, probe=False))
 
 
 class PollCadenceTests(unittest.TestCase):

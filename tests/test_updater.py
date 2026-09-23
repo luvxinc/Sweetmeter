@@ -202,6 +202,22 @@ class UpdateTests(unittest.TestCase):
         self.service.transfer_event({'event':'ota_error','error':'Connection lost'})
         self.assertFalse(self.service.busy)
         self.assertEqual(self.service.state['pending']['phase'],'commit')
+        # The image may be fine: the meter is told nothing until its status reconciles.
+        self.assertEqual(self.notices(),[3])
+    def test_commit_error_then_verified_boot_never_shows_a_failure(self):
+        self.device_update()
+        self.service.transfer_event({'event':'ota_progress','cancellable':False})
+        self.service.transfer_event({'event':'ota_error','error':'Connection lost'})
+        self.service.set_device({'protocol':4,'board':BOARD_ID,'firmware':'2026.9.2','boot_health':'valid',
+                                 'last_update':'success'},True,'device-one')
+        self.assertEqual(self.notices(),[3])
+        self.assertTrue(any(e['event']=='firmware_verified' for e in self.events))
+    def test_commit_error_then_reported_rollback_shows_the_failure(self):
+        self.device_update()
+        self.service.transfer_event({'event':'ota_progress','cancellable':False})
+        self.service.transfer_event({'event':'ota_error','error':'Connection lost'})
+        self.service.set_device({'protocol':4,'board':BOARD_ID,'firmware':'2026.9.1','boot_health':'valid',
+                                 'last_update':'rollback','ota_target':'2026.9.2'},True,'device-one')
         self.assertEqual(self.notices(),[3,4])
     def test_unconfirmed_rocker_install_shows_failure_on_the_meter(self):
         self.device_update()
@@ -216,7 +232,7 @@ class UpdateTests(unittest.TestCase):
         self.service.set_device({'protocol':4,'board':BOARD_ID,'firmware':'2026.9.1','boot_health':'valid',
                                  'last_update':'rollback','ota_target':'2026.9.2'},True,'device-one')
         self.assertEqual(self.notices(),[3,4])
-        self.assertEqual(self.service.state['failed']['outcome'],'rollback')
+        self.assertEqual(self.service.failed_targets()[-1]['outcome'],'rollback')
     def test_verified_rocker_install_is_not_reported_as_failed(self):
         self.device_update()
         self.service.set_device({'protocol':4,'board':BOARD_ID,'firmware':'2026.9.2','boot_health':'valid',
@@ -281,6 +297,34 @@ class UpdateTests(unittest.TestCase):
             self.assertTrue(old.exists())
             self.service.busy=False; self.service.cleanup()
         self.assertFalse(old.exists()); self.assertFalse(staging.exists()); self.assertTrue(manual.exists())
+    def test_several_failed_companion_targets_are_remembered(self):
+        self.service.state['failed']={'kind':'firmware','target':'2026.9.5','outcome':'failed'}  # Older format.
+        for target in ('2026.9.2','2026.9.3'):
+            self.service.state['pending']={'kind':'companion','target':target}
+            (self.state/'companion-update-result.json').write_text(json.dumps(
+                {'status':'rollback','version':target,'reason':'synthetic'}))
+            self.service.report_companion_result()
+        targets=[(r['kind'],r['target']) for r in self.service.failed_targets()]
+        self.assertEqual(targets,[('firmware','2026.9.5'),('companion','2026.9.2'),('companion','2026.9.3')])
+        self.check()  # 2026.9.2 failed earlier, before 2026.9.3: still never offered automatically.
+        self.assertFalse(any(e['event']=='update_offer' and e['offer'].kind=='companion' for e in self.events))
+        from meter.updater import FAILED_KEEP
+        for number in range(FAILED_KEEP + 3):
+            self.service._remember_failed({'kind':'companion','target':'2027.1.%d' % number})
+        self.assertEqual(len(self.service.failed_targets()),FAILED_KEEP)
+    def test_interrupted_installer_is_not_reported_as_a_failed_update(self):
+        (self.state/'companion-update-result.json').write_text(json.dumps(
+            {'status':'install_interrupted','version':'2026.9.2','reason':'x'}))
+        self.service.report_companion_result()
+        self.assertEqual(self.events[-1]['event'],'update_notice')
+        self.assertIn('installation was undone',self.events[-1]['message'])
+        self.assertEqual(self.service.failed_targets(),[])
+        # A rollback with no update started here is not blamed on a version either.
+        (self.state/'companion-update-result.json').write_text(json.dumps(
+            {'status':'rollback','version':'2026.9.2','reason':'x'}))
+        self.service.report_companion_result()
+        self.assertEqual(self.events[-1]['event'],'update_notice')
+        self.assertEqual(self.service.failed_targets(),[])
     def test_rollback_result_is_shown_once_and_clears_pending(self):
         self.service.state['pending']={'kind':'companion','target':'2026.9.2'}
         (self.state/'companion-update-result.json').write_text(json.dumps(

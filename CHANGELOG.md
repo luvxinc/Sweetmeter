@@ -83,3 +83,9 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 - Claude and Codex quotas refresh every minute again, a button-started update that fails is shown on the meter, and the panel refreshes at most once a minute.
 - Re-running the installer repairs or updates an older or damaged installation, uninstall never leaves a half-deleted app, and an open macOS Bluetooth prompt no longer undoes an update.
 - The self-hosted CI runner reaches its disposable VM through the Tart guest agent, so it keeps working under macOS Local Network privacy.
+
+## [2026.9.17] - 2026-09-23
+
+- Pairing is bound to the meter's Bluetooth address and the meter proves the pairing secret back, so a device copying the meter's serial number cannot take over pairing; the top button now redraws the screen immediately.
+- Account switches show within one refresh cycle (Codex keyring logins within about five minutes), and a hung Codex no longer delays Claude quotas or the Refresh button.
+- Installers never interrupt an update's health check or downgrade a newer installation, and the Windows single-instance lock closes safely.

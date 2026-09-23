@@ -3,7 +3,7 @@
 No administrator access. Only locations listed by `paths.candidate_install_roots`
 and files this module creates are ever adopted, rewritten or removed.
 """
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
@@ -441,6 +441,9 @@ def _destination_for(source):
 
 
 SELF_TEST_TIMEOUT = 120
+# tree_problem's answer when the self-test ran out of time twice: not proof
+# of damage, so a newer installed version is never replaced because of it.
+SELF_TEST_UNFINISHED = 'its self-test did not finish in time'
 
 
 def tree_version(root):
@@ -476,30 +479,49 @@ def tree_problem(root, *, self_test=True):
     if not self_test:
         return None
     options = {'creationflags': CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
-    try:
-        result = subprocess.run(app_command(root) + ['--self-test'], capture_output=True,
-                                timeout=SELF_TEST_TIMEOUT, check=False, **options)
-    except (OSError, subprocess.SubprocessError):
-        return 'it could not be started'
-    return None if result.returncode == 0 else 'it failed its self-test'
+    # A slow first start (antivirus scan, cold disk) is not a failure: a
+    # timeout is retried once with more time and is never reported as damage.
+    for timeout in (SELF_TEST_TIMEOUT, SELF_TEST_TIMEOUT * 2):
+        try:
+            result = subprocess.run(app_command(root) + ['--self-test'], capture_output=True,
+                                    timeout=timeout, check=False, **options)
+        except subprocess.TimeoutExpired:
+            continue
+        except (OSError, subprocess.SubprocessError):
+            return 'it could not be started'
+        return None if result.returncode == 0 else 'it failed its self-test'
+    return SELF_TEST_UNFINISHED
+
+
+@contextmanager
+def _updates_paused(retry):
+    """Hold the companion update lock, then stop the running app.
+
+    The order matters: an update helper holds this lock while it checks the
+    health of a freshly installed app. Stopping that app first would make a
+    good update fail its health check and roll back, so an installer or
+    uninstaller that finds the lock taken refuses and stops nothing.
+    """
+    from .self_update import _update_lock
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(_update_lock())
+        except RuntimeError:
+            raise InstallError('A Sweetmeter update is being installed right now. '
+                               'Wait a minute for it to finish, then ' + retry + '.') from None
+        if not stop_running_app():
+            raise InstallError('Sweetmeter is still running and could not be stopped. '
+                               'Quit it, then ' + retry + '.')
+        yield
 
 
 def _replace_installation(destination, source, version):
     """Atomically replace the managed tree with `source` using the same
     journaled swap as companion updates (the login launcher finishes or rolls
     back an interrupted swap)."""
-    import contextlib
     import secrets
-    from .self_update import TreeSwap, _update_lock, recover_update_locked
-    if not stop_running_app():
-        raise InstallError('Sweetmeter is still running and could not be stopped. '
-                           'Quit it, then run the installer again.')
-    with contextlib.ExitStack() as stack:
-        try:
-            stack.enter_context(_update_lock())
-        except RuntimeError:
-            raise InstallError('A Sweetmeter update is being installed right now. '
-                               'Wait a minute for it to finish, then run the installer again.') from None
+    from .self_update import TreeSwap, recover_update_locked
+    with _updates_paused('run the installer again'):
         if (data_dir() / 'companion-swap.json').exists():
             try:
                 recover_update_locked()  # Finish or undo an interrupted update first.
@@ -507,7 +529,7 @@ def _replace_installation(destination, source, version):
                 raise InstallError('An interrupted Sweetmeter update could not be finished ('
                                    + str(error) + '). Restart the computer, then run the installer again.') from None
         swap = TreeSwap(destination, nonce=secrets.token_hex(12), state_dir=default_state_dir(),
-                        version=str(version) if version else 'installer')
+                        version=str(version) if version else 'installer', origin='installer')
         try:
             swap.prepare(source, strip_marks=True)
             swap.swap()
@@ -557,9 +579,19 @@ def install_native(application, *, start_at_login=True, report=None):
                 raise ValueError('Existing installation is not managed by Sweetmeter.')
             current = tree_version(destination)
             problem = tree_problem(destination)
+            # Versions compare only when both are known (a package without a
+            # readable version never replaces a working installation).
+            newer = current is not None and offered is not None and current > offered
             if problem is None and (offered is None or current >= offered):
-                newer = ' (newer than this package)' if current > offered else ''
-                message = f'Sweetmeter {current}{newer} is already installed and working; its login startup was checked.'
+                shown_newer = ' (newer than this package)' if newer else ''
+                message = (f'Sweetmeter {current}{shown_newer} is already installed and working; '
+                           'its login startup was checked.')
+            elif problem == SELF_TEST_UNFINISHED and newer:
+                # Never downgrade on a timeout: only a definite failure
+                # (missing/damaged files, a failing self-test) replaces it.
+                message = (f'Sweetmeter {current} (newer than this package) is already installed and was kept; '
+                           'its self-test did not finish in time, so it was not replaced. '
+                           'Its login startup was checked.')
             else:
                 validate_tree(source)
                 _replace_installation(destination, source, offered)
@@ -696,23 +728,15 @@ def uninstall(remove_data=False, *, wait_pid=None):
     was deleted and the names and login item are restored, so a failed
     uninstall never leaves a half-deleted app behind at its real name.
     """
-    import contextlib
     import secrets
-    from .self_update import LAUNCHER_NAME, _alive, _retry, _update_lock, helper_log, recover_update_locked
+    from .self_update import LAUNCHER_NAME, _alive, _retry, helper_log, recover_update_locked
     removed, leftovers = [], []
     with install_lock():
         if wait_pid:
             deadline = time.monotonic() + 30
             while _alive(wait_pid) and time.monotonic() < deadline:
                 time.sleep(.2)
-        if not stop_running_app():
-            raise InstallError('Sweetmeter is still running. Quit it, then run the uninstaller again.')
-        with contextlib.ExitStack() as stack:
-            try:
-                stack.enter_context(_update_lock())
-            except RuntimeError:
-                raise InstallError('A Sweetmeter update is being installed right now. '
-                                   'Wait a minute for it to finish, then uninstall again.') from None
+        with _updates_paused('uninstall again'):
             if (data_dir() / 'companion-swap.json').exists():
                 try:
                     recover_update_locked()

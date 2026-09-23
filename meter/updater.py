@@ -25,6 +25,9 @@ INTERVAL = 6 * 3600
 DEVICE_CHECK_MAX_AGE = 60
 # Results shown on the meter after its rocker is held (protocol `u` codes).
 NOTICE_CURRENT, NOTICE_INSTALLING, NOTICE_FAILED, NOTICE_COMPANION = 2, 3, 4, 5
+# Failed targets remembered (most recent last) so none is offered again
+# automatically; a manual check still offers them.
+FAILED_KEEP = 8
 
 def save_json(path, value, *, durable=False):
     """Atomic JSON replace; `durable` also survives power loss (update decisions)."""
@@ -223,16 +226,41 @@ class UpdateService:
         if not isinstance(result, dict):
             return
         version = str(result.get('version', ''))[:20]
-        if result.get('status') == 'rollback':
+        if result.get('status') == 'install_interrupted':
+            # An installer or repair was interrupted and undone at login: not
+            # an update the user started here, so nothing is marked failed.
+            self.emit({'event': 'update_notice',
+                       'message': 'An interrupted Sweetmeter installation was undone and the previously '
+                                  'installed version was kept. Run the installer again to finish it.'})
+        elif result.get('status') == 'rollback':
             with self.lock:
                 pending = self.state.get('pending')
-                if pending and pending.get('kind') == 'companion':
-                    self.state['failed'] = {**pending, 'outcome': 'rollback'}
+                started = bool(pending and pending.get('kind') == 'companion')
+                if started:
+                    self._remember_failed({**pending, 'outcome': 'rollback'})
                     self.state.pop('pending', None)
                     self._save()
             reason = str(result.get('reason') or 'The updated app did not start correctly.')[:600]
-            self.emit({'event': 'update_error',
-                       'error': 'Companion update ' + version + ' was not kept; this version was restored. ' + reason})
+            if started:
+                self.emit({'event': 'update_error',
+                           'error': 'Companion update ' + version + ' was not kept; this version was restored. ' + reason})
+            else:
+                self.emit({'event': 'update_notice',
+                           'message': 'An interrupted Sweetmeter update was undone; this version was kept.'})
+
+    def failed_targets(self):
+        """Remembered failed installs (dicts with kind and target), oldest first.
+        Older versions stored a single record; it is read as a one-item list."""
+        value = self.state.get('failed')
+        if isinstance(value, dict):
+            value = [value]
+        return [record for record in value if isinstance(record, dict)] if isinstance(value, list) else []
+
+    def _remember_failed(self, record):
+        """Add a failed install (caller holds the lock); keeps FAILED_KEEP."""
+        key = record.get('kind'), record.get('target')
+        kept = [old for old in self.failed_targets() if (old.get('kind'), old.get('target')) != key]
+        self.state['failed'] = (kept + [record])[-FAILED_KEEP:]
 
     def check(self):
         self.requests.put('check')
@@ -422,9 +450,9 @@ class UpdateService:
             choice = self.state.get('choices', {}).get(kind, {})
             if not manual and (choice.get('skip') == offer.target or time.time() < choice.get('later', 0)):
                 continue
-            failed = self.state.get('failed')
-            if (not manual and kind == 'companion' and isinstance(failed, dict)
-                    and failed.get('kind') == 'companion' and failed.get('target') == offer.target):
+            if (not manual and kind == 'companion'
+                    and any(failed.get('kind') == 'companion' and failed.get('target') == offer.target
+                            for failed in self.failed_targets())):
                 continue  # Rolled back on this computer; only a manual check offers it again.
             if not manual and key in self.prompted:
                 continue
@@ -468,7 +496,7 @@ class UpdateService:
                     self._save()
                     self.emit({'event': 'firmware_verified', 'version': target})
                 elif status.get('ota_target') == target and status.get('last_update') in ('rollback', 'failed'):
-                    self.state['failed'] = {**pending, 'outcome': status['last_update']}
+                    self._remember_failed({**pending, 'outcome': status['last_update']})
                     self.state.pop('pending', None)
                     self._firmware_failed()
                     self._save()
@@ -491,13 +519,18 @@ class UpdateService:
                 firmware = pending and pending.get('kind') == 'firmware'
                 if not firmware and self.installing != 'firmware':
                     return  # Not about a firmware install (never clears a companion update).
+                if firmware and pending.get('phase') == 'commit':
+                    # The meter may already have switched images and boot
+                    # the new firmware fine: keep the target so its next
+                    # status report reconciles it, and tell the meter nothing
+                    # yet. set_device reports the verified outcome (a failure
+                    # also on the meter for a rocker-hold install).
+                    self._reconciled = False
+                    self._save()
+                    self.busy, self.awaiting_until = False, None
+                    return
                 if firmware:
-                    if pending.get('phase') == 'commit':
-                        # The meter may already have switched images: keep the
-                        # target so its next status report reconciles it.
-                        self._reconciled = False
-                    else:
-                        self.state.pop('pending', None)
+                    self.state.pop('pending', None)
                     self._save()
                 self._firmware_failed()
             elif kind == 'ota_progress' and event.get('cancellable') is False:

@@ -208,15 +208,25 @@ class StartupTests(Sandbox):
         self.assertEqual(plist['ProgramArguments'], ['/launcher', '--launch'])
         self.assertEqual(plist['EnvironmentVariables'], {'PATH': '/opt/homebrew/bin:/usr/bin', 'CODEX_HOME': '/codex'})
 
-    @unittest.skipIf(sys.platform in ('darwin', 'win32'), 'XDG autostart')
-    def test_repair_keeps_existing_autostart_entry(self):
+    def test_repair_rewrites_autostart_entry_but_keeps_its_profile_variables(self):
+        # Same rule as the macOS login item: a repair (start_now=False) runs
+        # in an app that may lack the user's shell profile. It rewrites the
+        # fields this module manages (program, launcher path) but keeps the
+        # profile variables the explicit install recorded.
         entry = self.home / 'config/autostart/sweetmeter.desktop'
-        entry.parent.mkdir(parents=True)
-        entry.write_text('existing')
-        installation.startup(['/launcher', '--launch'], start_now=False)
-        self.assertEqual(entry.read_text(), 'existing')
-        installation.startup(['/launcher', '--launch'], start_now=True)
-        self.assertIn('/launcher', entry.read_text())
+        with patch.object(sys, 'platform', 'linux'):
+            with patch.dict(os.environ, CODEX_HOME='/codex home'):
+                installation.startup(['/old-launcher', '--launch'], start_now=True)
+            self.assertNotIn('CODEX_HOME', os.environ)
+            installation.startup(['/launcher', '--launch'], start_now=False)
+            text = entry.read_text()
+            self.assertIn('Exec="env" "CODEX_HOME=/codex home" "/launcher" "--launch"\n', text)
+            self.assertNotIn('/old-launcher', text)
+            self.assertEqual(self.popen.call_count, 1)  # Only the explicit install started it.
+            # An entry this module cannot read back is rewritten from the current environment.
+            entry.write_text('existing')
+            installation.startup(['/launcher', '--launch'], start_now=False)
+            self.assertIn('Exec="/launcher" "--launch"\n', entry.read_text())
 
     def test_line_breaks_are_rejected_before_writing(self):
         with self.assertRaises(installation.InstallError):
@@ -363,10 +373,12 @@ class UninstallTests(Sandbox):
     def test_uninstall_refuses_during_an_update_swap(self):
         destination, _ = self.install()
         with self_update._update_lock():
-            with patch.object(installation, 'startup') as startup:
+            with patch.object(installation, 'startup') as startup, \
+                    patch.object(installation, 'stop_running_app', return_value=True) as stop:
                 with self.assertRaisesRegex(installation.InstallError, 'update is being installed'):
                     installation.uninstall()
         startup.assert_not_called()
+        stop.assert_not_called()  # The app being health-checked keeps running.
         self.assertTrue(destination.exists())
 
     def test_interrupted_update_is_finished_before_uninstalling(self):
@@ -489,6 +501,78 @@ class InstallerRepairTests(Sandbox):
         self.assertEqual(self.executable(destination), b'installed')
         self.assertFalse((paths.data_dir() / 'companion-swap.json').exists())
         self.assertEqual(installation._sibling_leftovers(destination), [])
+
+    def test_app_under_an_update_health_check_is_never_stopped(self):
+        # An update helper holds the lock while it health-checks the new
+        # app: a re-run installer must refuse without stopping that app.
+        destination = self.installed('2026.9.1')
+        source = self.download('2026.9.2')
+        with self_update._update_lock(), \
+                patch.object(installation, 'stop_running_app', return_value=True) as stop:
+            with self.assertRaisesRegex(installation.InstallError, 'update is being installed'):
+                self.install(source)
+        stop.assert_not_called()
+        self.assertEqual(self.executable(destination), b'installed')
+        # Without an update running, the app is stopped only once the lock is held.
+        order = []
+        real_lock = self_update._update_lock
+
+        def lock():
+            order.append('lock')
+            return real_lock()
+        with patch.object(self_update, '_update_lock', lock), \
+                patch.object(installation, 'stop_running_app', side_effect=lambda: order.append('stop') or True):
+            self.install(source)
+        self.assertEqual(order, ['lock', 'stop'])
+
+    def test_package_without_a_version_never_crashes_the_installer(self):
+        destination = self.installed('2026.9.5')
+        source = self.download('2026.9.2')
+        (source / ('Contents/Resources/VERSION' if sys.platform == 'darwin' else '_internal/VERSION')).unlink()
+        _, messages, _ = self.install(source)
+        self.assertEqual(self.executable(destination), b'installed')
+        self.assertEqual(messages, ['Sweetmeter 2026.9.5 is already installed and working; '
+                                    'its login startup was checked.'])
+
+    def test_newer_install_is_never_downgraded_after_a_self_test_timeout(self):
+        destination = self.installed('2026.9.5')
+        self.run_mock.side_effect = installation.subprocess.TimeoutExpired('Sweetmeter', 1)
+        _, messages, startup = self.install(self.download('2026.9.2'))
+        self.assertEqual(self.executable(destination), b'installed')
+        self.assertIn('was kept', messages[0])
+        timeouts = [call.kwargs['timeout'] for call in self.run_mock.call_args_list
+                    if call.args and call.args[0][-1] == '--self-test']
+        self.assertEqual(timeouts, [installation.SELF_TEST_TIMEOUT, 2 * installation.SELF_TEST_TIMEOUT])
+        startup.assert_called_once()
+
+    def test_self_test_that_passes_on_the_longer_retry_keeps_the_install(self):
+        destination = self.installed('2026.9.2')
+        self.run_mock.side_effect = [installation.subprocess.TimeoutExpired('Sweetmeter', 1),
+                                     Mock(returncode=0, stdout=b'', stderr=b'')]
+        _, messages, _ = self.install(self.download('2026.9.2'))
+        self.assertEqual(self.executable(destination), b'installed')
+        self.assertIn('already installed and working', messages[0])
+
+    def test_older_install_whose_self_test_times_out_is_still_updated(self):
+        destination = self.installed('2026.9.1')
+        self.run_mock.side_effect = installation.subprocess.TimeoutExpired('Sweetmeter', 1)
+        self.install(self.download('2026.9.2'))
+        self.assertEqual(self.executable(destination), b'download')
+
+    def test_interrupted_installer_swap_is_not_reported_as_an_update_rollback(self):
+        destination = self.installed('2026.9.1')
+        state = paths.default_state_dir()
+        state.mkdir(parents=True, exist_ok=True)
+        swap = self_update.TreeSwap(destination, nonce='abc123abc123', state_dir=state, version='2026.9.2',
+                                    origin='installer')
+        swap.prepare(self.download('2026.9.2'))
+        swap._stage('prepared')  # Journal written, as TreeSwap.swap() does first.
+        destination.rename(swap.backup)
+        swap._stage('old_moved')  # The installer stopped here (power cut, killed).
+        self.assertTrue(self_update.recover_update())
+        self.assertEqual(self.executable(destination), b'installed')
+        result = json.loads((state / 'companion-update-result.json').read_text())
+        self.assertEqual(result['status'], 'install_interrupted')
 
     def test_running_app_is_stopped_before_replacement(self):
         destination = self.installed('2026.9.1')

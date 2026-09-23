@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from .version import get_version
@@ -185,18 +186,48 @@ class Desktop:
         self.connection.set('Forgetting the meter…')
 
     def toggle_start_at_login(self):
-        """Record the choice and add or remove the login item right away."""
-        from .installation import InstallError, set_start_at_login
+        """Record the choice and add or remove the login item.
+
+        Changing it can wait for the installer lock (up to 5 s) and runs
+        launchctl or registry calls, so it runs on a worker thread; the
+        checkbox is disabled meanwhile and the outcome is shown from the Tk
+        thread (the worker never touches Tk)."""
+        from .installation import set_start_at_login
+        if getattr(self, 'start_at_login_job', None) is not None:
+            return
         wanted = bool(self.start_at_login.get())
-        try:
-            set_start_at_login(wanted)
-        except (InstallError, OSError, ValueError, RuntimeError) as error:
-            logging.warning('Start at login could not be changed (%s)', type(error).__name__)
-            self.start_at_login.set(not wanted)
-            messagebox.showerror('Cannot change login startup',
-                                 plain(str(error) if isinstance(error, InstallError) else '',
-                                       'Sweetmeter could not change its login startup. Try again.'),
-                                 parent=self.root)
+        job = self.start_at_login_job = {'wanted': wanted, 'done': threading.Event(), 'error': None}
+
+        def work():
+            try:
+                set_start_at_login(wanted)
+            except Exception as error:  # noqa: BLE001 - shown to the user, never raised on a worker
+                job['error'] = error
+            finally:
+                job['done'].set()
+        self.start_at_login_box.configure(state='disabled')
+        threading.Thread(target=work, name='sweetmeter-start-at-login', daemon=True).start()
+        self.root.after(50, self._start_at_login_finished)
+
+    def _start_at_login_finished(self):
+        from .installation import InstallError
+        job = getattr(self, 'start_at_login_job', None)
+        if job is None:
+            return
+        if not job['done'].is_set():
+            self.root.after(50, self._start_at_login_finished)
+            return
+        self.start_at_login_job = None
+        self.start_at_login_box.configure(state='normal')
+        error = job['error']
+        if error is None:
+            return
+        logging.warning('Start at login could not be changed (%s)', type(error).__name__)
+        self.start_at_login.set(not job['wanted'])
+        messagebox.showerror('Cannot change login startup',
+                             plain(str(error) if isinstance(error, InstallError) else '',
+                                   'Sweetmeter could not change its login startup. Try again.'),
+                             parent=self.root)
 
     def uninstall(self):
         if self.app.updates and self.app.updates.busy:

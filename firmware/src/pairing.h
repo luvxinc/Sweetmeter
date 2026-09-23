@@ -14,10 +14,14 @@
 uint32_t crc32(const uint8_t *bytes, size_t size);
 
 namespace sweetmeter {
-constexpr size_t secretSize = 32, challengeSize = 16, proofSize = 16, serialSize = 12, maxPaired = 8;
+constexpr size_t secretSize = 32, challengeSize = 16, proofSize = 16, serialSize = 12, maxPaired = 8, nonceSize = 16;
 // Hello ACK results (`H:u8, result:u8`, sent for H and P); Y replies use 0/5/7.
 constexpr uint8_t helloOk = 0, helloStoreFailed = 5, helloRejected = 7, helloProvision = 8, helloNotSelected = 9;
 constexpr char authLabel[] = "SWM-AUTH-1";
+// Mutual authentication: the meter proves the same secret over the computer's
+// nonce (sent in `N` before `P`), so a peripheral that copied this meter's
+// serial and accepts any proof cannot pass as this meter.
+constexpr char meterLabel[] = "SWM-METER-1";
 
 inline bool constantTimeEqual(const uint8_t *a, const uint8_t *b, size_t n) {
   volatile uint8_t difference = 0;
@@ -44,6 +48,25 @@ inline bool computeProof(const uint8_t *secret, const uint8_t *challenge, const 
   memcpy(message + label, challenge, challengeSize);
   memcpy(message + label + challengeSize, serial, serialSize);
   memcpy(message + label + challengeSize + serialSize, host, 36);
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  uint8_t mac[32];
+  if (!info || mbedtls_md_hmac(info, secret, secretSize, message, sizeof(message), mac) != 0) return false;
+  memcpy(proof, mac, proofSize);
+  return true;
+}
+
+// meter proof = first 16 bytes of HMAC-SHA256(secret, "SWM-METER-1" ||
+// challenge(16) || host nonce(16) || device serial ASCII (12) || host ID ASCII (36)).
+inline bool computeMeterProof(const uint8_t *secret, const uint8_t *challenge, const uint8_t *nonce,
+                              const char *serial, const char *host, uint8_t *proof) {
+  constexpr size_t label = sizeof(meterLabel) - 1;
+  uint8_t message[label + challengeSize + nonceSize + serialSize + 36];
+  uint8_t *at = message;
+  memcpy(at, meterLabel, label); at += label;
+  memcpy(at, challenge, challengeSize); at += challengeSize;
+  memcpy(at, nonce, nonceSize); at += nonceSize;
+  memcpy(at, serial, serialSize); at += serialSize;
+  memcpy(at, host, 36);
   const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
   uint8_t mac[32];
   if (!info || mbedtls_md_hmac(info, secret, secretSize, message, sizeof(message), mac) != 0) return false;
@@ -173,7 +196,15 @@ class Registry {
   uint32_t clock_ = 0;
 };
 
-struct AuthOutcome { uint8_t result; bool drop, changed; };  // aggregate (C++11 toolchain)
+// quiet: send no reply (an accepted N). proofLength 16: the reply carries the
+// meter proof after the result byte (mutual authentication).
+struct AuthOutcome { uint8_t result; bool drop, changed, quiet; uint8_t proofLength; uint8_t proof[proofSize]; };
+inline AuthOutcome authOutcome(uint8_t result, bool drop, bool changed, bool quiet = false) {
+  AuthOutcome outcome;
+  memset(&outcome, 0, sizeof(outcome));
+  outcome.result = result; outcome.drop = drop; outcome.changed = changed; outcome.quiet = quiet;
+  return outcome;
+}
 
 // Trust on first use for a selection inherited from pre-secret firmware is
 // allowed only briefly: for ten minutes after each boot (an OTA install, a reset
@@ -196,7 +227,7 @@ class LinkAuth {
  public:
   enum class State : uint8_t { Open, Provisioning, Authorized, Closed };
   State state = State::Open;
-  void reset() { state = State::Open; }
+  void reset() { state = State::Open; hasNonce_ = false; }
   // Opening/closing the physical menu ends this link's authorization.
   void revoke() { state = State::Closed; }
   bool authorized() const { return state == State::Authorized; }
@@ -207,7 +238,7 @@ class LinkAuth {
   AuthOutcome legacyHello(const uint8_t *p, size_t n, const Registry &registry, bool menu, bool ota,
                           LegacyWindow &window, uint32_t now) {
     if (ota) return current();
-    if (state == State::Authorized) return {helloOk, false, false};
+    if (state == State::Authorized) return authOutcome(helloOk, false, false);
     bool valid = n >= 37 && n <= 57 && hostId(p + 1, 36) && (n == 37 || hostName(p + 37, n - 37));
     const PairedComputer *selected = registry.current();
     if (state != State::Open || menu || !valid || !selected || selected->hasSecret || memcmp(selected->host, p + 1, 36))
@@ -215,20 +246,36 @@ class LinkAuth {
     if (!window.open(now)) return reject();
     window.consume();
     state = State::Provisioning;
-    return {helloProvision, false, false};
+    return authOutcome(helloProvision, false, false);
+  }
+  // `N:u8, host_nonce:16`, sent directly before P by a companion that
+  // requires mutual authentication. No reply; the next P reply carries the
+  // meter proof. At most one per link, and only before the hello.
+  AuthOutcome nonce(const uint8_t *p, size_t n, bool ota) {
+    if (ota) return authOutcome(helloOk, false, false, true);
+    if (state != State::Open || hasNonce_ || n != 1 + nonceSize) return reject();
+    memcpy(nonce_, p + 1, nonceSize); hasNonce_ = true;
+    return authOutcome(helloOk, false, false, true);
   }
   // `P:u8, proof:16`. A paired computer that is not the selected one learns
-  // that it is still paired (result 9) but is not authorized.
+  // that it is still paired (result 9) but is not authorized. While the menu
+  // is open a hello never authorizes; after N it still answers 9 (known) or 7
+  // (unknown) so a paired computer can tell whether it must register again.
+  // After N, results 0 and 9 carry the meter proof for the matched secret.
   AuthOutcome proofHello(const uint8_t *p, size_t n, const Registry &registry, const uint8_t *challenge,
                          const char *serial, bool menu, bool ota) {
     if (ota) return current();
-    if (state == State::Authorized) return {helloOk, false, false};
-    if (state != State::Open || menu || n != 1 + proofSize) return reject();
+    if (state == State::Authorized) return authOutcome(helloOk, false, false);
+    if (state != State::Open || (menu && !hasNonce_) || n != 1 + proofSize) return reject();
     int match = registry.matchProof(p + 1, challenge, serial);
     if (match < 0) return reject();
-    if (match != registry.selected) { state = State::Closed; return {helloNotSelected, true, false}; }
-    state = State::Authorized;
-    return {helloOk, false, true};
+    AuthOutcome outcome;
+    if (menu || match != registry.selected) { state = State::Closed; outcome = authOutcome(helloNotSelected, true, false); }
+    else { state = State::Authorized; outcome = authOutcome(helloOk, false, true); }
+    if (hasNonce_ && computeMeterProof(registry.entries[match].secret, challenge, nonce_, serial,
+                                       registry.entries[match].host, outcome.proof))
+      outcome.proofLength = proofSize;
+    return outcome;
   }
   // `Y:u8, secret:32` is legal only directly after an accepted legacy H.
   bool provisionAllowed(const uint8_t *p, size_t n) const {
@@ -236,13 +283,15 @@ class LinkAuth {
   }
   AuthOutcome provisionRejected() { return reject(); }
   AuthOutcome provisioned(bool stored) {
-    if (!stored) { state = State::Closed; return {helloStoreFailed, true, false}; }
+    if (!stored) { state = State::Closed; return authOutcome(helloStoreFailed, true, false); }
     state = State::Authorized;
-    return {helloOk, false, true};
+    return authOutcome(helloOk, false, true);
   }
 
  private:
-  AuthOutcome reject() { state = State::Closed; return {helloRejected, true, false}; }
-  AuthOutcome current() const { return {authorized() ? helloOk : helloRejected, false, false}; }
+  uint8_t nonce_[nonceSize]{};
+  bool hasNonce_ = false;
+  AuthOutcome reject() { state = State::Closed; return authOutcome(helloRejected, true, false); }
+  AuthOutcome current() const { return authOutcome(authorized() ? helloOk : helloRejected, false, false); }
 };
 }  // namespace sweetmeter

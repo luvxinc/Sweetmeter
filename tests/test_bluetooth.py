@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from meter.bluetooth import (Bluetooth, Session, PairingStore, PairingRejected, companion_identity,
                              parse_status, pairing_proof, classify_error, value_budget, advertised_kind,
-                             CONTROL_UUID, DATA_UUID, DiscoveryOpened)
+                             meter_proof, CONTROL_UUID, DATA_UUID, DiscoveryOpened, JOB_EXPIRED)
 
 HOST = '7a1e1000-ff1b-4d9f-a023-0123456789ab'
 OTHER = '7a1e1000-ff1b-4d9f-a023-00000000000b'
@@ -69,6 +69,7 @@ class FakeClient:
             self.callback(None, struct.pack('<cBII', b'J', self.result, self.session, self.total))
         elif data[:1] == b'B':
             _, self.sequence, self.crc, _ = struct.unpack('<cIIH', data)
+            self.frame = bytearray()
             self.begin_written.set()
             if self.auto_begin:
                 self.callback(None, struct.pack('<cBII', b'b', self.begin_result, self.sequence, self.crc))
@@ -78,8 +79,12 @@ class FakeClient:
 
 class FakeMeter:
     """Emulates the firmware pairing rules (tests/test_pairing.cpp covers the C++)."""
-    def __init__(self, address='meter', *, serial=SERIAL, legacy_status=False):
+    def __init__(self, address='meter', *, serial=SERIAL, legacy_status=False, mutual=False, rogue=None):
         self.address, self.serial, self.legacy_status = address, serial, legacy_status
+        # mutual: firmware that proves the secret back after N ("mutual": 1).
+        # rogue: 'accept' answers every proof with 0, 'reject' with 7 (a
+        # peripheral that copied the serial and knows no secret).
+        self.mutual, self.rogue = mutual, rogue
         self.paired = {}            # host -> secret (None = migrated legacy selection)
         self.selected = None
         self.menu_nonce = 0
@@ -92,10 +97,13 @@ class FakeMeter:
         if self.legacy_status:
             return {'protocol': 4, 'firmware': '2026.9.13', 'selected_host': self.selected or '',
                     'menu': bool(self.menu_nonce), 'discovery_nonce': self.menu_nonce}
-        return {'protocol': 4, 'firmware': '2026.9.14', 'auth': 1, 'serial': self.serial,
-                'selected': self.selected is not None,
-                'secured': self.selected is not None and self.paired.get(self.selected) is not None,
-                'challenge': self.challenge, 'menu': bool(self.menu_nonce), 'discovery_nonce': self.menu_nonce}
+        status = {'protocol': 4, 'firmware': '2026.9.14', 'auth': 1, 'serial': self.serial,
+                  'selected': self.selected is not None,
+                  'secured': self.selected is not None and self.paired.get(self.selected) is not None,
+                  'challenge': self.challenge, 'menu': bool(self.menu_nonce), 'discovery_nonce': self.menu_nonce}
+        if self.mutual:
+            status['mutual'] = 1
+        return status
     def client_factory(self, meters):
         meter_by_address = {m.address: m for m in meters}
         class Client:
@@ -106,6 +114,7 @@ class FakeMeter:
                 self.callback = None
                 self.state = 'open'
                 self.body = bytearray()
+                self.nonce = None
             async def __aenter__(self):
                 self.meter.connections += 1
                 self.meter.challenge = os.urandom(16).hex()
@@ -136,14 +145,23 @@ class FakeMeter:
                     self.callback(None, b'H' + bytes([reply]))
                     if reply == 7:
                         self.is_connected = False
+                elif op == b'N':
+                    assert len(data) == 17 and self.nonce is None and self.state == 'open'
+                    self.nonce = data[1:]
                 elif op == b'P':
-                    reply = 7
-                    if self.state == 'open':
+                    reply, proof = 7, b''
+                    if m.rogue == 'accept':
+                        reply = 0
+                        proof = os.urandom(16) if self.nonce is not None and m.mutual else b''
+                    elif m.rogue is None and self.state == 'open' and (not m.menu_nonce or self.nonce is not None):
                         for host, secret in m.paired.items():
                             if secret is not None and pairing_proof(secret, m.challenge, m.serial, host) == data[1:]:
-                                reply = 0 if host == m.selected else 9
+                                # In the open menu a hello only reports membership.
+                                reply = 0 if host == m.selected and not m.menu_nonce else 9
+                                if self.nonce is not None and m.mutual:
+                                    proof = meter_proof(secret, m.challenge, self.nonce, m.serial, host)
                     self.state = 'authorized' if reply == 0 else 'closed'
-                    self.callback(None, b'H' + bytes([reply]))
+                    self.callback(None, b'H' + bytes([reply]) + proof)
                     if reply:
                         self.is_connected = False
                 elif op == b'Y':
@@ -169,6 +187,7 @@ class FakeMeter:
                     self.is_connected = False
                 elif op == b'T':
                     assert self.state == 'authorized'
+                    m.clock_writes = getattr(m, 'clock_writes', 0) + 1
                     self.is_connected = False  # end the connected loop quickly
         Client.frame = bytearray()
         return Client
@@ -514,7 +533,9 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             radio.store.mark_paired('address:elsewhere', 'elsewhere', legacy=True)
             await self.visit(radio, meter)
             self.assertIsNone(meter.paired[HOST])
-            self.assertEqual(events_of(radio)[-1]['reason'], 'other_computer')
+            # Unrelated pairing firmware with a closed menu: the link is closed before any write.
+            self.assertEqual(meter.writes, [])
+            self.assertNotIn('connected', [e['event'] for e in events_of(radio)])
 
     async def test_legacy_migration_by_another_computer_is_refused(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -549,8 +570,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             confirm(radio, meter)
             meter.selected = HOST
             original = Session.authenticate
-            async def forget_meanwhile(session, *args):
-                await original(session, *args)
+            async def forget_meanwhile(session, *args, **kwargs):
+                await original(session, *args, **kwargs)
                 radio.forget()
             with patch.object(Session, 'authenticate', forget_meanwhile):
                 await self.visit(radio, meter)
@@ -931,6 +952,287 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PairingRejected) as caught:
             await self.session.hello()
         self.assertNotIsInstance(caught.exception, PermissionError)
+
+
+KEY = 'serial:' + SERIAL
+
+
+class BoundPairingTests(unittest.IsolatedAsyncioTestCase):
+    """A confirmed pairing is bound to (serial, address the secret was proven at)."""
+    async def visit(self, radio, meter, hinted=False):
+        return await radio._visit(SimpleNamespace(address=meter.address), hinted)
+
+    async def pair(self, radio, meter):
+        meter.menu_nonce = 41
+        await self.visit(radio, meter, hinted=True)
+        meter.select(HOST)
+        self.assertEqual(await self.visit(radio, meter), 0)
+        events_of(radio)
+        return radio.store.secret(KEY)
+
+    async def test_rogue_with_copied_serial_cannot_demote_or_take_over_the_pairing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            real, rogue = FakeMeter('real'), FakeMeter('rogue', rogue='reject')
+            radio = radio_for(folder, [real, rogue])
+            confirmed = await self.pair(radio, real)
+            # 1. The rogue copies the serial, claims our selection and refuses our hello.
+            rogue.selected, rogue.paired[HOST] = HOST, b'\x01' * 32
+            await self.visit(radio, rogue)
+            self.assertFalse(radio.store.needs_registration(KEY))
+            self.assertTrue(radio.store.trusted(KEY, 'real'))
+            # 2. It opens a "menu": this computer is still paired, so it registers nothing.
+            rogue.selected, rogue.menu_nonce = None, 7
+            await self.visit(radio, rogue, hinted=True)
+            self.assertNotIn(HOST, getattr(rogue, 'candidates', {}))
+            self.assertIsNone(radio.store.pending(KEY, 'rogue'))
+            # 3. It claims the selection and accepts any proof. Even with a pending
+            # secret for its address (as an earlier companion registered there),
+            # it is never driven and nothing moves.
+            stale = radio.store.new_pending(KEY, 'rogue')
+            rogue.rogue, rogue.menu_nonce, rogue.selected = 'accept', 0, HOST
+            delay = await self.visit(radio, rogue)
+            events = events_of(radio)
+            self.assertNotIn('connected', [e['event'] for e in events])
+            self.assertIn('meter_conflict', [e.get('code') for e in events])
+            self.assertGreaterEqual(delay, 30)
+            self.assertFalse(getattr(rogue, 'clock_writes', 0))  # no clock, frame or firmware
+            self.assertEqual(radio.store.secret(KEY), confirmed)
+            self.assertEqual(radio.store.bound_address(KEY), 'real')
+            self.assertEqual(radio.store.pending(KEY, 'rogue'), stale)
+            self.assertTrue(radio.store.related('real'))
+            # The real meter is still ours.
+            self.assertEqual(await self.visit(radio, real), 0)
+            self.assertIn('connected', [e['event'] for e in events_of(radio)])
+
+    async def test_pending_from_another_address_waits_until_the_bound_meter_refuses(self):
+        with tempfile.TemporaryDirectory() as folder:
+            real, other = FakeMeter('real'), FakeMeter('other')
+            radio = radio_for(folder, [real, other])
+            confirmed = await self.pair(radio, real)
+            # A pending secret for another address (sent to whoever answered there).
+            pending = radio.store.new_pending(KEY, 'other')
+            self.assertEqual(radio.store.bound_address(KEY), 'real')  # a registration never moves it
+            other.paired[HOST], other.selected = pending, HOST
+            await self.visit(radio, other)
+            self.assertEqual(radio.store.secret(KEY), confirmed)
+            self.assertEqual(radio.store.pending(KEY, 'other'), pending)  # kept per address
+            self.assertFalse(radio.store.promote(KEY, 'other', pending))
+            # The meter at the bound address forgets us (refuses the confirmed secret).
+            real.paired.clear()
+            real.paired[OTHER], real.selected = b'\x05' * 32, OTHER
+            await self.visit(radio, real)
+            self.assertTrue(radio.store.refused(KEY))
+            # Only now may the pending secret proven at the other address replace it.
+            self.assertEqual(await self.visit(radio, other), 0)
+            self.assertEqual(radio.store.secret(KEY), pending)
+            self.assertEqual(radio.store.bound_address(KEY), 'other')
+
+    async def test_mutual_proof_exposes_a_rogue_and_follows_a_real_address_change(self):
+        with tempfile.TemporaryDirectory() as folder:
+            real = FakeMeter('real', mutual=True)
+            rogue = FakeMeter('rogue', mutual=True, rogue='accept')
+            moved = FakeMeter('moved', mutual=True)
+            radio = radio_for(folder, [real, rogue, moved])
+            confirmed = await self.pair(radio, real)
+            self.assertTrue(radio.store.requires_mutual(KEY))
+            self.assertIn(b'N', [w[:1] for w in real.writes])
+            # A rogue that accepts any proof cannot produce the meter proof (it
+            # holds a pending secret an earlier companion registered with it).
+            radio.store.new_pending(KEY, 'rogue')
+            rogue.selected, rogue.paired[HOST] = HOST, b'\x01' * 32
+            await self.visit(radio, rogue)
+            self.assertIn('meter_conflict', [e.get('code') for e in events_of(radio)])
+            self.assertFalse(getattr(rogue, 'clock_writes', 0))
+            # Nor can it downgrade by hiding mutual support.
+            rogue.mutual = False
+            radio._last_error = (None, 0)
+            await self.visit(radio, rogue)
+            self.assertIn('meter_conflict', [e.get('code') for e in events_of(radio)])
+            self.assertEqual(rogue.connections, 2)
+            self.assertEqual((radio.store.secret(KEY), radio.store.bound_address(KEY)), (confirmed, 'real'))
+            # Our meter at a new address (the OS reset its identifiers) proves the
+            # confirmed secret itself in its open menu, so the pairing follows it.
+            moved.paired[HOST], moved.menu_nonce = confirmed, 70
+            await self.visit(radio, moved, hinted=True)
+            self.assertNotIn(HOST, getattr(moved, 'candidates', {}))
+            self.assertEqual(radio.store.bound_address(KEY), 'moved')
+            moved.select(HOST)
+            self.assertEqual(await self.visit(radio, moved), 0)
+            self.assertEqual(radio.store.bound_address(KEY), 'moved')
+            self.assertEqual(radio.store.secret(KEY), confirmed)
+
+    async def test_nothing_selected_keeps_a_pairing_the_meter_still_knows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter])
+            await self.pair(radio, meter)
+            meter.selected = None  # the owner removed the selected computer's selection
+            delay = await self.visit(radio, meter)
+            self.assertEqual(events_of(radio)[-1]['reason'], 'unpaired')
+            self.assertLessEqual(delay, 5)
+            self.assertFalse(radio.store.needs_registration(KEY))  # no fresh secret, no NEW KEY prompt
+            # Firmware without mutual authentication cannot answer membership in
+            # its menu: a paired computer neither registers nor sends a hello there.
+            meter.menu_nonce, meter.writes = 50, []
+            await self.visit(radio, meter, hinted=True)
+            self.assertEqual(meter.writes, [])
+            # Forgotten while nothing is selected: this computer registers again.
+            meter.paired.clear()
+            meter.menu_nonce = 0
+            await self.visit(radio, meter)
+            self.assertTrue(radio.store.needs_registration(KEY))
+
+    async def test_open_menu_reports_whether_this_computer_is_still_paired(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter(mutual=True)
+            radio = radio_for(folder, [meter])
+            confirmed = await self.pair(radio, meter)
+            meter.candidates = {}
+            # Still paired: one membership hello (N, P), no registration.
+            meter.menu_nonce, meter.writes = 60, []
+            await self.visit(radio, meter, hinted=True)
+            self.assertEqual([w[:1] for w in meter.writes], [b'N', b'P'])
+            self.assertNotIn(HOST, meter.candidates)
+            await self.visit(radio, meter, hinted=True)
+            self.assertEqual(len(meter.writes), 2)  # checked once per menu window
+            # Removed in the menu: the meter answers 7, and this computer reappears.
+            del meter.paired[HOST]
+            meter.menu_nonce = 61
+            delay = await self.visit(radio, meter, hinted=True)
+            self.assertLessEqual(delay, 2)
+            self.assertTrue(radio.store.needs_registration(KEY))
+            await self.visit(radio, meter, hinted=True)
+            self.assertIn(HOST, meter.candidates)
+            self.assertNotEqual(meter.candidates[HOST], confirmed)
+            meter.select(HOST)
+            self.assertEqual(await self.visit(radio, meter), 0)
+            self.assertEqual(radio.store.secret(KEY), meter.paired[HOST])
+
+    async def test_dropped_marker_is_reclassified_from_the_status(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter('stranger')  # pairing firmware; this scanner drops manufacturer data
+            radio = radio_for(folder, [meter], marker=False)
+            await radio._cycle()
+            self.assertEqual(meter.connections, 1)  # looked pre-secret, so it was probed once
+            self.assertEqual(meter.writes, [])       # left right after the status read
+            self.assertIn('selection_required', [e['event'] for e in events_of(radio)])
+            radio._not_before.clear()
+            await radio._cycle()
+            self.assertEqual(meter.connections, 1)  # now treated as pairing firmware, menu closed
+            # Its menu opens: the name suffix still says so, and it registers.
+            meter.menu_nonce = 8
+            radio.scanner_factory = radio_for(folder, [meter], hints={'stranger'}, marker=False).scanner_factory
+            await radio._cycle()
+            self.assertIn(HOST, meter.candidates)
+
+
+class RefreshAnswerTests(unittest.IsolatedAsyncioTestCase):
+    async def run_link(self, radio, script, cycles=6):
+        client = FakeClient()
+        session = Session(client, HOST, 'Test PC', radio.events.put)
+        await session.subscribe()
+        status = {'protocol': 4, 'firmware': '2026.9.14'}
+        async def read(_):
+            return json.dumps(status).encode()
+        client.read_gatt_char = read
+        steps = []
+        async def step(_seconds):
+            steps.append(1)
+            action = script.get(len(steps))
+            if action:
+                action(client)
+            if len(steps) >= cycles:
+                client.is_connected = False
+        radio._sleep = step
+        async def clock(_self):
+            pass
+        with patch.object(Session, 'clock', clock):
+            await radio._connected(session, 'meter', status, 'address:meter')
+        return [p for c, p in client.writes if c == CONTROL_UUID and p[:1] == b'B']
+
+    async def test_refresh_press_gets_one_frame_even_when_nothing_changed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            frame = b'\x0f' * 4000
+            radio.send(frame)
+            begins = await self.run_link(radio, {
+                1: lambda client: client.callback(None, b'R'),  # the meter asks; the app forces a refresh
+                3: lambda client: radio.send(frame),             # ...which renders the same frame
+                4: lambda client: radio.send(frame),             # later identical frames are not resent
+            })
+            self.assertEqual(len(begins), 2)
+            self.assertIn({'event': 'refresh'}, events_of(radio))
+
+    async def test_identical_frames_without_a_press_are_not_resent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            frame = b'\x0f' * 4000
+            radio.send(frame)
+            begins = await self.run_link(radio, {2: lambda client: radio.send(frame)})
+            self.assertEqual(len(begins), 1)
+            # A press whose refresh never produces a frame sends nothing (the meter's
+            # 10-second marker acknowledges it).
+            radio2 = radio_for(folder, [])
+            radio2.send(frame)
+            begins = await self.run_link(radio2, {1: lambda client: client.callback(None, b'R')})
+            self.assertEqual(len(begins), 1)
+
+
+class JobLockTests(unittest.TestCase):
+    def test_install_during_expiry_check_never_reports_the_wrong_job_expired(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'companion.json').write_text(json.dumps({'host_id': HOST}))
+            radio = Bluetooth(folder, start=False)
+            first = dict(image_path='a.bin', envelope=b'env', companion_version='2026.9.15', usb_power=True)
+            radio.install_firmware(device_id='meter', **first)
+            taken, release = threading.Event(), threading.Event()
+            original = radio.jobs.get_nowait
+            def slow_get():
+                item = original()
+                taken.set()
+                release.wait(2)  # the job is out of the queue for a moment
+                return item
+            radio.jobs.get_nowait = slow_get
+            worker = threading.Thread(target=radio._expire_job)
+            worker.start()
+            self.assertTrue(taken.wait(2))
+            outcome = []
+            def install():
+                try:
+                    radio.install_firmware(device_id='meter', image_path='b.bin')
+                    outcome.append('queued')
+                except queue.Full:
+                    outcome.append('full')
+            second = threading.Thread(target=install)
+            second.start()
+            second.join(.2)
+            self.assertTrue(second.is_alive())  # waits for the expiry check instead of racing it
+            release.set()
+            worker.join(2)
+            second.join(2)
+            radio.jobs.get_nowait = original
+            self.assertEqual(outcome, ['full'])  # the fresh first job is still queued
+            self.assertNotIn(JOB_EXPIRED, events_of(radio))
+            self.assertEqual(radio.jobs.get_nowait()[0]['image_path'], 'a.bin')
+
+
+class MutualStatusTests(unittest.TestCase):
+    def test_mutual_flag_is_strict(self):
+        good = {'protocol': 4, 'firmware': '2026.9.14', 'auth': 1, 'serial': SERIAL, 'selected': True,
+                'secured': True, 'challenge': 'ab' * 16, 'mutual': 1}
+        self.assertEqual(parse_status(json.dumps(good).encode())['mutual'], 1)
+        for change in ({'mutual': True}, {'mutual': 2}, {'mutual': '1'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                parse_status(json.dumps({**good, **change}).encode())
+        legacy = {'protocol': 4, 'firmware': '2026.9.13', 'selected_host': '', 'mutual': 1}
+        with self.assertRaises(ValueError):
+            parse_status(json.dumps(legacy).encode())
+
+    def test_meter_proof_matches_firmware_vector(self):
+        # Same vector as tests/test_pairing.cpp (mutualAuthentication).
+        proof = meter_proof(bytes(range(1, 33)), bytes(range(0xa0, 0xb0)).hex(), bytes(range(0x10, 0x20)),
+                            SERIAL, HOST)
+        self.assertEqual(proof.hex(), '8b2739822a4b9a04626344b72fad7e91')
 
 
 if __name__ == '__main__':

@@ -22,7 +22,7 @@ struct StatusFields {
 // Returns the JSON length, or -1 if it would not fit (never truncated).
 inline int formatStatus(char *out, size_t size, const StatusFields &f, size_t &challengeOffset) {
   int length = snprintf(out, size,
-    "{\"protocol\":4,\"firmware\":\"%s\",\"board\":\"%s\",\"auth\":1,\"serial\":\"%s\",\"selected\":%s,"
+    "{\"protocol\":4,\"firmware\":\"%s\",\"board\":\"%s\",\"auth\":1,\"mutual\":1,\"serial\":\"%s\",\"selected\":%s,"
     "\"secured\":%s,\"challenge\":\"%s\",\"battery_percent\":%d,\"battery_mv\":%d,\"interval\":%u,"
     "\"critical\":%s,\"charge_state\":\"unknown\",\"clock_synced\":%s,\"menu\":%s,\"discovery_nonce\":%lu,"
     "\"discovery_remaining_ms\":%lu,\"computers\":%u,\"ota\":%s,\"boot_health\":\"%s\",\"last_update\":\"%s\","

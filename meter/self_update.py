@@ -330,13 +330,25 @@ def recover_update_locked():
         instance.close()
 
 
+def swap_origin(record):
+    """'installer' for a swap an installer/repair started, else 'update'.
+    Journals written before the origin was recorded mark installer swaps with
+    version 'installer' only when the package had no readable version."""
+    origin = record.get('origin')
+    if origin in ('installer', 'update'):
+        return origin
+    return 'installer' if record.get('version') == 'installer' else 'update'
+
+
 def _recover_stopped(record, root, incoming, backup, journal):
+    installer = swap_origin(record) == 'installer'
     if record.get('stage') == 'confirmed':
         if not root.is_dir():
             raise RuntimeError('Confirmed installation missing; manual recovery required')
         _rmtree(backup)
-        _write(Path(record['state_dir']) / 'companion-update-result.json',
-               {'status': 'success', 'version': record['version']})
+        if not installer:  # The installer already reported its own success.
+            _write(Path(record['state_dir']) / 'companion-update-result.json',
+                   {'status': 'success', 'version': record['version']})
     else:
         if backup.exists():
             if root.exists() and tree_pids(root):
@@ -350,9 +362,16 @@ def _recover_stopped(record, root, incoming, backup, journal):
             raise RuntimeError('No installation or backup available for recovery')
         state = Path(record['state_dir'])
         state.mkdir(parents=True, exist_ok=True)
-        _write(state / 'companion-update-result.json',
-               {'status': 'rollback', 'version': record['version'],
-                'reason': 'Recovered an interrupted or unconfirmed application update'})
+        if installer:
+            # Not a companion update the user started from the app: never
+            # report it as a rolled-back update or mark that version failed.
+            _write(state / 'companion-update-result.json',
+                   {'status': 'install_interrupted', 'version': record['version'],
+                    'reason': 'An interrupted Sweetmeter installation was undone'})
+        else:
+            _write(state / 'companion-update-result.json',
+                   {'status': 'rollback', 'version': record['version'],
+                    'reason': 'Recovered an interrupted or unconfirmed application update'})
     _rmtree(incoming)
     journal.unlink()
     _sync_dir(journal.parent)
@@ -992,13 +1011,15 @@ class TreeSwap:
     swap. The caller must hold `_update_lock()` and must have stopped the app.
     """
 
-    def __init__(self, root, *, nonce, state_dir, version):
+    def __init__(self, root, *, nonce, state_dir, version, origin='update'):
         self.root = Path(root)
         self.incoming = self.root.with_name(self.root.name + '.incoming-' + nonce[:12])
         self.backup = self.root.with_name(self.root.name + '.previous-' + nonce[:12])
         self.journal = data_dir() / 'companion-swap.json'
+        # 'update' (the in-app companion update) or 'installer' (an installer
+        # replacing or repairing the app): recovery reports them differently.
         self.recovery = dict(schema=1, root=str(self.root), nonce=nonce, state_dir=str(state_dir),
-                             version=version, stage='prepared')
+                             version=version, stage='prepared', origin=origin)
         self.moved = self.replaced = self.journaled = False
 
     def prepare(self, candidate, *, strip_marks=False):

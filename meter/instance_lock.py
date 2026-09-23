@@ -23,8 +23,18 @@ class InstanceLock:
             raise
 
     def close(self):
-        if sys.platform == 'win32':
-            import msvcrt
-            self.handle.seek(0)
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-        self.handle.close()
+        """Release the lock. Idempotent: a second close (for example a test
+        cleanup after an explicit close) does nothing."""
+        handle, self.handle = self.handle, None
+        if handle is None or handle.closed:
+            return
+        try:
+            if sys.platform == 'win32':
+                import msvcrt
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass  # Closing the handle releases the region anyway.
+        finally:
+            handle.close()

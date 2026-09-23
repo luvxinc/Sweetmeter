@@ -92,7 +92,7 @@ QueueHandle_t packetQueue=nullptr,rejectQueue=nullptr;
 struct HostPacket { uint32_t generation; uint16_t size; uint8_t kind; bool invalid; uint8_t bytes[182]; };
 enum PacketKind : uint8_t { DashboardControl, DashboardData, OtaControl, OtaData };
 constexpr uint8_t helloBusy=2;
-void drawScreen();
+void drawScreen(bool answersPress=false);
 uint32_t read32(const uint8_t *p) { return sweetmeter::u32(p); }
 void put32(uint8_t *p,uint32_t value) { sweetmeter::put32(p,value); }
 void wakeWorker() { if(workerTask) xTaskNotifyGive(workerTask); }
@@ -190,7 +190,7 @@ void rejectPacket(uint8_t kind,const uint8_t *p,size_t n,bool busy) {
   if(kind==DashboardControl && n && (p[0]=='J'||p[0]=='j'||p[0]=='K')) {
     registrationReply(busy?RegBusy:RegMalformed,n>=5?read32(p+1):0,0); return;
   }
-  if(kind==DashboardControl && n && (p[0]=='H'||p[0]=='P'||p[0]=='Y')) {
+  if(kind==DashboardControl && n && (p[0]=='H'||p[0]=='P'||p[0]=='Y'||p[0]=='N')) {
     uint8_t answer[2]={uint8_t(p[0]=='Y'?'Y':'H'),uint8_t(busy?helloBusy:helloRejected)}; notifyControl(answer,2); return;
   }
   if(kind==DashboardControl && n && p[0]=='B') frameBeginReply(2,n>=5?read32(p+1):0,n>=9?read32(p+5):0);
@@ -480,7 +480,7 @@ void drawMenu() {
   if(!discovery.count) textAt(4,43,"Waiting for computers...");
   textAt(4,107,"Top: rescan    Bottom: back");
 }
-void drawScreen() {
+void drawScreen(bool answersPress) {
   using sweetmeter::OtaState;
   if(ota.active()) {
     memset(frame,0xff,FRAME_SIZE); box(0,0,250,14,true); textAt(4,1,"FIRMWARE UPDATE",false);
@@ -518,7 +518,8 @@ void drawScreen() {
       textAt(sweetmeter::bannerTextX(text),55,String(text).substring(0,length));
     }
   }
-  if(memcmp(frame,panelFrame,FRAME_SIZE) || !panelReady) displayFrame();
+  // The frame answering a refresh press is refreshed even when identical.
+  if(sweetmeter::panelRefreshNeeded(memcmp(frame,panelFrame,FRAME_SIZE)!=0,panelReady,answersPress)) displayFrame();
   uiDirty=false;
 }
 void buttonTask(void *) {
@@ -554,9 +555,10 @@ void setAdvertisedMenu(bool menu) {
   if(!connected) advertise();
 }
 void closeDiscovery() {
-  // A computer connected while the menu closes may have lost the race with
-  // the owner's choice: it keeps the bond its OS stored (bond_policy.h).
-  if(connected) earnBond();
+  // A computer that registered in this window and is connected while the
+  // menu closes may have lost the race with the owner's choice: it keeps the
+  // bond its OS stored (bond_policy.h). Any other connected central does not.
+  if(connected && sweetmeter::menuRaceEarnsBond(true,connectionAt,menuClosedAt,menuEverClosed,discovery.registeredPeer(linkPeer))) earnBond();
   menuClosedAt=millis(); menuEverClosed=true;
   discovery.close(); removeConfirm=keyConfirm=-1; receiving=pendingFrame=false; linkAuth.revoke();
   disconnectSleep.freshGrace(millis()); uiDirty=true; setAdvertisedMenu(false);
@@ -612,7 +614,12 @@ void onAuthorized() {
   Serial.println("BLE AUTHORIZED");
 }
 void helloReply(uint8_t opcode,const sweetmeter::AuthOutcome &outcome) {
-  uint8_t reply[2]={opcode,outcome.result}; notifyControl(reply,2);
+  if(outcome.quiet) return;  // an accepted N: the P reply carries the meter proof
+  // `H:u8, result:u8` plus, after N, the 16-byte meter proof (mutual authentication).
+  uint8_t reply[2+sweetmeter::proofSize]={opcode,outcome.result};
+  size_t length=2;
+  if(outcome.proofLength==sweetmeter::proofSize) { memcpy(reply+2,outcome.proof,sweetmeter::proofSize); length+=sweetmeter::proofSize; }
+  notifyControl(reply,length);
   if(outcome.changed && linkAuth.authorized()) onAuthorized();
   if(outcome.result==sweetmeter::helloNotSelected) earnBond();  // proved a paired secret
   updateDeviceSnapshot();
@@ -631,6 +638,7 @@ void processControl(const uint8_t *p,size_t n) {
     if(result || p[0]=='K') dropLink();
     return;
   }
+  if(p[0]=='N') { helloReply('H',linkAuth.nonce(p,n,ota.active())); return; }
   if(p[0]=='H') { helloReply('H',linkAuth.legacyHello(p,n,registry,discovery.open,ota.active(),legacyWindow,millis())); return; }
   if(p[0]=='P') {
     uint8_t challenge[challengeSize];
@@ -697,7 +705,7 @@ void syncLink(uint32_t now) {
   serviceChangeSent=false; discoveryReleaseAt=0; discovery.resetRegistration(); copyPeer(linkPeer);
   if(notices.link(generation)) uiDirty=true;
   if(connected && !discovery.open &&
-     sweetmeter::menuRaceEarnsBond(false,connectionAt,menuClosedAt,menuEverClosed)) earnBond();
+     sweetmeter::menuRaceEarnsBond(false,connectionAt,menuClosedAt,menuEverClosed,discovery.registeredPeer(linkPeer))) earnBond();
   if(!connected) { advertise(); Serial.println("BLE DISCONNECTED"); }
   updateDeviceSnapshot();
 }
@@ -902,7 +910,7 @@ void bluetoothLoop() {
       bool first=!hasFrame; hasFrame=true; lastCRC=incomingCRC;
       bool answersPress=refreshRequest.frame();
       if(drawFrameNow(first,answersPress)) {
-        drawScreen(); minuteRedraw.painted(displayedMinute(int64_t(time(nullptr)),timezoneOffset));
+        drawScreen(answersPress); minuteRedraw.painted(displayedMinute(int64_t(time(nullptr)),timezoneOffset));
         result=panelReady?frameDisplayed:5;
       } else result=frameDeferred;
     }

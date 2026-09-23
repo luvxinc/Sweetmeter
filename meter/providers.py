@@ -202,7 +202,8 @@ def claude_token():
 
 # --- Account identity -------------------------------------------------------
 # Switching the Claude Code or Codex account must never show the previous
-# account's quota. Each cycle derives a non-secret fingerprint of the signed-in
+# account's quota, and a switch must show within one refresh cycle (about a
+# minute). Each cycle derives a non-secret fingerprint of the signed-in
 # account: a salted SHA-256 of stable account/organization ids. Only if a CLI
 # stores no ids is a salted hash of its long-lived refresh token used. Neither
 # the ids nor any token are stored; only the salted digest is.
@@ -210,13 +211,30 @@ def claude_token():
 # A fingerprint is "<kind>:<digest>" (kinds: env, id, app, token) or
 # "signed-out". None means "unknown right now" (a config file that exists but
 # is being rewritten, a CLI that is not answering): it never causes a switch.
+#
+# Half-written files: a config is only used when it parses completely, and a
+# fingerprint that differs from the known one is read again ACCOUNT_SETTLE
+# seconds later, bypassing every cache (see account_fingerprints). Only when
+# both reads agree is it the new account, so the switch shows in the same
+# cycle; a file caught mid-write reads differently (or not at all) and counts
+# as unknown until a later cycle.
+#
+# Worst cases: Claude, and Codex with file credential storage (auth.json),
+# show a switch at the next poll: about 1 minute (5 minutes on the relaxed
+# interval). A Codex login kept in the OS keyring changes no file Sweetmeter
+# can watch; account/read is asked every cycle, but a running app-server may
+# keep answering with the login it loaded at start, so the session is
+# restarted at least every CODEX_SESSION_MAX_AGE seconds: a keyring switch
+# shows within about 5 minutes plus one poll (6 minutes at worst).
+ACCOUNT_SETTLE = 2.0
 
 _json_cache = {}
 _UNREADABLE = object()  # The file exists but is not (yet) a complete JSON object.
 
 
-def _read_json_cached(path):
-    """Parse a small JSON config again only when its size/mtime changes.
+def _read_json_cached(path, fresh=False):
+    """Parse a small JSON config again only when its size/mtime changes
+    (always with ``fresh``).
 
     Returns the object, None when the file does not exist, or _UNREADABLE when
     it exists but cannot be read or parsed (for example mid-write)."""
@@ -229,7 +247,7 @@ def _read_json_cached(path):
         return _UNREADABLE
     key = (st.st_size, st.st_mtime_ns)
     cached = _json_cache.get(str(path))
-    if cached and cached[0] == key:
+    if cached and cached[0] == key and not fresh:
         return cached[1]
     try:
         value = json.loads(path.read_bytes())
@@ -247,7 +265,7 @@ def _digest(salt, *parts):
     return hashlib.sha256(salt + b"\0" + material).hexdigest()[:24]
 
 
-def claude_global_config():
+def claude_global_config(fresh=False):
     """Claude Code's global config (holds oauthAccount ids, no secrets).
 
     Returns the object, None when no config exists, or _UNREADABLE when the
@@ -258,18 +276,18 @@ def claude_global_config():
         candidates = [Path.home() / ".claude.json"]
     candidates.append(claude_config_dir() / ".config.json")  # Legacy location.
     for path in candidates:
-        document = _read_json_cached(path)
+        document = _read_json_cached(path, fresh)
         if document is not None:
             return document  # The first existing file is authoritative, readable or not.
     return None
 
 
-def claude_account(salt):
+def claude_account(salt, *, fresh=False, probe=True):
     """Fingerprint of the Claude account in use, 'signed-out', or None (unknown)."""
     explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if explicit:
         return "env:" + _digest(salt, "env", explicit)
-    config = claude_global_config()
+    config = claude_global_config(fresh)
     if config is _UNREADABLE:
         return None  # Mid-write or damaged: never guess another identity.
     account = (config or {}).get("oauthAccount")
@@ -285,7 +303,7 @@ def claude_account(salt):
     return "token:" + _digest(salt, "claude-token", secret)
 
 
-def codex_account(salt):
+def codex_account(salt, *, fresh=False, probe=True):
     """Fingerprint of the Codex login, 'signed-out', or None (unknown).
 
     auth.json (file credential storage) provides the ChatGPT account id. When
@@ -294,9 +312,10 @@ def codex_account(salt):
     account type and e-mail/account id, never a token). If the app-server
     reports no identifier (for example an API-key login), the fingerprint is
     unknown and account switches are not detected for that login; quotas are
-    still read every minute."""
+    still read every minute. ``probe=False`` (Codex is in an error backoff)
+    never asks the app-server: the identity is then unknown."""
     path = codex_home() / "auth.json"
-    auth = _read_json_cached(path)
+    auth = _read_json_cached(path, fresh)
     if auth is _UNREADABLE:
         return None
     if auth is not None:
@@ -306,6 +325,8 @@ def codex_account(salt):
         secret = tokens.get("refresh_token") or auth.get("OPENAI_API_KEY")
         if secret:
             return "token:" + _digest(salt, "codex-token", secret)
+    if not probe:
+        return None
     try:
         account = codex_session().account()
     except NotSetUp:
@@ -321,13 +342,35 @@ def codex_account(salt):
     return "app:" + _digest(salt, "codex-app", account.get("type"), *identifiers)
 
 
-def account_fingerprints(salt):
-    result = {}
-    for name, read in (("claude", claude_account), ("codex", codex_account)):
+ACCOUNT_READERS = {"claude": claude_account, "codex": codex_account}
+
+
+def account_fingerprints(salt, known=None, *, names=("claude", "codex"), probe=True,
+                         settle=ACCOUNT_SETTLE, wait=time.sleep):
+    """Current fingerprint per provider in ``names``.
+
+    With ``known`` (provider -> fingerprint already in the cache), a
+    fingerprint that differs is confirmed in the same cycle: after ``settle``
+    seconds (``wait`` may return early at shutdown) it is read again without
+    any cache, and only an identical second reading is returned; otherwise the
+    identity is unknown (None) for this cycle. ``probe=False`` never asks a
+    Codex app-server (used while Codex is in an error backoff)."""
+    def read(name, fresh):
         try:
-            result[name] = read(salt)
+            return ACCOUNT_READERS[name](salt, fresh=fresh, probe=probe)
         except Exception:  # Identity is best effort; never break a refresh.
-            result[name] = None
+            return None
+
+    result = {name: read(name, False) for name in names}
+    if known is None:
+        return result
+    changed = [name for name, value in result.items()
+               if value is not None and known.get(name) is not None and value != known.get(name)]
+    if changed:
+        wait(settle)
+        for name in changed:
+            if read(name, True) != result[name]:
+                result[name] = None  # Still changing (mid-write): decide next cycle.
     return result
 
 
@@ -479,14 +522,43 @@ def _stop_codex(process, command):
 # starting Codex for every poll. It is restarted when it stops, fails or stops
 # answering, when the Codex executable or its login file changes, and at least
 # every CODEX_SESSION_MAX_AGE seconds so a long-lived server never serves an
-# outdated login (a keyring login changes no file Sweetmeter can watch).
-CODEX_SESSION_MAX_AGE = 900
-CODEX_TIMEOUT = 30
+# outdated login for long (a keyring login changes no file Sweetmeter can
+# watch; see the account identity notes above for the resulting worst case).
+CODEX_SESSION_MAX_AGE = 300
+# Per request. A hung app-server costs one timeout: its process is stopped in
+# the background and a fresh one is started at the next poll.
+CODEX_TIMEOUT = 10
+
+
+class CodexNoAnswer(ProviderError):
+    """The app-server did not answer in time, or stopped (pipe closed)."""
+
+
+class CodexRpcError(ProviderError):
+    """The app-server answered a request with a JSON-RPC error."""
+
+
+def _stop_codex_later(process, command):
+    """Stop a discarded app-server without making the caller wait for it:
+    ask it to stop now, then wait (and force it) on a background thread."""
+    if not (sys.platform == "win32" and len(command or ()) == 3):
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except OSError:
+            pass
+
+    def finish():
+        try:
+            _stop_codex(process, command)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    threading.Thread(target=finish, name="sweetmeter-codex-stop", daemon=True).start()
 
 
 class CodexSession:
-    """One long-lived `codex app-server`; every public method runs on the
-    provider worker thread (a lock also serializes stray callers)."""
+    """One long-lived `codex app-server`. Calls are serialized by a lock; the
+    provider worker polls it from one Codex thread at a time."""
 
     def __init__(self, binary=None):
         self.binary = binary
@@ -554,15 +626,45 @@ class CodexSession:
         command = codex_command(self.binary)
         if self._alive() and (self.command != command or self._signature(command) != self.signature
                               or time.monotonic() - self.started > CODEX_SESSION_MAX_AGE):
-            self.close()
+            self._discard()
         if not self._alive():
-            self.close()
+            self._discard()
             self._start(command)
 
+    def _detach(self):
+        process, command = self.process, self.command
+        self.process = self.command = self.reader = self.incoming = None
+        return process, command
+
+    @staticmethod
+    def _close_pipes(process):
+        for stream in (process.stdin, process.stdout):
+            try:
+                stream.close()
+            except (OSError, ValueError, AttributeError):
+                pass
+
+    def _discard(self):
+        """Drop the current process at once; it is stopped in the background
+        so a hung app-server never delays the caller."""
+        process, command = self._detach()
+        if process is not None:
+            _stop_codex_later(process, command)
+
     def close(self):
+        """Stop the process and wait for it (companion shutdown)."""
+        process = self.process
+        if process is not None:
+            try:
+                # Unblocks a request in flight on another thread (its reader
+                # sees end of file) so the lock below is released promptly.
+                if process.poll() is None and not (sys.platform == "win32" and len(self.command or ()) == 3):
+                    process.terminate()
+            except OSError:
+                pass
         with self.lock:
-            process, command, reader = self.process, self.command, self.reader
-            self.process = self.command = self.reader = self.incoming = None
+            reader = self.reader
+            process, command = self._detach()
             if process is None:
                 return
             try:
@@ -570,11 +672,7 @@ class CodexSession:
             except (OSError, subprocess.SubprocessError):
                 pass
             finally:
-                for stream in (process.stdin, process.stdout):
-                    try:
-                        stream.close()
-                    except (OSError, ValueError, AttributeError):
-                        pass
+                self._close_pipes(process)
                 if reader is not None:
                     reader.join(timeout=1)
 
@@ -583,57 +681,70 @@ class CodexSession:
         try:
             self.process.stdin.write(json.dumps(obj) + "\n")
             self.process.stdin.flush()
-        except (OSError, ValueError) as error:
-            raise ProviderError("Codex stopped answering. Retrying automatically.") from error
+        except (OSError, ValueError, AttributeError) as error:
+            raise CodexNoAnswer("Codex stopped answering. Retrying automatically.") from error
 
     def _request(self, method, params, timeout=None):
         timeout = CODEX_TIMEOUT if timeout is None else timeout
         self.next_id += 1
         number = self.next_id
+        incoming = self.incoming
         self._send({"id": number, "method": method, "params": params})
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
-                message = self.incoming.get(timeout=max(.01, end - time.monotonic()))
+                message = incoming.get(timeout=max(.01, end - time.monotonic()))
             except queue.Empty:
                 break
             if message is None:
-                raise ProviderError("Codex stopped answering. Retrying automatically.")
+                raise CodexNoAnswer("Codex stopped answering. Retrying automatically.")
             if message.get("id") != number:
                 continue  # A late answer to a request that already timed out.
             if "error" in message:
-                raise ProviderError("Codex could not read its usage limits. Retrying automatically.")
+                raise CodexRpcError("Codex could not read its usage limits. Retrying automatically.")
             result = message.get("result", {})
             return result if isinstance(result, dict) else {}
-        raise ProviderError("Codex did not answer in time. Retrying automatically.")
+        raise CodexNoAnswer("Codex did not answer in time. Retrying automatically.")
 
-    def call(self, method, params, timeout=None):
-        """One request; on any failure the process is stopped so the next
-        call starts a fresh one."""
+    def call(self, method, params, timeout=None, *, keep_on_error=False):
+        """One request. A process that fails, stops or does not answer is
+        discarded (stopped in the background) so the next call starts a fresh
+        one; with ``keep_on_error`` a JSON-RPC error answer keeps it, because
+        the process demonstrably still answers."""
         with self.lock:
             try:
                 self._ensure()
                 return self._request(method, params, timeout)
+            except CodexRpcError:
+                if not keep_on_error:
+                    self._discard()
+                raise
             except BaseException:
-                self.close()
+                self._discard()
                 raise
 
     # -- queries -------------------------------------------------------------
-    def account(self):
+    def account(self, *, keep_on_error=False):
         """The signed-in account as reported by Codex (dict), or None when
         signed out. Only used for a salted fingerprint; nothing is stored."""
-        account = self.call("account/read", {"refreshToken": False}, timeout=10).get("account")
+        account = self.call("account/read", {"refreshToken": False},
+                            keep_on_error=keep_on_error).get("account")
         return account if isinstance(account, dict) else None
 
     def rate_limits(self):
         with self.lock:
             try:
-                rows = parse_codex(self.call("account/rateLimits/read", {}))
-            except ProviderError:
+                rows = parse_codex(self.call("account/rateLimits/read", {}, keep_on_error=True))
+            except CodexRpcError:
+                # Codex answered with an error: ask the same, answering process
+                # whether anyone is signed in. A timeout or a stopped process
+                # is reported as is; asking again would only wait again.
                 try:
-                    present = self.account() is not None
-                except (ProviderError, OSError, ValueError, RuntimeError):
+                    present = self.account(keep_on_error=True) is not None
+                except ProviderError:
                     present = True  # Unknown: report the original, retryable failure.
+                finally:
+                    self._discard()  # A fresh server at the next poll.
                 if not present:
                     raise NotSetUp("Codex is installed but not signed in. Run Codex and sign in "
                                    "to show its quota.") from None
@@ -730,7 +841,7 @@ def is_due(entry, now, *, force=False, wake=False, interval=60):
 
 
 # Identity bookkeeping kept in a provider's cache entry across polls.
-IDENTITY_KEYS = ("account", "account_since", "account_candidate", "last_account", "last_account_since")
+IDENTITY_KEYS = ("account", "account_since", "last_account", "last_account_since")
 
 
 def _kind(fingerprint):
@@ -740,28 +851,22 @@ def _kind(fingerprint):
 def switch_account(old, account, now):
     """Return the entry to use when ``account`` is observed.
 
-    A confirmed change drops everything learned for the previous account:
-    rows, plan labels, errors and backoff (so it is polled immediately).
+    A change drops everything learned for the previous account: rows, plan
+    labels, errors and backoff (so it is polled immediately, in this cycle).
     ``account_since`` marks when this account's local token counting starts
     (0 = no known earlier account).
 
-    False switches are avoided: an unknown identity (None) changes nothing, and
-    a different fingerprint must be observed twice in a row before it counts
-    (a config file caught mid-write, or a fingerprint of another kind such as
-    ``token:`` instead of ``id:``, is not proof of a new account). Only an
-    explicit sign-out (no saved sign-in at all), and signing in after one,
-    take effect at once.
+    ``account`` must already be confirmed (account_fingerprints reads a
+    changed fingerprint twice, a few seconds apart); an unknown identity
+    (None) changes nothing. Returning to the account used just before (for
+    example after a config briefly lacked its ids, or signing out and back
+    in) resumes that account's token count.
     """
+    old = {k: v for k, v in old.items() if k != "account_candidate"}  # Older caches.
     current = old.get("account")
-    if account is None:
-        return old
-    if current == account:
-        if "account_candidate" in old:
-            old = {k: v for k, v in old.items() if k != "account_candidate"}
+    if account is None or current == account:
         return old
     known_before = "account" in old
-    if known_before and "signed-out" not in (account, current) and old.get("account_candidate") != account:
-        return {**old, "account_candidate": account}  # First sighting: confirm next cycle.
     if known_before:
         logging.info("Signed-in account changed; discarding the previous account's cached quota")
     # Local logs carry no account id, so token counting restarts at a real
@@ -769,28 +874,38 @@ def switch_account(old, account, now):
     # account ids) cannot be told apart from a switch: its quota is still
     # re-read, but token counting is not cut short. Signing out and back in to
     # the same account resumes that account's count (its own account_since).
-    remembered = {k: old[k] for k in ("last_account", "last_account_since") if k in old}
-    if current not in (None, "signed-out"):
-        remembered = {"last_account": current, "last_account_since": old.get("account_since", 0)}
+    previous = {k: old[k] for k in ("last_account", "last_account_since") if k in old}
     if _kind(current) == "token" and _kind(account) == "token":
         since = old.get("account_since", 0)
-    elif account == remembered.get("last_account"):
-        since = remembered.get("last_account_since", 0)
+    elif account == previous.get("last_account"):
+        since = previous.get("last_account_since", 0)
     else:
         since = now if known_before else 0
+    remembered = previous
+    if current not in (None, "signed-out"):
+        remembered = {"last_account": current, "last_account_since": old.get("account_since", 0)}
     return {"account": account, "account_since": since, **remembered}
 
 
+def in_backoff(entry, now, *, force=False):
+    """True while a provider's last poll failed and it is not due again yet."""
+    return bool(entry.get("error")) and not is_due(entry, now, force=force)
+
+
 def refresh(previous, now=None, readers=None, *, force=False, interval=60, relaxed=None, wake=(),
-            accounts=None):
+            accounts=None, names=None):
     """Poll due providers. ``relaxed`` maps a provider to a longer idle
     interval; ``wake`` names providers that should use ``interval`` now;
-    ``accounts`` maps a provider to its current account fingerprint."""
+    ``accounts`` maps a provider to its current account fingerprint;
+    ``names`` limits the poll to these providers (others are kept as is)."""
     now = now or time.time()
     relaxed = relaxed or {}
     accounts = accounts or {}
     providers = dict(previous.get("providers", {})) if isinstance(previous.get("providers"), dict) else {}
-    for name, read in (readers or {"claude": fetch_claude, "codex": fetch_codex}).items():
+    readers = readers or {"claude": fetch_claude, "codex": fetch_codex}
+    if names is not None:
+        readers = {name: read for name, read in readers.items() if name in names}
+    for name, read in readers.items():
         old = providers.get(name, {})
         if not isinstance(old, dict):
             old = {}

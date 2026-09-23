@@ -103,6 +103,12 @@ class Discovery {
     next=received_; resetRegistration(); return result;
   }
   void resetRegistration() { session_=0; total_=received_=0; }
+  // This connection address completed a registration in the current (or the
+  // just-closed) window; kept until the next begin(). See bond_policy.h.
+  bool registeredPeer(const uint8_t *peer) const {
+    for(unsigned i=0;i<peers_;++i) if(!memcmp(peerList_[i].address,peer,6)) return peerList_[i].count>0;
+    return false;
+  }
  private:
   struct Peer { uint8_t address[6]; uint8_t count; };
   uint32_t session_=0,lastAt_=0; size_t total_=0,received_=0; uint8_t body_[maxBody]{}, peer_[6]{};

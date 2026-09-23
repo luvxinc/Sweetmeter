@@ -64,6 +64,64 @@ class IsolationTests(unittest.TestCase):
             subprocess.run(['launchctl', 'list'])
         run.assert_called_once()
 
+    def test_other_launch_paths_and_wrappers_are_guarded(self):
+        import sys
+        attempts = [
+            lambda: os.system('security find-generic-password -s x'),
+            lambda: os.system('true; launchctl list'),
+            lambda: subprocess.run(['env', 'A=1', '/usr/bin/security', 'dump-keychain']),
+            lambda: subprocess.run(['/bin/sh', '-c', 'launchctl bootout gui/0/x']),
+            lambda: subprocess.run(['nohup', 'open', '-a', 'x']),
+            lambda: subprocess.run('cd /; codex app-server', shell=True),
+            lambda: os.popen('osascript -e 1'),
+            lambda: os.execv('/bin/launchctl', ['launchctl', 'list']),
+            lambda: os.execvp('sh', ['sh', '-c', 'systemctl status']),
+            lambda: os.execl('/usr/bin/env', 'env', 'codex', 'login'),
+        ]
+        if hasattr(os, 'posix_spawn'):
+            attempts += [lambda: os.posix_spawn('/usr/bin/security', ['security', 'list'], dict(os.environ)),
+                         lambda: os.posix_spawnp('env', ['env', 'launchctl', 'list'], dict(os.environ))]
+        if hasattr(os, 'spawnv'):
+            attempts.append(lambda: os.spawnv(os.P_WAIT, '/usr/bin/open', ['open', '-a', 'x']))
+        for number, attempt in enumerate(attempts):
+            with self.subTest(number=number), self.assertRaises(isolation.IsolationViolation):
+                attempt()
+        # Words that merely mention a blocked name in data are not programs.
+        self.assertIsNone(isolation.blocked_program([sys.executable, '-c', 'open("x")']))
+        self.assertIsNone(isolation.blocked_program(['tar', '-cf', 'open', 'security']))
+        self.assertEqual(isolation.blocked_program(['sh', '-c', 'echo; "/usr/bin/open" -a x']), 'open')
+
+    def test_non_loopback_network_is_refused_unless_opted_in(self):
+        import socket
+        import requests
+        for host in ('203.0.113.7', 'api.anthropic.com'):
+            with self.subTest(host=host), self.assertRaises(isolation.IsolationViolation):
+                socket.create_connection((host, 443), timeout=1)
+        with self.assertRaises(isolation.IsolationViolation):
+            requests.get('https://api.github.com/', timeout=1)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp, \
+                self.assertRaises(isolation.IsolationViolation):
+            udp.sendto(b'x', ('198.51.100.1', 53))
+        # Loopback still works (local fake servers).
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', 0))
+            server.listen(1)
+            with socket.create_connection(server.getsockname(), timeout=2):
+                pass
+        with isolation.allow_network(), patch.object(isolation, '_real_connect') as connect:
+            with socket.socket() as client:
+                client.connect(('203.0.113.7', 443))
+            connect.assert_called_once()
+        self.assertFalse(isolation.network_allowed())
+
+    def test_registry_writes_are_refused_on_windows(self):
+        import sys
+        if sys.platform != 'win32':
+            self.skipTest('winreg exists only on Windows')
+        import winreg
+        with self.assertRaises(isolation.IsolationViolation):
+            winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r'Software\SweetmeterTest', 0, winreg.KEY_SET_VALUE)
+
     def test_ordinary_programs_still_run(self):
         import sys
         result = subprocess.run([sys.executable, '-c', 'print(1)'], capture_output=True, text=True)
