@@ -113,6 +113,34 @@ class UpdateTests(unittest.TestCase):
         self.radio.install_firmware.assert_called_once()
         self.assertEqual(self.service.state['pending']['device_id'],'device-one')
         self.assertEqual(len(self.feed.downloads),2)
+    def device_update(self):
+        class InlineThread:
+            def __init__(self,target,args,**kwargs): self.target,self.args=target,args
+            def start(self): self.target(*self.args)
+        with patch('meter.updater.platform_id',return_value=('macos','arm64')), \
+             patch('meter.updater.threading.Thread',InlineThread):
+            self.service.device_update()
+    def test_rocker_hold_installs_newer_firmware_without_dialog(self):
+        self.device_update()
+        self.radio.update_notice.assert_called_once_with(3)
+        self.assertTrue(self.radio.install_firmware.call_args.kwargs['usb_power'])
+        self.assertFalse(any(e['event']=='update_offer' and e['offer'].kind=='firmware' for e in self.events))
+        self.events.clear(); self.service.busy=False; self.service._offers()
+        self.assertFalse(any(e['event']=='update_offer' and e['offer'].kind=='firmware' for e in self.events))
+    def test_rocker_hold_reports_current_firmware(self):
+        self.service.set_device({**self.service.device,'firmware':'2026.9.2'},True,'device-one')
+        self.device_update()
+        self.radio.update_notice.assert_called_once_with(2)
+        self.radio.install_firmware.assert_not_called()
+    def test_rocker_hold_reports_required_companion_update(self):
+        self.feed.manifest['artifacts'][0]['minimum_companion']='2026.9.2'
+        self.device_update()
+        self.radio.update_notice.assert_called_once_with(5)
+        self.assertFalse(self.feed.downloads)
+    def test_rocker_hold_reports_failed_check(self):
+        with patch('meter.updater.verify_manifest',side_effect=ValueError('bad signature')): self.device_update()
+        self.radio.update_notice.assert_called_once_with(4)
+        self.radio.install_firmware.assert_not_called()
     def test_reboot_requires_version_health_result_and_same_device(self):
         self.service.state['pending']={'kind':'firmware','target':'2026.9.2','device_id':'device-one'}
         self.events.clear()

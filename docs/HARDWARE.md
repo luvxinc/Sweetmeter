@@ -41,7 +41,7 @@ image quality.
 | Indicator LED | 19 | Disabled during normal operation |
 | Top Menu button | 2 | Active low; deep-sleep wake input |
 | Bottom Exit button | 1 | Active low |
-| Rocker up / down / press | 6 / 4 / 5 | Computer selection |
+| Rocker up / down / press | 6 / 4 / 5 | Computer selection; hold press 3 s for a firmware check |
 | Optional gauge SDA / SCL | 40 / 41 | 3.3 V I²C logic, shared ground |
 
 The display mapping and power handling also follow the board schematic linked

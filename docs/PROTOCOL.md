@@ -80,6 +80,13 @@ The old Swift helper which requires `protocol == 3` itself needs replacement.
 | Host → control, commit frame | `C:u8, sequence:u32` |
 | Device → control, displayed ACK | `A:u8, result:u8, sequence:u32, CRC32:u32` |
 | Device → control, refresh request | Single byte `R` |
+| Device → control, firmware check request | Single byte `U` (rocker held 3 s while selected) |
+| Host → control, firmware check result | `u:u8, code:u8` (`2` current, `3` installing, `4` failed, `5` companion update needed) |
+
+Holding the rocker is the physical confirmation for a firmware install: the
+companion checks the signed release immediately and, when newer compatible
+firmware exists, starts the normal verified OTA without a desktop dialog. A
+companion update is never installed from the meter.
 
 H uses a write-with-response long write if its 37–57 bytes exceed the ATT value
 budget; this is below the 512-byte GATT attribute limit. Require a backend that

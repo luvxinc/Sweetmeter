@@ -74,6 +74,8 @@ class Session:
         raw = bytes(raw)
         if raw == b'R':
             self.emit({'event': 'refresh'})
+        elif raw == b'U':
+            self.emit({'event': 'update_request'})
         elif len(raw) == 9 and raw[:1] == b'D':
             nonce, duration = struct.unpack('<II', raw[1:])
             self.discovery = True
@@ -108,6 +110,9 @@ class Session:
         reply = await self.wait(lambda p: len(p) == 2 and p[:1] == b'H', 10)
         if reply[1] != 0:
             raise PermissionError('Select this computer using the meter buttons')
+
+    async def update_notice(self, code):
+        await self.write(CONTROL_UUID, bytes((ord('u'), code)))
 
     async def clock(self):
         offset = int(datetime.now().astimezone().utcoffset().total_seconds())
@@ -172,6 +177,7 @@ class Bluetooth:
         self.startup_error = None
         self.frame_lock = threading.Lock()
         self.jobs = queue.Queue(maxsize=1)
+        self.notices = queue.Queue()
         self.scanner_factory, self.client_factory = scanner_factory, client_factory
         self.thread = threading.Thread(target=self._thread, name='sweetmeter-ble', daemon=True)
         self.thread.start()
@@ -275,6 +281,13 @@ class Bluetooth:
                     return
                 await session.clock()
                 next_status = now + 30
+            while True:
+                try:
+                    code = self.notices.get_nowait()
+                except queue.Empty:
+                    break
+                if status['protocol'] == 4:
+                    await session.update_notice(code)
             with self.frame_lock:
                 frame = self.latest_frame
             if frame is not None and frame != sent and not status.get('critical'):
@@ -301,6 +314,12 @@ class Bluetooth:
             raise ValueError('Expected 4000-byte frame')
         with self.frame_lock:
             self.latest_frame = bytes(frame)
+
+    def update_notice(self, code):
+        """Show a rocker-hold update result on the connected meter."""
+        if code not in (2, 3, 4, 5):
+            raise ValueError('Unknown update notice')
+        self.notices.put(code)
 
     def install_firmware(self, **job):
         if self.ota is not None:

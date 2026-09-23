@@ -46,5 +46,17 @@ int main() {
   assert(wheel.update(true, 4000) == 0);
   assert(wheel.update(false, 4100) == 0);
   assert(wheel.update(false, 4130) == 0);
-  std::cout << "PASS: short/long press, bounce, wake hold, rollover, wheel\n";
+
+  MeterButton rocker(16, 128);
+  assert(rocker.update(false, 0) == 0);
+  assert(rocker.update(true, 10) == 0);
+  assert(rocker.update(true, 40) == 0); // Selection waits for release.
+  assert(rocker.update(false, 100) == 0);
+  assert(rocker.update(false, 130) == 16);
+  assert(rocker.update(true, 200) == 0);
+  assert(rocker.update(true, 230) == 0);
+  assert(rocker.update(true, 3230) == 128); // Hold requests a firmware check.
+  assert(rocker.update(false, 3300) == 0);
+  assert(rocker.update(false, 3330) == 0); // No selection after the hold.
+  std::cout << "PASS: short/long press, bounce, wake hold, rollover, wheel, rocker hold\n";
 }

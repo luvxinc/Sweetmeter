@@ -70,6 +70,7 @@ and output; cached input/reasoning are already included and are not added twice.
 | Top button while asleep | Wake the device |
 | Bottom button, hold 3 seconds | Open computer selection |
 | Rocker up/down, then press | Choose and save a computer |
+| Rocker press, hold 3 seconds | Check for firmware and install a newer version through the selected computer |
 | Bottom button in selection | Back |
 
 After a selected companion has connected in the current boot, a continuous
@@ -183,7 +184,9 @@ python3 -m venv .venv
 ```
 
 On Windows replace `.venv/bin/python` with `.venv\Scripts\python.exe` and use
-`py -3` to create the environment. `--no-startup` installs without registering
+`py -3` to create the environment. Running `install_agent.py` again reuses the
+installed dependencies and only runs pip when `requirements.txt` changed.
+`--no-startup` installs without registering
 login startup. `--remove-startup` removes Sweetmeter's current startup entry.
 Source installs receive update notices and verified manual packages; the app
 never pretends to automatically replace an arbitrary source checkout.

@@ -40,7 +40,10 @@ RTC_DATA_ATTR bool clockSynced=false;
 volatile uint8_t keyEvents=0;
 uint8_t dashboard[FRAME_SIZE],incomingFrame[FRAME_SIZE];
 size_t received=0;
-uint32_t incomingSequence=0,incomingCRC=0,packetAt=0,refreshRequestedAt=0;
+uint32_t incomingSequence=0,incomingCRC=0,packetAt=0,refreshRequestedAt=0,updateNoticeAt=0;
+// Rocker-hold firmware check banner; codes 2..5 arrive from the companion as `u`.
+enum UpdateNotice : uint8_t { NoNotice, UpdateChecking, UpdateCurrent, UpdateInstalling, UpdateFailed, UpdateCompanion, UpdateUnpaired };
+uint8_t updateNotice=NoNotice;
 bool receiving=false,pendingFrame=false,uiDirty=true,sleepCommitted=false;
 int batteryPercent=-1,batteryMillivolts=-1;
 DisconnectSleep disconnectSleep;
@@ -316,12 +319,18 @@ void drawScreen() {
     char stamp[24]="----/--/-- --:--";
     if(clockSynced) { time_t now=time(nullptr)+timezoneOffset; tm local; gmtime_r(&now,&local); strftime(stamp,sizeof(stamp),"%Y/%m/%d %H:%M",&local); }
     textAt(124,1,stamp,false); batteryIcon();
+    if(updateNotice) {
+      static const char *const notices[]={"","Checking for updates...","Firmware is up to date.",
+        "Update found. Installing...","Update check failed.","Update the Sweetmeter app.","Select a computer first."};
+      String text=notices[updateNotice];
+      box(10,40,230,40,true); box(12,42,226,36,false); textAt(125-int(text.length())*3,55,text);
+    }
   }
   if(memcmp(frame,panelFrame,FRAME_SIZE) || !panelReady) displayFrame();
   uiDirty=false;
 }
 void buttonTask(void *) {
-  const int pins[]={2,1,6,4,5}; MeterButton buttons[]={{1,64},{2,32},{4},{8},{16}};
+  const int pins[]={2,1,6,4,5}; MeterButton buttons[]={{1,64},{2,32},{4},{8},{16,128}};
   for(int pin:pins) pinMode(pin,INPUT_PULLUP);
   while(true) {
     for(int i=0;i<5;++i) {
@@ -380,6 +389,8 @@ void processControl(const uint8_t *p,size_t n) {
     // Ready is an application ACK: the worker has finished any prior panel job.
     // Protocol-4 hosts cannot enqueue framebuffer data before this notification.
     frameBeginReply(0,seq,checksum);
+  } else if(p[0]=='u') {
+    if(n==2 && p[1]>=UpdateCurrent && p[1]<=UpdateCompanion) { updateNotice=p[1]; updateNoticeAt=millis(); uiDirty=true; }
   } else if(p[0]=='C') {
     uint32_t seq=n>=5?read32(p+1):0;
     if(n!=5 || !receiving || pendingFrame || received!=FRAME_SIZE || seq!=incomingSequence || crc32(incomingFrame,FRAME_SIZE)!=incomingCRC) {
@@ -520,6 +531,12 @@ void bluetoothLoop() {
       if(connected&&authorized) { uint8_t request='R'; notifyControl(&request,1); }
       else if(!connected) BLEDevice::startAdvertising();
     }
+    if(!discovery.open && (keys&128)) {
+      // Holding the rocker asks the selected computer to check and install firmware.
+      updateNoticeAt=now; uiDirty=true;
+      if(connected&&authorized) { uint8_t request='U'; notifyControl(&request,1); updateNotice=UpdateChecking; }
+      else updateNotice=UpdateUnpaired;
+    }
   }
   HostPacket packet;
   for(unsigned handled=0;handled<4 && xQueueReceive(packetQueue,&packet,0)==pdTRUE;++handled) {
@@ -554,6 +571,8 @@ void bluetoothLoop() {
   now=millis();
   if(receiving && expired(now,packetAt,15000)) receiving=false;
   if(refreshRequestedAt && expired(now,refreshRequestedAt,10000)) { refreshRequestedAt=0; uiDirty=true; }
+  if(updateNotice==UpdateChecking && expired(now,updateNoticeAt,45000)) { updateNotice=UpdateFailed; updateNoticeAt=now; uiDirty=true; }
+  else if(updateNotice>UpdateChecking && expired(now,updateNoticeAt,8000)) { updateNotice=NoNotice; updateNoticeAt=0; uiDirty=true; }
   bool active=ota.active();
   if(active) {
     unsigned percent=ota.status.total?uint64_t(ota.status.offset)*100/ota.status.total:0;

@@ -5,6 +5,7 @@ an extracted native Sweetmeter.app (macOS) or Sweetmeter folder (Windows/Linux).
 Never copies state, account files, development caches or private signing keys.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,19 @@ sys.path.insert(0, str(SOURCE))
 from meter.paths import app_command, data_dir, default_state_dir, install_root
 
 from meter.installation import startup, install_native, retire_legacy_startup
+
+
+def install_requirements(python, requirements, marker):
+    """Run pip only when the pinned requirements changed since the last success."""
+    digest = hashlib.sha256(requirements.read_bytes()).hexdigest()
+    try:
+        if marker.read_text(encoding='ascii').strip() == digest:
+            return False
+    except OSError:
+        pass
+    subprocess.run([str(python), '-m', 'pip', 'install', '-r', str(requirements)], check=True)
+    marker.write_text(digest + '\n', encoding='ascii')
+    return True
 
 
 def main():
@@ -50,7 +64,7 @@ def main():
         python = runtime / '.venv' / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
         if not python.is_file():
             subprocess.run([sys.executable, '-m', 'venv', str(runtime / '.venv')], check=True)
-        subprocess.run([str(python), '-m', 'pip', 'install', '-r', str(runtime / 'requirements.txt')], check=True)
+        install_requirements(python, runtime / 'requirements.txt', runtime / '.venv' / 'sweetmeter-requirements.sha256')
         command = [str(python), '-m', 'meter']
         # `-m meter` needs an explicit portable source launcher outside the checkout.
         launcher = runtime / 'run.py'

@@ -19,22 +19,6 @@ case "$(uname -s)" in
     arch=$(uname -m)
     [ "$arch" = x86_64 ] || fail 'The Linux release currently requires x86_64.'
     [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || fail 'Run from a terminal in your graphical desktop session.'
-    command -v apt-get >/dev/null || fail 'Automatic dependency setup currently supports Ubuntu/Debian. Use the native ZIP on other distributions.'
-    missing=''
-    for tool in curl openssl unzip python3; do
-      if ! command -v "$tool" >/dev/null; then missing="$missing $tool"; fi
-    done
-    if ! command -v bluetoothctl >/dev/null; then missing="$missing bluez"; fi
-    if [ -n "$missing" ]; then
-      printf 'Installing required system packages:%s (sudo may ask for your password).\n' "$missing"
-      sudo apt-get update
-      # Package names are the fixed literals above, never server-provided input.
-      sudo apt-get install -y $missing
-    fi
-    if command -v systemctl >/dev/null && ! systemctl is-active --quiet bluetooth; then
-      printf 'Starting the system Bluetooth service (sudo may ask for your password).\n'
-      sudo systemctl start bluetooth
-    fi
     ;;
   *) fail 'Use install.ps1 on Windows. This installer supports macOS and Linux.' ;;
 esac
@@ -55,6 +39,26 @@ if [ -x "$installed" ]; then
   printf 'Opening your existing Sweetmeter. Use its updater for new versions.\n'
   "$installed" >/dev/null 2>&1 &
   return
+fi
+
+# First install only: add missing Ubuntu/Debian tools; present ones are never reinstalled.
+if [ "$system" = linux ]; then
+  command -v apt-get >/dev/null || fail 'Automatic dependency setup currently supports Ubuntu/Debian. Use the native ZIP on other distributions.'
+  missing=''
+  for tool in curl openssl unzip python3; do
+    if ! command -v "$tool" >/dev/null; then missing="$missing $tool"; fi
+  done
+  if ! command -v bluetoothctl >/dev/null; then missing="$missing bluez"; fi
+  if [ -n "$missing" ]; then
+    printf 'Installing required system packages:%s (sudo may ask for your password).\n' "$missing"
+    sudo apt-get update
+    # Package names are the fixed literals above, never server-provided input.
+    sudo apt-get install -y $missing
+  fi
+  if command -v systemctl >/dev/null && ! systemctl is-active --quiet bluetooth; then
+    printf 'Starting the system Bluetooth service (sudo may ask for your password).\n'
+    sudo systemctl start bluetooth
+  fi
 fi
 
 temporary=$(mktemp -d)

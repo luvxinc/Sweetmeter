@@ -125,6 +125,11 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.client.result = 2
         with self.assertRaises(RuntimeError): await self.session.register(123)
         self.assertFalse(any(p[:1] == b'K' for _,p in self.client.writes))
+    async def test_rocker_hold_requests_update_and_receives_result(self):
+        self.client.callback(None, b'U')
+        self.assertEqual(self.events[-1], {'event': 'update_request'})
+        await self.session.update_notice(2)
+        self.assertEqual(self.client.writes[-1], (CONTROL_UUID, b'u\x02'))
     async def test_frame_requires_matching_application_ack(self):
         data = bytes(range(250))*16
         await self.session.frame(data)

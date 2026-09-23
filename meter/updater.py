@@ -20,6 +20,8 @@ from .version import Version, get_version
 
 RELEASE_API = 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest'
 INTERVAL = 6 * 3600
+# Results shown on the meter after its rocker is held (protocol `u` codes).
+NOTICE_CURRENT, NOTICE_INSTALLING, NOTICE_FAILED, NOTICE_COMPANION = 2, 3, 4, 5
 
 def save_json(path, value):
     temp = path.with_suffix('.tmp')
@@ -182,6 +184,10 @@ class UpdateService:
     def check(self):
         self.requests.put('check')
 
+    def device_request(self):
+        """The meter's rocker was held: check now and install newer firmware."""
+        self.requests.put('device')
+
     def _save(self):
         save_json(self.path, self.state)
 
@@ -189,22 +195,25 @@ class UpdateService:
         next_check = time.monotonic() + INTERVAL
         while not self.stop.is_set():
             try:
-                manual = self.requests.get(timeout=1) == 'check'
+                request = self.requests.get(timeout=1)
             except queue.Empty:
-                manual = False
+                request = 'automatic'
                 if time.monotonic() < next_check:
                     self.tick()
                     continue
-            self.check_now(manual=manual)
+            if request == 'device':
+                self.device_update()
+            else:
+                self.check_now(manual=request == 'check')
             next_check = time.monotonic() + INTERVAL
 
-    def check_now(self, *, manual=False):
+    def check_now(self, *, manual=False, quiet=()):
         with self.lock:
             if self.busy:
-                return
+                return False
             if time.time() < self.state.get('retry_at', 0):
                 self.emit({'event': 'update_notice', 'message': 'Update checks are waiting for the server retry time.'})
-                return
+                return False
         try:
             headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'Sweetmeter/' + self.version,
                        'X-GitHub-Api-Version': '2022-11-28'}
@@ -234,12 +243,14 @@ class UpdateService:
                                   etag=response_headers.get('ETag', self.state.get('etag', '')),
                                   checked_at=time.time(), retry_at=0)
                 self._save()
-                self._offers(manual)
+                self._offers(manual, quiet=quiet)
             self.emit({'event': 'update_checked', 'version': manifest['version']})
+            return True
         except NoPublishedRelease:
             with self.lock:
                 self.manifest, self.offers = None, {}
             self.emit({'event': 'update_notice', 'message': 'No published updates yet.'})
+            return True
         except RateLimited as error:
             with self.lock:
                 self.state['retry_at'] = error.retry_at
@@ -253,8 +264,42 @@ class UpdateService:
         except Exception as error:
             # Response bodies never become executable HTML or diagnostic dumps.
             self.emit({'event': 'update_error', 'error': 'Update check failed: ' + type(error).__name__})
+        return False
 
-    def _offers(self, manual=False):
+    def device_update(self):
+        """Holding the rocker is the physical confirmation for a firmware install."""
+        if self.busy:
+            self._notify_device(NOTICE_INSTALLING)
+            return
+        self.emit({'event': 'update_notice', 'message': 'Firmware check requested on the meter…'})
+        if not self.check_now(manual=True, quiet=('firmware',)):
+            self._notify_device(NOTICE_FAILED)
+            return
+        with self.lock:
+            offer = self.offers.get('firmware')
+        if offer is None:
+            self._notify_device(NOTICE_CURRENT)
+            self.emit({'event': 'update_notice', 'message': 'Meter firmware is up to date.'})
+            return
+        if offer.blocked:
+            self._notify_device(NOTICE_COMPANION)
+            self.emit({'event': 'update_error', 'error': offer.blocked})
+            return
+        self._notify_device(NOTICE_INSTALLING)
+        try:
+            # The meter's own OTA screen asks to keep USB power connected.
+            self.install(offer, usb_power=True)
+        except (ValueError, RuntimeError) as error:
+            self._notify_device(NOTICE_FAILED)
+            self.emit({'event': 'update_error', 'error': str(error)})
+
+    def _notify_device(self, code):
+        try:
+            self.radio.update_notice(code)
+        except (AttributeError, ValueError):
+            pass
+
+    def _offers(self, manual=False, quiet=()):
         if self.manifest is None or self.busy:
             return
         manifest, offers = self.manifest, {}
@@ -276,6 +321,10 @@ class UpdateService:
         self.offers = offers
         for kind, offer in offers.items():
             key = kind, offer.target
+            if kind in quiet:
+                # Handled by the caller; later status reads must not re-prompt.
+                self.prompted.add(key)
+                continue
             choice = self.state.get('choices', {}).get(kind, {})
             if not manual and (choice.get('skip') == offer.target or time.time() < choice.get('later', 0)):
                 continue
@@ -431,6 +480,8 @@ class UpdateService:
                 if pending and pending.get('kind') == offer.kind and pending.get('target') == offer.target:
                     self.state.pop('pending', None)
                 self._save()
+            if offer.kind == 'firmware':
+                self._notify_device(NOTICE_FAILED)
             self.emit({'event': 'update_error', 'error': str(error)[:200]})
 
     def cancel(self):

@@ -30,6 +30,8 @@ class BootstrapTests(unittest.TestCase):
         self.mark = self.root / 'launched'
         self.system = {'darwin': 'macos', 'win32': 'windows'}.get(sys.platform, 'linux')
         self.linux_arch = 'x86_64'
+        self.bluez_installed = True
+        self.package_log = self.root / 'package-manager'
         self.arch = 'arm64' if sys.platform == 'darwin' and platform.machine() == 'arm64' else 'x86_64'
         self.version = '2026.9.999'
         self.asset = f'Sweetmeter-{self.version}-{self.system}-{self.arch}.zip'
@@ -100,8 +102,10 @@ function Start-Process($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThr
             if self.system == 'linux':
                 self.shell_tool('uname', 'case "$1" in -s) echo Linux ;; -m) echo ' + self.linux_arch + ' ;; esac')
             self.shell_tool('id', 'echo 501')
-            self.shell_tool('apt-get', 'exit 0')
-            self.shell_tool('bluetoothctl', 'exit 0')
+            self.shell_tool('apt-get', 'echo "apt-get $*" >> ' + self.quote(self.package_log))
+            self.shell_tool('sudo', 'echo "sudo $*" >> ' + self.quote(self.package_log))
+            if self.bluez_installed:
+                self.shell_tool('bluetoothctl', 'exit 0')
             self.shell_tool('systemctl', 'exit 0')
             self.shell_tool('curl', f'''output=''
 previous=''
@@ -126,6 +130,31 @@ esac''')
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.mark.read_text().strip(), '--install')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux dependency setup')
+    def test_present_linux_dependencies_are_not_reinstalled(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.package_log.exists(), self.package_log.read_text() if self.package_log.exists() else '')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux dependency setup')
+    def test_missing_linux_dependency_installs_only_that_package(self):
+        self.bluez_installed = False
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('sudo apt-get install -y bluez\n', self.package_log.read_text())
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux dependency setup')
+    def test_existing_linux_install_skips_dependency_setup(self):
+        self.bluez_installed = False
+        installed = self.home / '.local/lib/Sweetmeter/Sweetmeter'
+        installed.parent.mkdir(parents=True)
+        installed.write_text('#!/bin/sh\nexit 0\n')
+        installed.chmod(0o755)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Opening your existing Sweetmeter', result.stdout)
+        self.assertFalse(self.package_log.exists())
 
     @unittest.skipUnless(sys.platform == 'linux', 'Linux platform guard')
     def test_unsupported_linux_arm_stops_before_install(self):

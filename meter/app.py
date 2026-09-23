@@ -136,6 +136,9 @@ class Application:
                     self.updates.connected = False
                 elif kind == 'refresh':
                     self.provider.force.set()
+                elif kind == 'update_request':
+                    logging.info('Button: firmware update check requested')
+                    self.updates.device_request()
                 elif kind == 'ack':
                     save_json(self.state_dir / 'last-ack.json', {**event, 'received_at': time.time()})
                     logging.info('BLE ACK %s %s %s', event['sequence'], event['crc32'], event['ack'])
@@ -148,6 +151,9 @@ class Application:
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
+            if event['event'] in ('connected', 'disconnected', 'error', 'exit', 'update_error', 'ota_error'):
+                # The desktop window shows these too, but only the log survives it.
+                logging.info('Event %s %s', event['event'], event.get('error', event.get('device_id', '')))
             if event['event'] == 'snapshot' and self.radio:
                 self.radio.send(event['frame'])
             if event['event'] == 'firmware_verified':
