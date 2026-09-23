@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <initializer_list>
+#include "screen_orientation.h"
 
 // ELECROW CrowPanel ESP32-S3 2.13(E), PCB V1.2, JD79661 panel.
 // Register sequence and GC waveform: ELECROW example/arduino-v1.2.
@@ -108,7 +109,7 @@ bool displayFrame(bool forceFull = false) {
   if (!refreshPanel()) return false;
   command(0x50); data(0xd7);
   command(0x13);
-  for (size_t i = 0; i < FRAME_SIZE; ++i) data(frame[i]);
+  for (size_t i = 0; i < FRAME_SIZE; ++i) data(sweetmeter::rotatedPanelByte(frame, i));
   loadWaveform(true);
   if (!refreshPanel()) return false;
   panelReady = true; lastFullAt = millis();

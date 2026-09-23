@@ -48,6 +48,11 @@ The display mapping and power handling also follow the board schematic linked
 from the vendor wiki. The firmware packs each landscape image into the panel's
 128 × 250 memory: `frame[x * 16 + y / 8]`, 4000 bytes including padding. Its
 V1.2 mirrored scan direction is compensated in the display driver.
+The final panel output rotates the visible 250 × 122 image by 180° for the
+printed enclosure. This applies to the dashboard, Bluetooth selection, update
+and sleep screens together; incoming frame coordinates and checksums stay the
+same. The six unused bits in each panel column remain white. Button functions
+remain assigned to their existing GPIOs.
 
 ## Battery and gauge
 

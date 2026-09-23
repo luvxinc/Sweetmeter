@@ -58,3 +58,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.12] - 2026-09-20
 
 - Exercise Linux installer fixtures correctly on the Mac mini ARM64 CI runner, while continuing to reject unsupported Linux ARM64 installations.
+
+## [2026.9.13] - 2026-09-23
+
+- Rotate every device screen by 180 degrees for the printed enclosure, including the dashboard, Bluetooth menu and sleep screen; existing button functions remain unchanged.
