@@ -31,6 +31,7 @@ Pairing model (protocol 4, firmware with ``"auth": 1`` in its status):
 """
 from __future__ import annotations
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -74,6 +75,9 @@ MENU_NAME_SUFFIX = '-PAIR'
 # company ID 0xFFFF, b'SM' and a flags byte (bit 0 pairing secrets, bit 1 menu open).
 MARKER_COMPANY, MARKER_PREFIX, MARKER_AUTH, MARKER_MENU = 0xFFFF, b'SM', 1, 2
 SCAN_SECONDS = 3
+# The scanner runs continuously between scans; it restarts this often so a
+# Bluetooth problem (turned off, adapter gone) is still noticed.
+SCANNER_RESTART = 60
 MAX_IDLE_GAP = 30
 MAX_FOUND_GAP = 15
 # Hello results shared by H and P.
@@ -901,6 +905,9 @@ class Bluetooth:
         self._reset_requested = False
         self._hurry_requested = False
         self._scanning = False
+        # The running scanner (see _scan) and what it reported since the last scan returned.
+        self._scan_stack, self._scan_factory, self._scan_started = None, None, 0.0
+        self._seen, self._last_kinds = {}, {}
         # The setup window is open: this computer's user is pairing now (set by the UI).
         self.setup_open = False
         # address -> monotonic time before which it is not contacted, even with its menu open.
@@ -937,6 +944,12 @@ class Bluetooth:
             self.scanner_factory, self.client_factory = BleakScanner, BleakClient
         self.loop = asyncio.get_running_loop()
         self.ready.set()
+        try:
+            return await self._supervise()
+        finally:
+            await self._pause_scanner()
+
+    async def _supervise(self):
         while not self.stop.is_set():
             try:
                 await self._cycle()
@@ -954,26 +967,62 @@ class Bluetooth:
                 if self.stop.is_set():
                     break
                 self._error('worker_restarted', error)
+                await self._pause_scanner()
                 await self._sleep(2)
         return False
 
     # --- scanning ------------------------------------------------------------
     async def _scan(self):
-        devices = {}
-        def found(device, advertisement):
-            previous = devices.get(device.address, (None, _Advertisement()))[1]
-            name = getattr(advertisement, 'local_name', None) or previous.local_name
-            data = dict(previous.manufacturer_data)
-            data.update(getattr(advertisement, 'manufacturer_data', None) or {})
-            rssi = getattr(advertisement, 'rssi', None)
-            devices[device.address] = (device, _Advertisement(name, data, rssi if type(rssi) is int else previous.rssi))
+        """Advertisements reported since the previous scan returned, after
+        listening SCAN_SECONDS more.
+
+        The scanner keeps running between scans: macOS reports a meter that
+        appears unreliably when scanning restarts every few seconds (measured
+        30-60 s, sometimes not at all, against 2-5 s for a running scanner).
+        It stops only while this computer connects to a meter
+        (_pause_scanner) and restarts every SCANNER_RESTART seconds.
+        """
+        if self._scan_stack is not None and (self._scan_factory is not self.scanner_factory or
+                                             time.monotonic() - self._scan_started > SCANNER_RESTART):
+            await self._pause_scanner()
+        if self._scan_stack is None:
+            stack = contextlib.AsyncExitStack()
+            await stack.enter_async_context(
+                self.scanner_factory(detection_callback=self._found, service_uuids=[SERVICE_UUID]))
+            self._scan_stack, self._scan_factory, self._scan_started = stack, self.scanner_factory, time.monotonic()
         self._scanning = True
         try:
-            async with self.scanner_factory(detection_callback=found, service_uuids=[SERVICE_UUID]):
-                await self._sleep(SCAN_SECONDS)
+            await self._sleep(SCAN_SECONDS)
         finally:
             self._scanning = False
+        devices, self._seen = self._seen, {}
+        self._last_kinds = {address: self._kind(address, adv) for address, (_d, adv) in devices.items()}
         return devices
+
+    def _found(self, device, advertisement):
+        """Scanner callback (on the worker's event loop): merge advertisement and scan response."""
+        previous = self._seen.get(device.address, (None, _Advertisement()))[1]
+        name = getattr(advertisement, 'local_name', None) or previous.local_name
+        data = dict(previous.manufacturer_data)
+        data.update(getattr(advertisement, 'manufacturer_data', None) or {})
+        rssi = getattr(advertisement, 'rssi', None)
+        merged = _Advertisement(name, data, rssi if type(rssi) is int else previous.rssi)
+        self._seen[device.address] = (device, merged)
+        if not self._scanning:
+            # Between scans: a meter that just appeared, or whose computer list just
+            # opened, is looked at now instead of after the idle gap.
+            kind, before = self._kind(device.address, merged), self._last_kinds.get(device.address, 'absent')
+            if before == 'absent' or kind == 'menu' and before != 'menu':
+                self._wake.set()
+
+    async def _pause_scanner(self):
+        """Stop scanning (before connecting; BlueZ may fail to connect while it scans)."""
+        stack, self._scan_stack = self._scan_stack, None
+        if stack is not None:
+            try:
+                await stack.aclose()
+            except Exception:  # noqa: BLE001 - stopping a failed scanner must not stop the worker
+                pass
 
     @staticmethod
     def _menu_hint(advertisement):
@@ -994,6 +1043,7 @@ class Bluetooth:
         try:
             devices = await self._scan()
         except Exception as error:  # noqa: BLE001 - mapped to health/error events
+            await self._pause_scanner()  # start a fresh scanner next time
             code = classify_error(error)
             self._set_health(_HEALTH.get(code, 'error'))
             self._error(code, error)
@@ -1106,6 +1156,7 @@ class Bluetooth:
     # --- one meter -------------------------------------------------------------
     async def _visit(self, device, hinted):
         """Probe/drive one meter; returns seconds before probing it again."""
+        await self._pause_scanner()
         address = device.address
         was_connected, key = False, None
         # A Forget while this visit runs must never be undone by it.

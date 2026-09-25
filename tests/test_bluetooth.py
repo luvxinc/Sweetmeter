@@ -1527,6 +1527,7 @@ class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
             nearby = [e for e in events_of(radio) if e['event'] == 'nearby'][0]['meters']
             self.assertFalse(nearby[0]['paired'])
             confirm(radio, meter)
+            radio.scanner_factory = radio_for(folder, [meter]).scanner_factory  # a fresh report
             await radio._cycle()
             nearby = [e for e in events_of(radio) if e['event'] == 'nearby'][0]['meters']
             self.assertTrue(nearby[0]['paired'])
@@ -1588,3 +1589,67 @@ class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
                 await radio._first_status(Quick(), patient=True)
             self.assertLessEqual(waits[0], 10)
             self.assertGreater(waits[1], 30)
+
+
+class PersistentScannerTests(unittest.IsolatedAsyncioTestCase):
+    """The scanner keeps running between scans and stops only to connect."""
+    def scanner(self, log):
+        class Scanner:
+            instances = []
+            def __init__(self, detection_callback, **_):
+                self.found = detection_callback
+                Scanner.instances.append(self)
+            async def __aenter__(self):
+                log.append('start')
+                return self
+            async def __aexit__(self, *_):
+                log.append('stop')
+        return Scanner
+
+    async def test_scanner_runs_across_scans_and_pauses_for_a_visit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            log = []
+            radio = radio_for(folder, [])
+            radio.scanner_factory = self.scanner(log)
+            await radio._scan()
+            await radio._scan()
+            self.assertEqual(log, ['start'])  # not restarted every few seconds
+            meter = SimpleNamespace(address='m')
+            scanner = radio.scanner_factory.instances[0]
+            scanner.found(meter, SimpleNamespace(local_name='Sweetmeter-ABCD', manufacturer_data={}, rssi=-60))
+            self.assertIn('m', await radio._scan())  # reports between scans are kept
+            await radio._pause_scanner()
+            self.assertEqual(log, ['start', 'stop'])
+            with patch('meter.bluetooth.time.monotonic', return_value=time.monotonic() + 1):
+                await radio._scan()
+            self.assertEqual(log, ['start', 'stop', 'start'])
+
+    async def test_a_meter_appearing_between_scans_wakes_the_worker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            radio.scanner_factory = self.scanner([])
+            await radio._scan()
+            radio._wake.clear()
+            scanner = radio.scanner_factory.instances[0]
+            scanner.found(SimpleNamespace(address='m'), SimpleNamespace(local_name='Sweetmeter-ABCD',
+                                                                        manufacturer_data={0xFFFF: b'SM\x01'}, rssi=-60))
+            self.assertTrue(radio._wake.is_set())  # new meter
+            await radio._scan()  # now known, menu closed
+            radio._wake.clear()
+            scanner.found(SimpleNamespace(address='m'), SimpleNamespace(local_name='Sweetmeter-ABCD',
+                                                                        manufacturer_data={0xFFFF: b'SM\x01'}, rssi=-60))
+            self.assertFalse(radio._wake.is_set())  # nothing new: keep the idle pacing
+            scanner.found(SimpleNamespace(address='m'), SimpleNamespace(local_name='Sweetmeter-ABCD-PAIR',
+                                                                        manufacturer_data={0xFFFF: b'SM\x03'}, rssi=-60))
+            self.assertTrue(radio._wake.is_set())  # its computer list just opened
+
+    async def test_the_scanner_restarts_now_and_then_to_notice_bluetooth_problems(self):
+        with tempfile.TemporaryDirectory() as folder:
+            log = []
+            radio = radio_for(folder, [])
+            radio.scanner_factory = self.scanner(log)
+            await radio._scan()
+            from meter.bluetooth import SCANNER_RESTART
+            with patch('meter.bluetooth.time.monotonic', return_value=time.monotonic() + SCANNER_RESTART + 1):
+                await radio._scan()
+            self.assertEqual(log, ['start', 'stop', 'start'])

@@ -100,3 +100,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 - Meters can be named (up to 16 letters or digits, or 5 Chinese characters) in that window or with Rename meter…; the name is stored on the meter, which advertises it to every computer. Without a name each meter now advertises Sweetmeter- plus the end of its own serial instead of the shared Sweetmeter-05D4.
 - A first Bluetooth pairing succeeds when macOS's Connection Request is answered within about 25 seconds instead of 8: the meter waits for pairing, Sweetmeter explains the prompt while it shows, and an old pairing kept by the computer is reported with the Bluetooth settings to open instead of endless retries.
 - When a meter runs newer firmware than this app, Sweetmeter checks for an app update at once and says so; a full or closed computer list on the meter is explained instead of retried silently.
+
+## [2026.9.20] - 2026-09-25
+
+- Sweetmeter keeps scanning between checks instead of restarting the scan every few seconds, so a Mac finds a meter that just woke in seconds rather than up to a minute; scanning pauses while it connects to a meter.
