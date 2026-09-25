@@ -56,9 +56,10 @@ manufacturer-specific data AD into the scan response: company ID `0xFFFF`
 companies, used because Sweetmeter holds no company ID), then ASCII `SM` and a
 flags byte: bit 0 pairing secrets supported (always 1), bit 1 physical menu
 open; other bits 0. The scan response is `09`-type complete local name
-(`Sweetmeter-XXXX`, plus `-PAIR` while the menu is open) followed by the
-marker: 24 bytes, or 29 with the suffix (`firmware/src/advertising.h`, size
-asserted by tests). Pre-secret firmware (2026.9.8/2026.9.13) sends the name
+(the meter name, plus `-PAIR` while the menu is open) followed by the
+marker: 24 bytes for a default name, or 29 with the suffix; at most 30 bytes
+with a 16-byte owner-chosen name and the suffix (`firmware/src/advertising.h`,
+size asserted by tests). Pre-secret firmware (2026.9.8/2026.9.13) sends the name
 only. A computer classifies a meter from the advertisement merged over one
 scan: marker with the menu bit (or, when a scanner reports only the name, the
 `-PAIR` suffix) = pairing firmware, menu open; marker without it = pairing
@@ -76,6 +77,14 @@ meter then removes the unearned bond; only the computer's OS may keep a stale
 key from that one probe), and the address is remembered as pairing firmware
 so it is not probed again while its marker stays invisible. The `-PAIR` name
 suffix still reveals an open menu.
+
+**Meter name.** The local name is the owner-chosen name (section 2.2) or,
+without one, the default `Sweetmeter-XXXX`, where `XXXX` is the last four
+characters of `serial` (section 3) in upper case, i.e. the last two bytes of
+the eFuse MAC. Firmware up to 2026.9.18 formatted the first two bytes instead,
+so every board with the same manufacturer prefix advertised the same name
+(for example `Sweetmeter-05D4`). The same name is the GAP device name.
+Computers identify meters by serial and address, never by name.
 
 The device requests MTU 185. New fragmented packets use at most 182-byte GATT
 values and must also work with MTU 23 (20-byte values). Start with a 20-byte value
@@ -100,9 +109,19 @@ notification (packets, buttons, connection events) with a 50–250 ms deadline
 check instead of polling.
 
 Outside the physical menu and OTA, a link that is not authorized within
-**10 seconds** of connecting is disconnected, and any rejected hello disconnects
-immediately after its reply. A stray phone or a stale OS auto-connection cannot
-occupy the single link.
+**10 seconds** of being encrypted is disconnected, and any rejected hello
+disconnects immediately after its reply. A link that is not encrypted yet may
+stay up to **30 seconds** after connecting (the pairing protocol's own timeout):
+a computer pairing for the first time waits for its user, and macOS asks
+"Connection Request from <meter name>" and starts pairing only after Connect is
+clicked, so the meter cannot see that pairing is coming. Encryption is the
+Bluedroid authentication-complete event, for a new pairing or a bonded
+reconnect. Firmware up to 2026.9.18 counted 10 seconds from connecting, which
+left a person answering that prompt about 8 seconds. A stray phone or a stale
+OS auto-connection cannot occupy the single link: one that never encrypts is
+dropped after 30 seconds, a bonded one 10 seconds after it encrypts. Only the
+link's first encryption counts, and however often a central pairs again an
+unauthorized link never outlasts 40 seconds after connecting (45 in the menu).
 
 ## 2. Existing dashboard messages
 
@@ -128,6 +147,8 @@ The old Swift helper which requires `protocol == 3` itself needs replacement.
 | Device → control, refresh request | Single byte `R` |
 | Device → control, firmware check request | Single byte `U` (rocker held 3 s while selected) |
 | Host → control, firmware check result | `u:u8, code:u8` (`2` current, `3` installing, `4` failed, `5` companion update needed) |
+| Host → control, rename meter | `L:u8, length:u8, name:length bytes` (length 0–16; section 2.2) |
+| Device → control, rename ACK | `L:u8, result:u8` (section 2.2) |
 
 Holding the rocker is the physical confirmation for a firmware install: the
 companion checks the signed release immediately and, when newer compatible
@@ -349,6 +370,46 @@ visible changed.
   sent** (otherwise unchanged data would send nothing and the meter would
   fall back to the marker). Later identical frames are not resent.
 
+### 2.2 Meter name
+
+The owner names the meter from the computer that is selected on it. Firmware
+that implements this reports `"rename":1` in its status (section 3); a
+companion sends `L` only when a status read on the current link reported it,
+and only on an authorized link.
+Earlier firmware answers the unknown opcode with `A 3`.
+
+`L:u8, length:u8, name` is 2 + length bytes (at most 18, within the minimum
+20-byte value budget); a packet whose size differs from 2 + length is
+malformed. `length` 0 removes the owner-chosen name and restores the default
+(section 1). Otherwise the name must be:
+
+- 1–16 bytes of well-formed UTF-8: shortest-form encodings only, no surrogate
+  code points (U+D800–U+DFFF), nothing above U+10FFFF;
+- free of control characters: U+0000–U+001F, U+007F and U+0080–U+009F;
+- without a leading or trailing space (U+0020);
+- not ending in `-PAIR`, the open-menu suffix of section 1.
+
+Sixteen bytes are, for example, sixteen ASCII characters or five CJK
+characters. The limit keeps the scan response within 31 bytes including the
+`-PAIR` suffix and the marker. Companions normalize input (Unicode NFC, trim
+surrounding white space) before encoding it; firmware validates exactly the
+bytes it received and never alters them.
+
+The worker stores the name in NVS key `label` of the `quota-meter` namespace
+and reads it back; removing the name deletes the key. Only after the stored
+value is verified does the meter use it as its GAP device name and in its scan
+response, which apply from its next advertisement; the current link continues.
+A stored value that fails validation at boot is ignored (the default is used)
+and left for the next successful `L` to replace.
+
+Rename ACK results: `0` stored (or default restored) and applied; `1`
+malformed packet or invalid name (nothing changed); `2` busy, an OTA is active
+(retry after it ends); `5` storage failed (the previous name remains); `7` not
+authorized (no authorized link, or the menu is open). The meter shows its name
+on the start screen that is drawn before the first dashboard; a name that the
+screen font cannot draw (anything but printable ASCII) is shown as the default
+name there.
+
 ## 3. Device status (0004)
 
 Return one valid UTF-8 JSON object, **at most 512 bytes**. Never truncate a JSON
@@ -356,7 +417,7 @@ string. The following fields are required; omit optional diagnostics rather than
 exceeding the limit. Strings containing local names are not included here.
 
 ```json
-{"protocol":4,"firmware":"2026.9.1","board":"elecrow-crowpanel-2.13-v1.2-jd79661","auth":1,"mutual":1,"serial":"a1b2c3d4e5f6","selected":true,"secured":true,"challenge":"5f0c3a9e1b7d2c4e8a6f1d3b5c7e9a0b","battery_percent":-1,"battery_mv":-1,"interval":60,"critical":false,"charge_state":"unknown","clock_synced":true,"menu":true,"discovery_nonce":4294967295,"discovery_remaining_ms":60000,"computers":8,"ota":false,"boot_health":"valid","last_update":"none","ota_target":"","rssi":-61}
+{"protocol":4,"firmware":"2026.9.1","board":"elecrow-crowpanel-2.13-v1.2-jd79661","auth":1,"mutual":1,"serial":"a1b2c3d4e5f6","selected":true,"secured":true,"challenge":"5f0c3a9e1b7d2c4e8a6f1d3b5c7e9a0b","battery_percent":-1,"battery_mv":-1,"interval":60,"critical":false,"charge_state":"unknown","clock_synced":true,"menu":true,"discovery_nonce":4294967295,"discovery_remaining_ms":60000,"computers":8,"ota":false,"boot_health":"valid","last_update":"none","ota_target":"","rename":1,"rssi":-61}
 ```
 
 The example values are synthetic. The status **never names the selected
@@ -364,7 +425,12 @@ computer** (the former `selected_host` field is gone): any nearby central can
 read it. `auth` is 1 for the pairing protocol of section 2.1. `mutual` is 1
 when the firmware implements mutual authentication (N and the meter proof,
 section 2.1); it is omitted by earlier pairing firmware and only valid with
-`auth`. `serial` is the
+`auth`. `rename` is 1 when the firmware accepts the meter name command `L`
+(section 2.2); it is omitted by earlier firmware and only valid with `auth`.
+It is the first optional field, appended before `rssi`: the required fields
+can reach 511 bytes only with implausibly long version strings, and then it
+is dropped rather than exceeding the limit. A companion treats a missing
+`rename` as "not supported". `serial` is the
 meter's stable eFuse MAC as 12 lower-case hex characters; computers key pairing
 secrets by it. `selected` says whether a computer is selected; `secured` whether
 that selection has a pairing secret (false only after migrating from pre-secret
@@ -468,7 +534,9 @@ expires after five seconds without a valid packet or when its window closes; no
 partial body is persisted. Wait five seconds for a J ACK. The device disconnects
 immediately after commit ACK/error. It forcibly releases a discovery connection
 after eight seconds from its first status read/registration packet, or 15
-seconds from physical connection, whichever comes first.
+seconds from encryption (30 seconds from physical connection while not yet
+encrypted; section 1), whichever comes first. Firmware up to 2026.9.18 counted
+the 15 seconds from physical connection.
 
 After selection, persist the registry, close the menu, disconnect any candidate
 and advertise; only the selected computer's next hello is authorized.
@@ -506,6 +574,19 @@ therefore decides from the advertisement (section 1) before connecting:
 - Undecided (no scan response yet): do not connect this scan.
 - Marker not reported although the status says `"auth":1`: see section 1;
   the status decides and the link is closed at once.
+
+**Operating-system pairing.** The first encrypted read on a link makes a
+computer that has no bond with the meter pair (Just Works). macOS first shows
+"Connection Request from <name>" and pairs only after Connect; the companion
+waits up to 35 seconds for that read (re-reading after a backend's own read
+timeout) so the meter's deadline decides, and tells the user after 2 seconds.
+If the meter drops a link whose pairing then completes, the meter removes that
+unearned bond (section 9) while the computer keeps its keys; every later
+connection from that computer then fails (macOS: CBError 14, "Peer removed
+pairing information") until the user removes the Sweetmeter device in the
+system Bluetooth settings. Companions up to 2026.9.13 probe pairing firmware
+and leave such keys whenever the user accepted the prompt. The companion
+reports this case with the settings to open, rather than retrying silently.
 
 Status read before this link authenticated is reported to the application as
 untrusted: a copied serial proves nothing. A firmware job is bound to the BLE

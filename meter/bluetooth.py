@@ -48,6 +48,7 @@ import uuid
 import zlib
 from datetime import datetime
 from pathlib import Path
+from .naming import NAME_MAX_BYTES, default_name, display_name
 
 SERVICE_UUID = '7a1e0001-ff1b-4d9f-a023-47c7752c1a01'
 CONTROL_UUID = '7a1e0002-ff1b-4d9f-a023-47c7752c1a01'
@@ -79,6 +80,26 @@ MAX_FOUND_GAP = 15
 HELLO_OK, HELLO_BUSY, HELLO_STORE_FAILED, HELLO_REJECTED, HELLO_PROVISION, HELLO_NOT_SELECTED = 0, 2, 5, 7, 8, 9
 # Frame A results: 0 drawn now, 1 accepted and drawn with the next minute tick.
 ACK_LABELS = {0: 'FULL', 1: 'QUEUED'}
+# A rename that has not reached a connected meter within this time fails.
+RENAME_TIMEOUT = 20
+# Rename ACK results (docs/PROTOCOL.md section 2.2).
+RENAME_MESSAGES = {
+    1: 'The meter refused this name. Use up to 16 letters or digits, or up to 5 Chinese characters.',
+    2: 'The meter is installing an update. Rename it when the update has finished.',
+    5: 'The meter could not save the name. Try again.',
+    7: 'The meter is not connected to this computer right now. Try again when it is connected.',
+}
+# Registration (J) results worth explaining; others are transient and retried.
+REGISTRATION_MESSAGES = {
+    2: 'The meter’s computer list closed before this computer was added. Hold the meter’s lower button '
+       'for 3 seconds to open it again.',
+    5: 'The meter’s computer list is full. On the meter, highlight a computer you no longer use, hold the '
+       'wheel for 3 seconds and confirm to remove it, then try again.',
+    7: 'This computer tried to join too often. Wait a moment; Sweetmeter tries again automatically.',
+    8: 'The meter saw two different keys for this computer. On the meter, remove this computer from the list, '
+       'then hold the lower button for 3 seconds to add it again.',
+    9: 'The meter needs a newer Sweetmeter app on this computer. Check for updates.',
+}
 
 
 def companion_identity(state_dir):
@@ -120,6 +141,8 @@ def parse_status(raw):
             raise ValueError('Invalid device pairing status')
     if 'mutual' in value and (type(value['mutual']) is not int or value['mutual'] != 1 or 'auth' not in value):
         raise ValueError('Invalid device pairing status')
+    if 'rename' in value and (type(value['rename']) is not int or value['rename'] != 1 or 'auth' not in value):
+        raise ValueError('Invalid device naming status')
     return value
 
 
@@ -164,8 +187,9 @@ def advertised_kind(advertisement):
 
 class _Advertisement:
     """Advertisement fields merged over one scan (a scan response can arrive separately)."""
-    def __init__(self, local_name=None, manufacturer_data=None):
+    def __init__(self, local_name=None, manufacturer_data=None, rssi=None):
         self.local_name, self.manufacturer_data = local_name, dict(manufacturer_data or {})
+        self.rssi = rssi
 
 
 def device_key(address, status):
@@ -198,6 +222,13 @@ class HelloBusy(RuntimeError):
     pass
 
 
+class RegistrationRejected(RuntimeError):
+    """The meter answered a registration step with a nonzero J result."""
+    def __init__(self, result, offset):
+        super().__init__(f'Computer registration rejected ({result}, offset {offset})')
+        self.result = result
+
+
 class MeterConflict(Exception):
     """A peripheral using this meter's serial could not show it is our meter.
 
@@ -222,7 +253,34 @@ _MESSAGES = {
     'worker_restarted': 'The Bluetooth connection restarted after an unexpected error.',
     'meter_conflict': ('A device using your meter\'s serial number could not prove it is your meter, so Sweetmeter '
                        'ignores it. If you reset this meter or its Bluetooth pairing, choose Forget and pair again.'),
+    'stale_pairing': ('This computer kept an old Bluetooth pairing that the meter no longer has, so every connection '
+                      'fails. Remove the Sweetmeter device from the computer\'s Bluetooth settings, then connect again.'),
 }
+# Where to remove an old pairing, per operating system (stale_pairing).
+STALE_PAIRING_HELP = {
+    'darwin': ('macOS kept an old Bluetooth pairing that the meter no longer has, so every connection fails. '
+               'Open System Settings > Bluetooth, click ⓘ next to each device named Sweetmeter, choose '
+               'Forget This Device… and confirm. Then connect again; when macOS asks to connect, click Connect.'),
+    'win32': ('Windows kept an old Bluetooth pairing that the meter no longer has, so every connection fails. '
+              'Open Settings > Bluetooth & devices > Devices, choose each device named Sweetmeter, then Remove '
+              'device. Then connect again.'),
+    'linux': ('This computer kept an old Bluetooth pairing that the meter no longer has, so every connection fails. '
+              'Remove each device named Sweetmeter in Settings > Bluetooth (or run bluetoothctl remove with its '
+              'address). Then connect again.'),
+}
+# The first status read waits for the operating system's pairing prompt on a
+# new link (macOS shows "Connection Request"); after this long, say so.
+PAIRING_PROMPT_AFTER = 2
+# Longer than the meter's 30 s allowance for a link that is still pairing, so
+# the meter, not this computer, ends a pairing its user has not answered. Used
+# only while this computer is pairing (setup window open, or a registration in
+# progress with that meter); otherwise a first read gets the normal 10 s.
+FIRST_STATUS_TIMEOUT = 35
+STATUS_TIMEOUT = 10
+# A meter whose pairing prompt went unanswered, or that refused this computer's
+# registration, is not contacted again for this long even while its menu is open.
+UNANSWERED_HOLD = 30
+REFUSED_HOLD = 10
 _HEALTH = {'bluetooth_off': 'off', 'bluetooth_unauthorized': 'unauthorized', 'bluetooth_unavailable': 'error'}
 
 
@@ -247,6 +305,10 @@ def classify_error(error):
         return 'bluetooth_unavailable'
     if name == 'BleakCharacteristicNotFoundError' or 'characteristic' in text and 'not found' in text:
         return 'gatt_changed'
+    # macOS CBErrorPeerRemovedPairingInformation. (BlueZ's AuthenticationFailed also
+    # covers a cancelled first pairing, so it is not reported as a stale pairing.)
+    if 'peer removed pairing information' in text or 'cberrordomain code=14' in text:
+        return 'stale_pairing'
     if name == 'BleakDeviceNotFoundError' or 'not found' in text:
         return 'device_not_found'
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
@@ -457,6 +519,11 @@ class PairingStore:
     def has_pairing(self):
         with self.lock:
             return any(record.get('secret') or record.get('legacy') for record in self.meters.values())
+
+    def has_secret_pairing(self):
+        """A meter proved a pairing secret with this computer (not only a pre-secret record)."""
+        with self.lock:
+            return any(record.get('secret') for record in self.meters.values())
 
     def trusted(self, key, address):
         with self.lock:
@@ -726,6 +793,14 @@ class Session:
     async def update_notice(self, code):
         await self.write(CONTROL_UUID, bytes((ord('u'), code)))
 
+    async def rename(self, name):
+        """Store ``name`` (validated UTF-8 bytes, empty = default) on the meter; returns its L result."""
+        if len(name) > NAME_MAX_BYTES:
+            raise ValueError('Invalid meter name')
+        await self.write(CONTROL_UUID, b'L' + bytes([len(name)]) + name)
+        reply = await self.wait(lambda p: len(p) == 2 and p[:1] == b'L', 10)
+        return reply[1]
+
     async def clock(self):
         offset = int(datetime.now().astimezone().utcoffset().total_seconds())
         await self.write(CONTROL_UUID, struct.pack('<cIi', b'T', int(time.time()), offset))
@@ -748,7 +823,7 @@ class Session:
                                   struct.unpack_from('<I', p, 2)[0] == session, 5)
             _, result, _, offset = struct.unpack('<cBII', ack)
             if result or offset != expected:
-                raise RuntimeError(f'Computer registration rejected ({result}, offset {offset})')
+                raise RegistrationRejected(result, offset)
         await step(struct.pack('<cIIH', b'J', session, nonce, len(body)), 0)
         count = value_budget(self.client) - 9
         for offset in range(0, len(body), count):
@@ -811,6 +886,10 @@ class Bluetooth:
         # concurrent install_firmware() never sees a job briefly missing.
         self.job_lock = threading.Lock()
         self.notices = queue.Queue()
+        # (UTF-8 name bytes, queued_at) waiting for the connected meter.
+        self.renames = queue.Queue()
+        # Last advertised name per address (without the menu suffix).
+        self.names = {}
         self.scanner_factory, self.client_factory = scanner_factory, client_factory
         self.registered = {}
         self._not_before = {}
@@ -820,6 +899,12 @@ class Bluetooth:
         self._idle_gap = 0
         self._wake = threading.Event()
         self._reset_requested = False
+        self._hurry_requested = False
+        self._scanning = False
+        # The setup window is open: this computer's user is pairing now (set by the UI).
+        self.setup_open = False
+        # address -> monotonic time before which it is not contacted, even with its menu open.
+        self._hold = {}
         self._last_error = (None, 0.0)
         self.thread = threading.Thread(target=self._thread, name='sweetmeter-ble', daemon=True)
         if start:
@@ -880,9 +965,14 @@ class Bluetooth:
             name = getattr(advertisement, 'local_name', None) or previous.local_name
             data = dict(previous.manufacturer_data)
             data.update(getattr(advertisement, 'manufacturer_data', None) or {})
-            devices[device.address] = (device, _Advertisement(name, data))
-        async with self.scanner_factory(detection_callback=found, service_uuids=[SERVICE_UUID]):
-            await self._sleep(SCAN_SECONDS)
+            rssi = getattr(advertisement, 'rssi', None)
+            devices[device.address] = (device, _Advertisement(name, data, rssi if type(rssi) is int else previous.rssi))
+        self._scanning = True
+        try:
+            async with self.scanner_factory(detection_callback=found, service_uuids=[SERVICE_UUID]):
+                await self._sleep(SCAN_SECONDS)
+        finally:
+            self._scanning = False
         return devices
 
     @staticmethod
@@ -890,12 +980,17 @@ class Bluetooth:
         return advertised_kind(advertisement) == 'menu'
 
     async def _cycle(self):
+        if self._hurry_requested:
+            self._hurry_requested = False
+            self._idle_gap = 0
         if self._reset_requested:
             # Applied on the loop thread; rescan()/forget() only set the flag.
             self._reset_requested = False
             self._idle_gap = 0
             self._not_before.clear()
-            self.registered.clear()
+            self._hold.clear()
+            # self.registered is kept: registering again for the same menu opening
+            # would send a second secret, which the meter lists as a conflict.
         try:
             devices = await self._scan()
         except Exception as error:  # noqa: BLE001 - mapped to health/error events
@@ -906,15 +1001,17 @@ class Bluetooth:
             return
         self._set_health('ok')
         self._expire_job()
+        self._expire_renames()
+        self._nearby(devices)
         paired = self.store.paired_addresses()
         order = sorted(devices.items(), key=lambda item: (item[0] not in paired, not self._menu_hint(item[1][1])))
         for address, (device, advertisement) in order:
             if self.stop.is_set():
                 return
-            kind = advertised_kind(advertisement)
-            if kind == 'legacy' and address in self._pairing_firmware:
-                kind = 'closed'  # its marker is not reported here; the status showed pairing firmware
+            kind = self._kind(address, advertisement)
             hinted = kind == 'menu'
+            if time.monotonic() < self._hold.get(address, 0):
+                continue
             if not hinted and time.monotonic() < self._not_before.get(address, 0):
                 continue
             if not hinted and not self.store.related(address):
@@ -925,7 +1022,8 @@ class Bluetooth:
                     # probe would leave a stale key in this computer's OS.
                     # Show the instructions from the advertisement instead.
                     if not self.store.has_pairing():
-                        self.events.put({'event': 'selection_required', 'name': self.name, 'reason': 'unpaired'})
+                        self.events.put({'event': 'selection_required', 'name': self.name, 'reason': 'unpaired',
+                                         'device_id': address})
                     self._not_before[address] = time.monotonic() + random.uniform(3, 5)
                     continue
                 # 'legacy': pre-secret firmware never removes bonds; probe it
@@ -941,6 +1039,40 @@ class Bluetooth:
             await self._sleep(random.uniform(2, 5) if soonest <= 5 else min(MAX_FOUND_GAP, soonest))
         else:
             await self._sleep(self._next_idle_gap())
+
+    def _kind(self, address, advertisement):
+        kind = advertised_kind(advertisement)
+        if kind == 'legacy' and address in self._pairing_firmware:
+            kind = 'closed'  # its marker is not reported here; the status showed pairing firmware
+        return kind
+
+    def _nearby(self, devices):
+        """Report the meters this scan saw, for the setup window (nothing is connected)."""
+        meters, paired = [], self.store.paired_addresses()
+        for address, (_device, advertisement) in devices.items():
+            name = display_name(advertisement.local_name)
+            if name:
+                self.names[address] = name
+            # Only a confirmed pairing counts: a registration still waiting for the
+            # owner's choice on the meter is not "paired".
+            meters.append({'address': address, 'name': self.names.get(address, ''), 'rssi': advertisement.rssi,
+                           'kind': self._kind(address, advertisement), 'paired': address in paired})
+        self.events.put({'event': 'nearby', 'meters': meters})
+
+    def _expire_renames(self):
+        """No meter connected: a rename that waited too long fails visibly."""
+        kept = []
+        while True:
+            try:
+                item = self.renames.get_nowait()
+            except queue.Empty:
+                break
+            if time.monotonic() - item[1] > RENAME_TIMEOUT:
+                self.events.put({'event': 'renamed', 'ok': False, 'error': RENAME_MESSAGES[7]})
+            else:
+                kept.append(item)
+        for item in kept:
+            self.renames.put(item)
 
     def _next_idle_gap(self):
         """No meter seen: back off 5, 10, 20, then 30 s between 3 s scans."""
@@ -959,9 +1091,16 @@ class Bluetooth:
         if last == code and now - at < 30:
             return
         self._last_error = (code, now)
-        event = {'event': 'error', 'code': code, 'error': _MESSAGES[code]}
+        message = _MESSAGES[code]
+        if code == 'stale_pairing':
+            message = STALE_PAIRING_HELP['darwin' if sys.platform == 'darwin' else
+                                         'win32' if sys.platform == 'win32' else 'linux']
+        event = {'event': 'error', 'code': code, 'error': message}
         if error is not None:
-            event['detail'] = type(error).__name__
+            # Our own protocol errors carry only fixed text and numeric codes;
+            # other libraries' messages may include addresses, so keep only the type.
+            own = type(error) in (ValueError, RuntimeError)
+            event['detail'] = type(error).__name__ + (': ' + str(error)[:120] if own else '')
         self.events.put(event)
 
     # --- one meter -------------------------------------------------------------
@@ -973,7 +1112,17 @@ class Bluetooth:
         generation = self.store.generation
         try:
             async with self.client_factory(device, timeout=20) as client:
-                status = parse_status(await asyncio.wait_for(client.read_gatt_char(STATUS_UUID), 10))
+                # Pairing now: the setup window is open, a registration with this meter
+                # is under way, or this computer never paired (its user's meter).
+                patient = self.setup_open or self.store.related(address) or not self.store.has_secret_pairing()
+                try:
+                    status = parse_status(await self._first_status(client, patient=patient))
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not self.store.related(address):
+                        # Probably a pairing prompt nobody answers here (a neighbour's
+                        # meter with its menu open): leave its single link alone.
+                        self._hold[address] = time.monotonic() + UNANSWERED_HOLD
+                    raise
                 key = device_key(address, status)
                 # Anyone can copy a meter's serial: nothing is trusted before
                 # this link has authenticated.
@@ -985,7 +1134,8 @@ class Bluetooth:
                     # now and leave at once, before any write.
                     self._pairing_firmware.add(address)
                     if not self.store.has_pairing():
-                        self.events.put({'event': 'selection_required', 'name': self.name, 'reason': 'unpaired'})
+                        self.events.put({'event': 'selection_required', 'name': self.name, 'reason': 'unpaired',
+                                         'device_id': address})
                     return random.uniform(3, 5)
                 session = Session(client, self.host_id, self.name, self.events.put, protocol=status['protocol'])
                 await session.subscribe()
@@ -1010,7 +1160,7 @@ class Bluetooth:
                                 return 0
                         await session.register(nonce, secret)
                         self.registered[address] = nonce
-                        self.events.put({'event': 'registered', 'name': self.name})
+                        self.events.put({'event': 'registered', 'name': self.name, 'device_id': address})
                     return random.uniform(5, 9)
                 legacy = not auth
                 if not legacy:
@@ -1033,7 +1183,8 @@ class Bluetooth:
                 was_connected = True
                 self._idle_gap = 0
                 self._status(address, status, True)
-                self.events.put({'event': 'connected', 'device_id': address})
+                self.events.put({'event': 'connected', 'device_id': address,
+                                 'name': self.names.get(address) or default_name(status.get('serial'))})
                 await self._connected(session, address, status, key, generation)
                 return 0
         except DiscoveryOpened:
@@ -1046,6 +1197,16 @@ class Bluetooth:
             return self._rejected(address, rejection, key)
         except HelloBusy:
             return random.uniform(2, 5)
+        except RegistrationRejected as rejection:
+            message = REGISTRATION_MESSAGES.get(rejection.result)
+            if message is None:
+                self._error('device_error', rejection)  # transient; retried with a fresh session
+                return random.uniform(2, 5)
+            self.events.put({'event': 'registration_failed', 'result': rejection.result, 'error': message,
+                             'device_id': address})
+            if rejection.result in (5, 8, 9):
+                self._hold[address] = time.monotonic() + REFUSED_HOLD  # applies with its menu open too
+            return random.uniform(8, 12) if rejection.result in (5, 8, 9) else random.uniform(2, 5)
         except Exception as error:  # noqa: BLE001 - a single meter must not stop the worker
             code = classify_error(error)
             if code in _HEALTH:
@@ -1080,11 +1241,37 @@ class Bluetooth:
             return random.uniform(5, 9)  # another device with this serial says nothing about our meter
         raise MeterConflict('Authorized while its menu is open')
 
+    async def _first_status(self, client, *, patient=True):
+        """The first read on a link is encrypted: a computer that has not paired
+        with the meter pairs now, and macOS first asks the user ("Connection
+        Request"). Waiting longer than a normal read keeps that link alive; the
+        meter's own deadline still applies."""
+        loop = asyncio.get_running_loop()
+        deadline, prompted = loop.time() + (FIRST_STATUS_TIMEOUT if patient else STATUS_TIMEOUT), False
+        try:
+            while True:
+                read = asyncio.ensure_future(client.read_gatt_char(STATUS_UUID))
+                try:
+                    if not prompted:
+                        done, _ = await asyncio.wait({read}, timeout=PAIRING_PROMPT_AFTER)
+                        if not done:
+                            prompted = True
+                            self.events.put({'event': 'os_pairing_prompt'})
+                    return await asyncio.wait_for(read, max(.1, deadline - loop.time()))
+                except (asyncio.TimeoutError, TimeoutError):
+                    # bleak's macOS read gives up after 20 s while the user may still
+                    # answer the prompt: read again on the same link until the deadline.
+                    if loop.time() >= deadline or not getattr(client, 'is_connected', True):
+                        raise
+        finally:
+            if prompted:
+                self.events.put({'event': 'os_pairing_done'})
+
     def _rejected(self, address, rejection, key):
         if rejection.retry:
             # Only an unproven pending secret was refused; try the confirmed one.
             return random.uniform(2, 4)
-        event = {'event': 'selection_required', 'name': self.name, 'reason': rejection.reason}
+        event = {'event': 'selection_required', 'name': self.name, 'reason': rejection.reason, 'device_id': address}
         self.events.put(event)
         if rejection.reason == 'unpaired':
             return random.uniform(3, 5)
@@ -1176,6 +1363,7 @@ class Bluetooth:
                 # A result that could not be delivered promptly is stale.
                 if status['protocol'] == 4 and time.monotonic() - queued_at <= NOTICE_MAX_AGE:
                     await session.update_notice(code)
+            await self._apply_renames(session, address, status)
             if session.refresh_requested:
                 session.refresh_requested = False
                 with self.frame_lock:
@@ -1193,6 +1381,34 @@ class Bluetooth:
                 if answering:
                     answer = None
             await self._sleep(.1)
+
+    async def _apply_renames(self, session, address, status):
+        while True:
+            try:
+                name, queued_at = self.renames.get_nowait()
+            except queue.Empty:
+                return
+            event = {'event': 'renamed', 'device_id': address, 'ok': False}
+            if time.monotonic() - queued_at > RENAME_TIMEOUT:
+                event['error'] = RENAME_MESSAGES[7]
+            elif status.get('rename') != 1:
+                event['error'] = ('This meter needs a firmware update before it can be renamed. '
+                                  'Hold its wheel for 3 seconds to check for one.')
+            else:
+                try:
+                    result = await session.rename(name)
+                except BaseException:
+                    # The link ended or the meter did not answer: say so, then end the session.
+                    event['error'] = 'The meter did not confirm the new name. Try again when it is connected.'
+                    self.events.put(event)
+                    raise
+                if result == 0:
+                    shown = name.decode('utf-8') if name else default_name(status.get('serial'))
+                    self.names[address] = shown
+                    event.update(ok=True, name=shown)
+                else:
+                    event['error'] = RENAME_MESSAGES.get(result, 'The meter could not be renamed. Try again.')
+            self.events.put(event)
 
     def _status(self, address, status, trusted):
         self.events.put({'event': 'status', 'device_id': address, 'status': status, 'trusted': bool(trusted)})
@@ -1224,11 +1440,25 @@ class Bluetooth:
         self._reset_requested = True
         self._wake.set()
 
+    def hurry(self):
+        """Scan now and restart the idle backoff, keeping per-meter retry timers.
+        A scan in progress is not cut short (short scans miss advertisements)."""
+        self._hurry_requested = True
+        if not self._scanning:
+            self._wake.set()
+
     def update_notice(self, code):
         """Show a rocker-hold update result on the connected meter (dropped after 60 s)."""
         if code not in (2, 3, 4, 5):
             raise ValueError('Unknown update notice')
         self.notices.put((code, time.monotonic()))
+
+    def rename(self, data):
+        """Rename the connected meter; ``data`` comes from ``naming.encode_meter_name``
+        (empty restores the default name). The outcome is a ``renamed`` event."""
+        if not isinstance(data, bytes) or len(data) > NAME_MAX_BYTES:
+            raise ValueError('Invalid meter name')
+        self.renames.put((data, time.monotonic()))
 
     def forget(self):
         """Forget every paired meter and its secret on this computer."""

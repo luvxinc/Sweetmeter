@@ -180,7 +180,7 @@ static void advertisingTests() {
   assert(open==29 && open<=advertisingLimit && raw[0]==21 && !memcmp(raw+2,"Sweetmeter-ABCD-PAIR",20));
   const uint8_t markerOpen[7]={6,0xFF,0xFF,0xFF,'S','M',markerAuth|markerMenu};
   assert(!memcmp(raw+22,markerOpen,7));
-  // Every name the firmware can generate ("Sweetmeter-%04X") fits; longer names are refused, never truncated.
+  // Default and owner-chosen names (at most 16 bytes, test_meter_name.cpp) fit; longer ones are refused, never truncated.
   assert(buildScanResponse(raw,"Sweetmeter-ABCDEFGH",true)==0);
 }
 static void statusTests() {
@@ -193,10 +193,15 @@ static void statusTests() {
   assert(length>0 && length<512 && out[length-1]=='}');
   assert(!strncmp(out+offset,challengePlaceholder,32) && out[offset+32]=='"');
   assert(!strstr(out,"selected_host") && strstr(out,"\"auth\":1,\"mutual\":1,") && strstr(out,"\"serial\":\"a1b2c3d4e5f6\""));
-  assert(!strstr(out,"rssi"));  // optional diagnostic omitted rather than exceeding 512
+  // Theoretical maxima: every required field stays; optional ones are omitted rather than exceeding 512.
+  assert(!strstr(out,"rssi") && !strstr(out,"rename"));
+  // Real versions keep the rename capability even with every other field at its maximum;
+  // it is appended before the diagnostic, which is dropped first.
+  f.firmware="2026.12.999";f.target="2026.12.999";length=formatStatus(out,sizeof(out),f,offset);
+  assert(length>0 && length<512 && strstr(out,",\"rename\":1}") && !strstr(out,"rssi"));
   f.target="";length=formatStatus(out,sizeof(out),f,offset);
-  assert(length>0 && length<512 && strstr(out,",\"rssi\":-127}"));
-  f.rssi=127;assert(formatStatus(out,sizeof(out),f,offset)>0 && !strstr(out,"rssi"));
+  assert(length>0 && length<512 && strstr(out,",\"rename\":1,\"rssi\":-127}"));
+  f.rssi=127;assert(formatStatus(out,sizeof(out),f,offset)>0 && !strstr(out,"rssi") && strstr(out,",\"rename\":1}"));
   char tiny[100];assert(formatStatus(tiny,sizeof(tiny),f,offset)==-1);
 }
 int main() {

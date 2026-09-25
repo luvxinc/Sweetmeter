@@ -16,6 +16,7 @@ from .providers import (NotSetUp, account_fingerprints, close_codex, in_backoff,
 from .tokens import TokenIndex, is_corrupt
 from .render import render, pack_frame
 from .updater import save_json, UpdateService
+from .version import Version, get_version
 
 # Claude and Codex quotas are both read every render interval (about once a
 # minute). Codex is asked through one long-lived `codex app-server` process
@@ -391,6 +392,9 @@ class Application:
         self.radio_started = None
         self.log_limit = LogLimiter()
         self.provider = ProviderWorker(state_dir, self.events.put, lambda: self.device)
+        self.version = get_version()
+        # Firmware versions already reported as newer than this app (one update check each).
+        self.newer_firmware = set()
 
     def _new_radio(self):
         if self.bluetooth_factory is None:
@@ -424,9 +428,44 @@ class Application:
         except OSError as error:
             self.log_limit.log(logging.WARNING, 'Cannot save meter state (%s)' % type(error).__name__)
 
+    def _meter_version(self, event):
+        """A meter newer than this app needs an app update: check now and say so.
+
+        Only the meter this computer is paired with, or one it is registering
+        with while the owner has its computer list open, counts; a stranger's
+        meter nearby (or a device imitating one) does not."""
+        status = event.get('status') or {}
+        store = getattr(self.radio, 'store', None)
+        pairing = bool(status.get('menu')) and store is not None and store.related(event.get('device_id'))
+        if not (event.get('trusted') or pairing):
+            return
+        firmware = status.get('firmware')
+        try:
+            newer = Version.parse(firmware) > Version.parse(self.version)
+        except ValueError:
+            return
+        if not newer or firmware in self.newer_firmware:
+            return
+        self.newer_firmware.add(firmware)
+        self.events.put({'event': 'meter_newer', 'firmware': firmware, 'companion': self.version})
+        if self.updates:
+            self.updates.check()
+
+    def rename_meter(self, text):
+        """Rename the connected meter (empty restores its default name).
+
+        Raises ValueError with a user-facing reason for a name the meter would
+        refuse; the outcome arrives as a ``renamed`` event."""
+        from .naming import encode_meter_name
+        data = encode_meter_name(text)
+        if self.radio is None:
+            raise RuntimeError('Bluetooth is not running')
+        self.radio.rename(data)
+
     def _radio_event(self, event):
         kind = event.get('event')
         if kind == 'status':
+            self._meter_version(event)
             if not event.get('trusted'):
                 # Foreign or unauthenticated meters never affect update offers,
                 # the render interval, or what is saved.
@@ -520,11 +559,22 @@ class Application:
             self.log_limit.log(logging.INFO, 'Meter %s %s' % (kind, event.get('device_id', '')))
         elif kind in ('error', 'update_error', 'ota_error', 'provider_error'):
             code = event.get('code')
-            self.log_limit.log(logging.WARNING, '%s%s: %s' % (kind, ' [%s]' % code if code else '', event.get('error', '')))
+            detail = event.get('detail')
+            self.log_limit.log(logging.WARNING, '%s%s: %s%s' % (kind, ' [%s]' % code if code else '', event.get('error', ''),
+                                                              ' (%s)' % detail if detail else ''))
         elif kind == 'bluetooth_state':
             self.log_limit.log(logging.INFO, 'Bluetooth state: %s' % event.get('state'))
         elif kind == 'selection_required':
             self.log_limit.log(logging.INFO, 'Meter needs this computer selected (%s)' % event.get('reason', ''))
+        elif kind == 'registration_failed':
+            self.log_limit.log(logging.WARNING, 'Meter refused registration (%s)' % event.get('result'))
+        elif kind == 'renamed':
+            self.log_limit.log(logging.INFO, 'Meter rename %s' % ('stored' if event.get('ok') else 'failed'))
+        elif kind == 'os_pairing_prompt':
+            self.log_limit.log(logging.INFO, 'Waiting for the system Bluetooth pairing prompt')
+        elif kind == 'meter_newer':
+            self.log_limit.log(logging.WARNING, 'Meter firmware %s is newer than this app %s' %
+                               (event.get('firmware'), event.get('companion')))
 
     def pump(self):
         result = []

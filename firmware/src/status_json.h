@@ -32,13 +32,18 @@ inline int formatStatus(char *out, size_t size, const StatusFields &f, size_t &c
     f.clockSynced ? "true" : "false", f.menu ? "true" : "false", (unsigned long)f.nonce,
     (unsigned long)f.remaining, f.computers, f.ota ? "true" : "false", f.health, f.lastUpdate, f.target);
   if (length < 0 || size_t(length) + 1 >= size || size_t(length) + 1 >= statusLimit) return -1;
-  // Optional diagnostics are appended only when they fit; required fields never truncate.
-  int extra = f.rssi != 127 ? snprintf(out + length, size - size_t(length), ",\"rssi\":%d}", f.rssi) : -1;
-  if (extra < 0 || size_t(length + extra) >= size || size_t(length + extra) >= statusLimit) {
-    out[length++] = '}'; out[length] = 0;
-  } else {
-    length += extra;
+  // Optional fields are appended, in this order, only while they fit with the
+  // closing brace; required fields never truncate. "rename" (the L command,
+  // docs/PROTOCOL.md 2.2) is dropped only with implausibly long version strings.
+  char optional[2][24]; int count = 0;
+  snprintf(optional[count++], sizeof(optional[0]), ",\"rename\":1");
+  if (f.rssi != 127) snprintf(optional[count++], sizeof(optional[0]), ",\"rssi\":%d", f.rssi);
+  for (int i = 0; i < count; ++i) {
+    size_t extra = strlen(optional[i]);
+    if (size_t(length) + extra + 1 >= size || size_t(length) + extra + 1 >= statusLimit) continue;
+    memcpy(out + length, optional[i], extra + 1); length += int(extra);
   }
+  out[length++] = '}'; out[length] = 0;
   const char *field = strstr(out, "\"challenge\":\"");
   if (!field) return -1;
   challengeOffset = size_t(field - out) + 13;

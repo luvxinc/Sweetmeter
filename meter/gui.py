@@ -9,13 +9,18 @@ import re
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
+from .setup_flow import DONE, OPEN, STEPS, WAKE, SetupFlow
 from .version import get_version
 
 SETUP_STEPS = ('Allow Bluetooth if asked. Turn on the meter.\n'
                'Hold its lower button for 3 seconds, then select this computer\n'
                'with the wheel and press to confirm.\n'
-               'Already signed in to Claude Code / Codex? No extra login is needed.')
+               'Already signed in to Claude Code / Codex? No extra login is needed.\n'
+               'Choose Connect a meter… for step-by-step help.')
+# While the setup window waits for a meter or for its computer list to open,
+# scan almost continuously instead of backing off.
+SETUP_SCAN_EVERY_MS = 2000
 
 # Plain, OS-specific steps for Bluetooth problems.
 BLUETOOTH_HELP = {
@@ -136,8 +141,15 @@ class Desktop:
         ttk.Button(buttons, text='Check updates', command=self.check).pack(side='left', padx=8)
         self.forget_button = ttk.Button(buttons, text='Forget meter…', command=self.forget)
         self.forget_button.pack(side='left')
+        meter_buttons = ttk.Frame(frame)
+        meter_buttons.pack(side='bottom', fill='x', pady=(12, 0))
+        self.setup_button = ttk.Button(meter_buttons, text='Connect a meter…', command=self.open_setup)
+        self.setup_button.pack(side='left')
+        self.rename_button = ttk.Button(meter_buttons, text='Rename meter…', command=self.rename)
+        self.rename_button.pack(side='left', padx=8)
         if app.preview_only:
-            self.forget_button.configure(state='disabled')
+            for button in (self.forget_button, self.setup_button, self.rename_button):
+                button.configure(state='disabled')
         ttk.Button(buttons, text='Quit', command=self.quit).pack(side='right')
         ttk.Button(buttons, text='Uninstall…', command=self.uninstall).pack(side='right', padx=8)
         from .installation import start_at_login_choice
@@ -152,8 +164,80 @@ class Desktop:
         if not available or app.preview_only:
             self.start_at_login_box.configure(state='disabled')
         self.root.protocol('WM_DELETE_WINDOW', self.root.withdraw)
+        # Bluetooth starts after this window exists (see run()).
+        self.setup = SetupFlow()
+        self.setup_window = None
+        self.background = background
         if background:
             self.root.withdraw()
+
+    def _needs_setup(self):
+        """No meter has proved a pairing secret with this computer yet: a first
+        install, or an app updated from a version that paired without secrets
+        (a meter with pairing firmware refuses those until it is selected again)."""
+        radio = getattr(self.app, 'radio', None)
+        store = getattr(radio, 'store', None)
+        return bool(store is not None and not self.app.preview_only and not store.has_secret_pairing())
+
+    def open_setup(self):
+        """Show the step-by-step window for connecting (or reconnecting) a meter."""
+        if self.app.preview_only:
+            return
+        if self.setup_window is not None and self.setup_window.alive:
+            self.setup_window.show()
+            return
+        name = getattr(getattr(self.app, 'radio', None), 'name', None)
+        if name:
+            self.setup.computer = name
+        self.setup.restart()
+        self.setup_window = SetupWindow(self)
+        self._setup_open(True)
+        self.search(full=False)
+
+    def _setup_open(self, value):
+        radio = getattr(self.app, 'radio', None)
+        if radio is not None:
+            radio.setup_open = value  # the worker waits longer for OS pairing prompts meanwhile
+
+    def search(self, full=True):
+        """Look for meters now: ``full`` also forgets retry timers (the Search again button)."""
+        radio = getattr(self.app, 'radio', None)
+        if radio is None:
+            return
+        if full:
+            radio.rescan()
+        elif hasattr(radio, 'hurry'):
+            radio.hurry()
+
+    def rename(self, text=None):
+        """Ask for a new name (unless given) and send it to the connected meter."""
+        if not self.app.connected:
+            messagebox.showinfo('Meter not connected', 'Rename the meter while it is connected to this computer. '
+                                'Press its top button to wake it.', parent=self.root)
+            return False
+        if not self.setup.rename_capable:
+            messagebox.showinfo('Firmware update needed', 'This meter’s firmware cannot store a name yet. Hold its '
+                                'wheel for 3 seconds to check for a firmware update, then rename it.', parent=self.root)
+            return False
+        if text is None:
+            current = self.setup.connected['name'] if self.setup.connected else ''
+            text = simpledialog.askstring(
+                'Rename meter', 'Name for this meter: up to 16 letters or digits, or up to 5 Chinese '
+                'characters.\nLeave it empty to restore the default name.', initialvalue=current, parent=self.root)
+            if text is None:
+                return False
+        try:
+            self.app.rename_meter(text)
+        except ValueError as error:
+            messagebox.showerror('Cannot use this name', str(error), parent=self.root)
+            return False
+        except RuntimeError:
+            messagebox.showerror('Cannot rename', 'Bluetooth is not running right now. Try again in a minute.',
+                                 parent=self.root)
+            return False
+        self.setup.begin_rename()
+        self.connection.set('Renaming the meter…')
+        return True
 
     def refresh(self):
         self.app.provider.force.set()
@@ -349,11 +433,23 @@ class Desktop:
         device = getattr(app, 'device', None) or {}
         return '5 minutes' if device.get('interval') == 300 else '60 seconds'
 
+    def _setup_event(self, event):
+        setup = getattr(self, 'setup', None)
+        if setup is None:
+            return
+        setup.handle(event)
+        window = getattr(self, 'setup_window', None)
+        if window is not None and window.alive:
+            window.render()
+
     def event(self, event):
         kind = event['event']
+        self._setup_event(event)
         if kind == 'connected':
             self.bluetooth_problem = ''
-            self.connection.set('Bluetooth connected. Dashboard refreshes every ' + self._interval_text() + '.')
+            name = event.get('name')
+            self.connection.set(('Connected to ' + name if name else 'Bluetooth connected') +
+                                '. Dashboard refreshes every ' + self._interval_text() + '.')
             self.setup_heading.set('Sending your dashboard…')
             self.setup_help.set('Time and usage are synchronized automatically. Waiting for the meter to confirm its display.')
         elif kind == 'ack':
@@ -389,6 +485,16 @@ class Desktop:
             self.setup_heading.set('Confirm this computer')
             self.setup_help.set('On the meter, choose ' + name + '\n'
                                 'and press the wheel. Everything else is automatic.')
+        elif kind == 'registration_failed':
+            self.connection.set(plain(event.get('error'), 'The meter did not add this computer. Try again.'))
+        elif kind == 'renamed':
+            if event.get('ok'):
+                self.connection.set('Meter renamed to ' + (event.get('name') or 'its default name') + '.')
+            else:
+                self.connection.set(plain(event.get('error'), 'The meter could not be renamed. Try again.'))
+        elif kind == 'meter_newer':
+            self.update_status.set('Your meter has firmware ' + str(event.get('firmware')) + ', newer than this app ('
+                                   + str(event.get('companion')) + '). Checking for an app update…')
         elif kind == 'forgotten':
             self.connection.set('Meter forgotten. Sweetmeter will not connect to it anymore.')
             self.setup_heading.set('Connect a meter')
@@ -444,6 +550,8 @@ class Desktop:
             if show_signal.exists():
                 show_signal.unlink(missing_ok=True)
                 self.show()
+                if self._needs_setup():
+                    self.open_setup()
         except OSError:
             pass
         try:
@@ -463,6 +571,11 @@ class Desktop:
             self.root.after(100, self.poll)
 
     def run(self):
+        """Called once Bluetooth has started. Until a meter is paired the setup
+        window opens even when started in the background (at login or right
+        after an automatic app update), because nothing works before that."""
+        if self._needs_setup():
+            self.open_setup()
         self.poll()
         self.root.mainloop()
 
@@ -472,3 +585,144 @@ class Desktop:
                 return
         self.running = False
         self.root.destroy()
+
+
+def open_bluetooth_settings(platform=None):
+    """Open the system Bluetooth settings (to remove an old pairing)."""
+    import subprocess
+    platform = platform or sys.platform
+    try:
+        if platform == 'darwin':
+            subprocess.Popen(['open', 'x-apple.systempreferences:com.apple.BluetoothSettings'])
+        elif platform == 'win32':
+            import os
+            os.startfile('ms-settings:bluetooth')
+        else:
+            import shutil
+            for command in (['gnome-control-center', 'bluetooth'], ['blueman-manager'], ['systemsettings', 'kcm_bluetooth']):
+                if shutil.which(command[0]):
+                    subprocess.Popen(command)
+                    break
+    except OSError as error:
+        logging.warning('Cannot open Bluetooth settings (%s)', type(error).__name__)
+
+
+class SetupWindow:
+    """Renders ``SetupFlow.view()``: step list, instructions, nearby meters and naming."""
+    def __init__(self, desktop):
+        self.desktop = desktop
+        self.alive = True
+        self.last_step = None
+        window = self.window = tk.Toplevel(desktop.root)
+        window.title('Connect your meter')
+        window.geometry('700x520')
+        window.minsize(620, 480)
+        outer = ttk.Frame(window, padding=18)
+        outer.pack(fill='both', expand=True)
+        buttons = ttk.Frame(outer)
+        buttons.pack(side='bottom', fill='x', pady=(12, 0))
+        self.search_button = ttk.Button(buttons, text='Search again', command=desktop.search)
+        self.search_button.pack(side='left')
+        self.update_button = ttk.Button(buttons, text='Check for updates', command=desktop.check)
+        self.settings_button = ttk.Button(buttons, text='Open Bluetooth settings', command=open_bluetooth_settings)
+        self.close_button = ttk.Button(buttons, text='Close', command=self.close)
+        self.close_button.pack(side='right')
+        steps = ttk.Frame(outer, padding=(0, 0, 18, 0))
+        steps.pack(side='left', fill='y')
+        self.step_labels, self.step_titles = [], STEPS + ('Ready',)
+        for title in self.step_titles:
+            label = ttk.Label(steps, text='   ' + title)
+            label.pack(anchor='w', pady=4)
+            self.step_labels.append(label)
+        content = ttk.Frame(outer)
+        content.pack(side='left', fill='both', expand=True)
+        self.heading, self.body, self.alert = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        ttk.Label(content, textvariable=self.heading, font=('', 17, 'bold'), wraplength=470).pack(anchor='w')
+        ttk.Label(content, textvariable=self.body, wraplength=470, justify='left').pack(anchor='w', pady=(10, 0))
+        self.alert_label = ttk.Label(content, textvariable=self.alert, wraplength=470, justify='left',
+                                     foreground='#b3261e')
+        self.alert_label.pack(anchor='w', pady=(8, 0))
+        self.name_row = ttk.Frame(content)
+        self.name_value = tk.StringVar()
+        self.name_entry = ttk.Entry(self.name_row, textvariable=self.name_value, width=22)
+        self.name_entry.pack(side='left')
+        self.name_entry.bind('<Return>', lambda _event: self.save_name())
+        self.save_button = ttk.Button(self.name_row, text='Save name', command=self.save_name)
+        self.save_button.pack(side='left', padx=8)
+        self.skip_button = ttk.Button(self.name_row, text='Skip', command=self.skip_name)
+        self.skip_button.pack(side='left')
+        self.table_title = ttk.Label(content, text='Meters nearby', font=('', 11, 'bold'))
+        self.table_title.pack(anchor='w', pady=(16, 4))
+        self.table = ttk.Treeview(content, columns=('name', 'signal', 'status'), show='headings', height=4,
+                                  selectmode='none')
+        for column, title, width in (('name', 'Name', 170), ('signal', 'Signal', 120), ('status', 'Status', 190)):
+            self.table.heading(column, text=title)
+            self.table.column(column, width=width, anchor='w')
+        self.table.pack(fill='x')
+        window.protocol('WM_DELETE_WINDOW', self.close)
+        self.render()
+        self.window.after(1000, self._tick)
+        self.show()
+
+    def show(self):
+        self.window.deiconify()
+        self.window.lift()
+        self.window.focus_force()
+
+    def close(self):
+        self.alive = False
+        self.desktop._setup_open(False)
+        self.window.destroy()
+
+    def _tick(self):
+        """Re-render (time-based help) and keep scanning promptly while waiting for a meter."""
+        if not self.alive:
+            return
+        view = self.render()
+        waiting = view.step in (WAKE, OPEN)
+        if waiting:
+            self.desktop.search(full=False)
+        self.window.after(SETUP_SCAN_EVERY_MS if waiting else 1000, self._tick)
+
+    def save_name(self):
+        if self.desktop.rename(self.name_value.get()):
+            self.render()
+
+    def skip_name(self):
+        self.desktop.setup.skip_name()
+        self.render()
+
+    def render(self):
+        view = self.desktop.setup.view()
+        for index, label in enumerate(self.step_labels):
+            mark = '✓ ' if index < view.step else '▶ ' if index == view.step else '   '
+            label.configure(text=mark + self.step_titles[index],
+                            font=('', 12, 'bold') if index == view.step else ('', 12))
+        self.heading.set(view.heading)
+        self.body.set(view.body)
+        self.alert.set(view.alert)
+        if view.update_hint:
+            self.update_button.pack(side='left', padx=8)
+        else:
+            self.update_button.pack_forget()
+        if view.settings_hint:
+            self.settings_button.pack(side='left', padx=8)
+        else:
+            self.settings_button.pack_forget()
+        if view.naming:
+            if self.last_step != view.step:
+                self.name_value.set(view.name)
+            self.name_row.pack(anchor='w', pady=(12, 0), before=self.table_title)
+            editable = view.can_rename and not view.saving
+            self.save_button.configure(state='normal' if editable else 'disabled')
+            self.skip_button.configure(text='Skip' if view.can_rename else 'Continue',
+                                       state='disabled' if view.saving else 'normal')
+            self.name_entry.configure(state='normal' if editable else 'disabled')
+        else:
+            self.name_row.pack_forget()
+        self.close_button.configure(text='Done' if view.step == DONE else 'Close')
+        self.table.delete(*self.table.get_children())
+        for row in view.meters:
+            self.table.insert('', 'end', values=row)
+        self.last_step = view.step
+        return view

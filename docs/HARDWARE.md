@@ -148,6 +148,11 @@ installation or deliberate recovery after keeping your own backup. Routine
 confirmed BLE updates write the inactive application slot and preserve NVS.
 Do not use this layout on another display/revision or flash size.
 
+After flashing, the start screen shows `This meter: Sweetmeter-XXXX`, the
+name the meter advertises (the last four characters of its serial). The
+companion's **Connect your meter** window lists it by that name; it is not
+paired in the operating system's Bluetooth settings.
+
 Typical port families are `COM…` on Windows, `/dev/cu.…` on macOS and
 `/dev/ttyUSB…` on Linux. Serial is for initial flashing and diagnostics;
 dashboard data travels through BLE. Where required, install the USB serial

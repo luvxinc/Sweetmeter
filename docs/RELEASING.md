@@ -347,6 +347,16 @@ controlled failed-start rollback. Restore production firmware after fixture
 tests. Battery wiring/runtime and Windows/Linux physical pairing are separate
 acceptance items; software CI is not evidence those passed.
 
+**A unit that has run candidate or fixture firmware is not handed to anyone
+else until that exact version is published.** Firmware can require a newer
+companion than the published one (2026.9.18 accepts only companions that send
+pairing secrets, 2026.9.15 and later). A customer with the published companion
+then cannot pair and has no update to install: this happened when an
+acceptance unit running 2026.9.18 left while 2026.9.13 was the published
+release. Before a unit leaves, either publish the version it runs or restore
+the published firmware by USB (docs/HARDWARE.md) and confirm its start screen
+shows that version.
+
 Companion replacement waits for the old PID to exit, uses sibling incoming and
 backup directories on the installation filesystem, launches the new version,
 and requires a matching version/nonce/PID health receipt. Renames are retried

@@ -22,6 +22,7 @@ from meter.app import (Application, LogLimiter, ProviderWorker, display_snapshot
                        display_time, next_render, BLUETOOTH_RESTARTS)
 from meter.gui import (BLUETOOTH_HELP, Desktop, bluetooth_help, plain, provider_summary,
                        selection_text)
+from meter.setup_flow import SetupFlow
 from meter.providers import (NotSetUp, ProviderError, RateLimited, parse_claude, parse_codex,
                              refresh)
 from meter.render import compact, fit, font, percent, printable, render
@@ -429,6 +430,15 @@ class FakeRadio:
     def update_notice(self, code):
         pass
 
+    def rename(self, data):
+        self.renamed = getattr(self, 'renamed', []) + [data]
+
+    class store:
+        """This computer is registering with meter AA only."""
+        @staticmethod
+        def related(address):
+            return address == 'AA'
+
 
 class AppWiringTests(unittest.TestCase):
     def setUp(self):
@@ -463,6 +473,43 @@ class AppWiringTests(unittest.TestCase):
         saved = json.loads(path.read_text())
         self.assertEqual(saved['pairing'], 'kept')
         self.assertEqual(saved['status']['interval'], 300)
+
+    def test_meter_newer_than_this_app_checks_for_an_update_once(self):
+        self.app.version = '2026.9.19'
+        self.app.radio.events.put(self.status(True, firmware='2026.9.25'))
+        self.app.radio.events.put(self.status(True, firmware='2026.9.25'))
+        events = self.app.pump()
+        newer = [e for e in events if e['event'] == 'meter_newer']
+        self.assertEqual(newer, [{'event': 'meter_newer', 'firmware': '2026.9.25', 'companion': '2026.9.19'}])
+        self.app.updates.check.assert_called_once_with()
+
+    def test_only_the_paired_meter_or_one_being_paired_counts_as_newer(self):
+        self.app.version = '2026.9.19'
+        self.app.radio.events.put(self.status(False, firmware='2026.9.25'))  # a stranger's meter nearby
+        self.app.radio.events.put(self.status(True, firmware='2026.9.19'))   # same version
+        self.app.radio.events.put(self.status(True, firmware='garbage'))
+        self.assertFalse([e for e in self.app.pump() if e['event'] == 'meter_newer'])
+        self.app.updates.check.assert_not_called()
+        # An open computer list alone is not enough: anyone nearby can advertise one.
+        stranger = self.status(False, firmware='2026.9.26', menu=True)
+        stranger['device_id'] = 'BB'
+        self.app.radio.events.put(stranger)
+        self.assertFalse([e for e in self.app.pump() if e['event'] == 'meter_newer'])
+        # The meter this computer is registering with while its list is open counts.
+        self.app.radio.events.put(self.status(False, firmware='2026.9.25', menu=True))
+        self.assertTrue([e for e in self.app.pump() if e['event'] == 'meter_newer'])
+        self.app.updates.check.assert_called_once_with()
+
+    def test_rename_meter_encodes_the_name_or_explains(self):
+        self.app.rename_meter(' 书房 ')
+        self.assertEqual(self.app.radio.renamed, ['书房'.encode()])
+        self.app.rename_meter('')
+        self.assertEqual(self.app.radio.renamed[-1], b'')
+        with self.assertRaises(ValueError):
+            self.app.rename_meter('x' * 17)
+        self.app.radio = None
+        with self.assertRaises(RuntimeError):
+            self.app.rename_meter('Desk')
 
     def test_forget_clears_device(self):
         self.app.device = {'firmware': 'x'}
@@ -576,6 +623,47 @@ class GuiTextTests(unittest.TestCase):
         self.assertNotIn('JSONDecodeError', desktop.update_status.set.call_args.args[0])
         desktop.event({'event': 'status', 'trusted': False, 'status': {'protocol': 3}})
         desktop.update_status.set.assert_called_once()
+
+    def test_desktop_explains_naming_and_pairing_results_without_window(self):
+        desktop = Desktop.__new__(Desktop)
+        for name in ('connection', 'setup_heading', 'setup_help', 'provider_status', 'update_status'):
+            setattr(desktop, name, Mock())
+        desktop.progress_window = None
+        desktop.setup = SetupFlow('Mac')
+        desktop.setup_window = None
+        desktop.event({'event': 'connected', 'device_id': 'AA', 'name': 'Sweetmeter-CF24'})
+        self.assertIn('Connected to Sweetmeter-CF24', desktop.connection.set.call_args.args[0])
+        desktop.event({'event': 'renamed', 'ok': True, 'name': '书房'})
+        self.assertEqual(desktop.connection.set.call_args.args[0], 'Meter renamed to 书房.')
+        desktop.event({'event': 'renamed', 'ok': False, 'error': 'The meter could not save the name. Try again.'})
+        self.assertIn('could not save', desktop.connection.set.call_args.args[0])
+        desktop.event({'event': 'registration_failed', 'result': 5, 'error': 'The meter’s computer list is full.'})
+        self.assertIn('list is full', desktop.connection.set.call_args.args[0])
+        desktop.event({'event': 'meter_newer', 'firmware': '2026.9.25', 'companion': '2026.9.19'})
+        self.assertIn('2026.9.25', desktop.update_status.set.call_args.args[0])
+        self.assertEqual(desktop.setup.newer_firmware, ('2026.9.25', '2026.9.19'))  # the setup flow saw it too
+
+    def test_desktop_rename_checks_connection_capability_and_name(self):
+        desktop = Desktop.__new__(Desktop)
+        desktop.root, desktop.connection = Mock(), Mock()
+        desktop.setup = SetupFlow('Mac')
+        desktop.app = SimpleNamespace(connected=False, rename_meter=Mock())
+        with patch('meter.gui.messagebox') as box:
+            self.assertFalse(desktop.rename('Desk'))
+            self.assertIn('connected', box.showinfo.call_args.args[1])
+            desktop.app.connected = True
+            desktop.setup.handle({'event': 'connected', 'device_id': 'AA', 'name': 'Sweetmeter-CF24'})
+            self.assertFalse(desktop.rename('Desk'))  # firmware without the name command
+            self.assertIn('firmware update', box.showinfo.call_args.args[1])
+            desktop.setup.handle({'event': 'status', 'trusted': True, 'status': {'protocol': 4, 'rename': 1}})
+            desktop.app.rename_meter.side_effect = ValueError('The name is too long.')
+            self.assertFalse(desktop.rename('x' * 17))
+            self.assertEqual(box.showerror.call_args.args[1], 'The name is too long.')
+            desktop.app.rename_meter.side_effect = None
+            self.assertTrue(desktop.rename('Desk'))
+        desktop.app.rename_meter.assert_called_with('Desk')
+        self.assertTrue(desktop.setup.saving)
+        self.assertTrue(desktop.setup.view().saving)
 
     def test_poll_survives_a_bad_event(self):
         desktop = Desktop.__new__(Desktop)
@@ -951,3 +1039,31 @@ class MultiComputerTests(AppWiringTests):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SetupWindowOpeningTests(unittest.TestCase):
+    """The setup window opens until a meter proved a pairing secret, even in the background."""
+    def desktop(self, meters, *, background=True):
+        from meter.bluetooth import PairingStore
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        store = PairingStore(Path(folder.name))
+        store.meters = meters
+        desktop = Desktop.__new__(Desktop)
+        desktop.background = background
+        desktop.app = SimpleNamespace(radio=SimpleNamespace(store=store, name='Mac'), preview_only=False)
+        desktop.open_setup, desktop.poll, desktop.root = Mock(), Mock(), Mock()
+        return desktop
+
+    def test_after_an_automatic_update_without_a_secret_pairing(self):
+        legacy_only = {'address:AA': {'legacy': True, 'address': 'AA'}}
+        for meters in ({}, legacy_only, {'serial:x': {'paired': False, 'pending': {'AA': {'secret': '00'}}}}):
+            with self.subTest(meters=meters):
+                desktop = self.desktop(meters)
+                desktop.run()
+                desktop.open_setup.assert_called_once()
+
+    def test_not_once_a_meter_proved_its_secret(self):
+        desktop = self.desktop({'serial:x': {'paired': True, 'secret': 'ab' * 32, 'address': 'AA'}}, background=False)
+        desktop.run()
+        desktop.open_setup.assert_not_called()

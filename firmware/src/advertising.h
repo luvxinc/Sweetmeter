@@ -20,6 +20,10 @@ constexpr uint8_t markerAuth = 1, markerMenu = 2;
 constexpr char menuNameSuffix[] = "-PAIR";
 constexpr size_t advertisementSize = 3 + 18;  // flags AD + complete 128-bit UUID list AD
 static_assert(advertisementSize <= advertisingLimit, "Advertisement exceeds 31 bytes");
+// Longest scan response: name AD header (2) + a 16-byte owner-chosen name
+// (meter_name.h) + "-PAIR" (5) + marker AD (7) = 30 bytes.
+constexpr size_t longestScanResponse = 2 + 16 + sizeof(menuNameSuffix) - 1 + 7;
+static_assert(longestScanResponse <= advertisingLimit, "A 16-byte name with -PAIR exceeds the scan response");
 
 // Writes the raw scan response; returns its length, or 0 if it would exceed
 // 31 bytes (callers then fall back to the name alone).

@@ -197,10 +197,31 @@ permission across updates; ad-hoc builds may ask for it again after an update.
 
 Allow Bluetooth permission when requested. On Linux ensure BlueZ and its D-Bus
 service are running and the current desktop user has Bluetooth permission. Log
-into the official Claude Code and Codex clients, open Sweetmeter, then long-press
-the meter's bottom button for three seconds and select this computer with the rocker. The device only lists companions that register during
-that physical selection window. Pairing alone cannot read account data: the
-companion must be running.
+into the official Claude Code and Codex clients and open Sweetmeter. On a
+computer that has never paired, the **Connect your meter** window opens by
+itself (later: **Connect a meter…** in the main window). It lists the meters in
+range with their name, signal and state, and walks through each step: wake the
+meter, hold its bottom button for three seconds to open the computer list,
+select this computer with the rocker, then name the meter. You never pair it in
+the operating system's Bluetooth settings. On a Mac, the first connection shows
+**Connection Request from Sweetmeter-…**: click **Connect** (not Cancel, and do
+not tick "Ignore this device"). If Sweetmeter reports an old Bluetooth pairing,
+remove every device named Sweetmeter in System Settings > Bluetooth (ⓘ >
+Forget This Device…; on Windows Settings > Bluetooth & devices > Remove device)
+and connect again; **Open Bluetooth settings** in the setup window goes there. The device only lists companions
+that register during that physical selection window. Pairing alone cannot read
+account data: the companion must be running.
+
+Each meter advertises its own name: `Sweetmeter-XXXX` (the last four characters
+of its serial) until you name it, for example `Desk` or `书房` (up to 16 letters
+or digits, or up to 5 Chinese characters). **Rename meter…** in the main window
+changes it later; every computer paired with the meter sees the new name. The
+meter's start screen shows the name when its font can draw it. Firmware up to
+2026.9.18 advertised the same `Sweetmeter-05D4` on many boards and cannot store
+a name; update the firmware first.
+
+If the meter runs newer firmware than Sweetmeter on this computer, Sweetmeter
+says so and checks for an app update at once.
 
 First firmware installation still uses USB; see [HARDWARE.md](docs/HARDWARE.md).
 Existing `QM3.2` firmware requires this USB bootstrap for protocol 4 OTA. Normal

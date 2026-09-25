@@ -15,7 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from meter.bluetooth import (Bluetooth, Session, PairingStore, PairingRejected, companion_identity,
                              parse_status, pairing_proof, classify_error, value_budget, advertised_kind,
-                             meter_proof, CONTROL_UUID, DATA_UUID, DiscoveryOpened, JOB_EXPIRED)
+                             meter_proof, CONTROL_UUID, DATA_UUID, DiscoveryOpened, JOB_EXPIRED,
+                             RENAME_TIMEOUT)
 
 HOST = '7a1e1000-ff1b-4d9f-a023-0123456789ab'
 OTHER = '7a1e1000-ff1b-4d9f-a023-00000000000b'
@@ -93,6 +94,9 @@ class FakeMeter:
         self.menu_name = False
         self.challenge = '00' * 16
         self.writes = []
+        self.rename = False         # firmware with the meter name command (status "rename": 1)
+        self.rename_result = 0
+        self.label = b''
     def status(self):
         if self.legacy_status:
             return {'protocol': 4, 'firmware': '2026.9.13', 'selected_host': self.selected or '',
@@ -103,6 +107,8 @@ class FakeMeter:
                   'challenge': self.challenge, 'menu': bool(self.menu_nonce), 'discovery_nonce': self.menu_nonce}
         if self.mutual:
             status['mutual'] = 1
+        if self.rename:
+            status['rename'] = 1
         return status
     def client_factory(self, meters):
         meter_by_address = {m.address: m for m in meters}
@@ -185,6 +191,11 @@ class FakeMeter:
                     m.candidates[host] = bytes(self.body[37 + size:]) or None
                     self.callback(None, struct.pack('<cBII', b'J', 0, self.session, self.total))
                     self.is_connected = False
+                elif op == b'L':
+                    assert self.state == 'authorized' and len(data) == 2 + data[1]
+                    if m.rename_result == 0:
+                        m.label = data[2:]
+                    self.callback(None, b'L' + bytes([m.rename_result]))
                 elif op == b'T':
                     assert self.state == 'authorized'
                     m.clock_writes = getattr(m, 'clock_writes', 0) + 1
@@ -203,8 +214,9 @@ class FakeMeter:
 def advertisement(meter, hinted, *, marker=True, name=True):
     """What the firmware advertises: pairing firmware adds the capability marker."""
     data = {} if meter.legacy_status or not marker else {0xFFFF: b'SM' + bytes([1 | (2 if hinted else 0)])}
-    local = ('Sweetmeter-ABCD' + ('-PAIR' if hinted and not meter.legacy_status else '')) if name else None
-    return SimpleNamespace(local_name=local, manufacturer_data=data)
+    base = meter.label.decode() if meter.label else 'Sweetmeter-ABCD'
+    local = (base + ('-PAIR' if hinted and not meter.legacy_status else '')) if name else None
+    return SimpleNamespace(local_name=local, manufacturer_data=data, rssi=-58)
 
 
 def radio_for(folder, meters, *, hints=(), marker=True, name=True):
@@ -385,7 +397,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             pending = radio.store.pending('serial:' + SERIAL, 'meter')
             self.assertEqual(meter.candidates[HOST], pending)
             self.assertIsNone(radio.store.secret('serial:' + SERIAL))  # not confirmed yet
-            self.assertEqual(events_of(radio)[-1], {'event': 'registered', 'name': radio.name})
+            self.assertEqual(events_of(radio)[-1], {'event': 'registered', 'name': radio.name, 'device_id': 'meter'})
             meter.select(HOST)
             self.assertEqual(await self.visit(radio, meter), 0)
             events = events_of(radio)
@@ -586,7 +598,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             radio = radio_for(folder, [stranger])
             await radio._cycle()
             self.assertEqual(stranger.connections, 0)  # no connection, so no bond on either side
-            self.assertEqual([e['event'] for e in events_of(radio)], ['bluetooth_state', 'selection_required'])
+            self.assertEqual([e['event'] for e in events_of(radio)], ['bluetooth_state', 'nearby', 'selection_required'])
             radio.scanner_factory = radio_for(folder, [stranger], hints={'stranger'}).scanner_factory
             stranger.menu_nonce = 3
             await radio._cycle()
@@ -637,7 +649,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             radio.scanner_factory = radio_for(folder, []).scanner_factory
             await radio._cycle()
             self.assertEqual(radio.health, 'ok')
-            self.assertEqual(events_of(radio)[-1], {'event': 'bluetooth_state', 'state': 'ok'})
+            self.assertEqual(events_of(radio)[-2:], [{'event': 'bluetooth_state', 'state': 'ok'},
+                                                     {'event': 'nearby', 'meters': []}])
 
     async def test_worker_survives_cancellation_and_errors(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -759,7 +772,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             radio._sleep = sleep
             await radio._run()
             kinds = [e['event'] for e in events_of(radio)]
-            self.assertEqual(kinds, ['bluetooth_state', 'selection_required'])
+            self.assertEqual(kinds, ['bluetooth_state', 'nearby', 'selection_required'])
             self.assertEqual(meter.connections, 0)
             self.assertLessEqual(delays[-1], 5)
 
@@ -1217,6 +1230,18 @@ class JobLockTests(unittest.TestCase):
 
 
 class MutualStatusTests(unittest.TestCase):
+    def test_rename_flag_is_strict(self):
+        base = {'protocol': 4, 'firmware': '2026.9.19', 'auth': 1, 'serial': SERIAL, 'selected': False,
+                'secured': False, 'challenge': '00' * 16}
+        self.assertEqual(parse_status(json.dumps({**base, 'rename': 1}).encode())['rename'], 1)
+        self.assertNotIn('rename', parse_status(json.dumps(base).encode()))  # optional: dropped if it would not fit
+        for bad in (0, 2, True, '1'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_status(json.dumps({**base, 'rename': bad}).encode())
+        legacy = {'protocol': 4, 'firmware': '2026.9.13', 'selected_host': '', 'rename': 1}
+        with self.assertRaises(ValueError):
+            parse_status(json.dumps(legacy).encode())
+
     def test_mutual_flag_is_strict(self):
         good = {'protocol': 4, 'firmware': '2026.9.14', 'auth': 1, 'serial': SERIAL, 'selected': True,
                 'secured': True, 'challenge': 'ab' * 16, 'mutual': 1}
@@ -1237,3 +1262,329 @@ class MutualStatusTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SetupEventTests(unittest.IsolatedAsyncioTestCase):
+    """Events the setup window relies on: nearby meters, registration results, naming."""
+    async def visit(self, radio, meter, hinted=False):
+        return await radio._visit(SimpleNamespace(address=meter.address), hinted)
+
+    async def test_nearby_reports_every_meter_without_connecting(self):
+        with tempfile.TemporaryDirectory() as folder:
+            mine, other = FakeMeter('mine'), FakeMeter('other', serial='a1b2c3d4e5f7')
+            other.label = 'Desk'.encode()
+            radio = radio_for(folder, [mine, other], hints={'other'})
+            confirm(radio, mine)
+            radio._visit = lambda *_: asyncio.sleep(0, 0)  # only the scan is under test
+            await radio._cycle()
+            nearby = [e for e in events_of(radio) if e['event'] == 'nearby'][0]['meters']
+            by_address = {m['address']: m for m in nearby}
+            self.assertEqual(by_address['mine'], {'address': 'mine', 'name': 'Sweetmeter-ABCD', 'rssi': -58,
+                                                  'kind': 'closed', 'paired': True})
+            # The open-menu suffix is not part of the name.
+            self.assertEqual(by_address['other']['name'], 'Desk')
+            self.assertEqual(by_address['other']['kind'], 'menu')
+            self.assertFalse(by_address['other']['paired'])
+
+    async def test_registration_results_are_explained(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter])
+            meter.menu_nonce = 9
+            client = FakeClient()
+            client.result = 5
+            async def reject(_nonce, _secret=None):
+                from meter.bluetooth import RegistrationRejected
+                raise RegistrationRejected(5, 0)
+            with patch.object(Session, 'register', side_effect=reject):
+                delay = await self.visit(radio, meter, hinted=True)
+            failed = [e for e in events_of(radio) if e['event'] == 'registration_failed']
+            self.assertEqual(failed[0]['result'], 5)
+            self.assertIn('list is full', failed[0]['error'])
+            self.assertGreaterEqual(delay, 8)  # not hammered every few seconds
+            async def transient(_nonce, _secret=None):
+                from meter.bluetooth import RegistrationRejected
+                raise RegistrationRejected(4, 3)
+            radio.registered.clear()
+            with patch.object(Session, 'register', side_effect=transient):
+                await self.visit(radio, meter, hinted=True)
+            events = events_of(radio)
+            self.assertFalse([e for e in events if e['event'] == 'registration_failed'])
+            self.assertEqual([e['code'] for e in events if e['event'] == 'error'], ['device_error'])
+
+    async def test_connected_event_names_the_meter(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter(serial='d405927bcf24')
+            radio = radio_for(folder, [meter])
+            confirm(radio, meter)
+            meter.selected = HOST
+            await self.visit(radio, meter)
+            connected = [e for e in events_of(radio) if e['event'] == 'connected'][0]
+            self.assertEqual(connected['name'], 'Sweetmeter-CF24')  # default from the serial before any scan
+            radio.names[meter.address] = 'Kitchen'
+            await self.visit(radio, meter)
+            connected = [e for e in events_of(radio) if e['event'] == 'connected'][0]
+            self.assertEqual(connected['name'], 'Kitchen')
+
+    async def test_rename_is_sent_only_to_capable_firmware_and_reports_the_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter(serial='d405927bcf24')
+            radio = radio_for(folder, [meter])
+            confirm(radio, meter)
+            meter.selected = HOST
+            name = '客厅'.encode()
+            radio.rename(name)
+            await self.visit(radio, meter)  # earlier firmware: no "rename" in its status
+            renamed = [e for e in events_of(radio) if e['event'] == 'renamed']
+            self.assertFalse(renamed[0]['ok'])
+            self.assertIn('firmware update', renamed[0]['error'])
+            self.assertFalse([w for w in meter.writes if w[:1] == b'L'])  # never sent an unknown opcode
+            meter.rename = True
+            radio.rename(name)
+            await self.visit(radio, meter)
+            self.assertIn(b'L' + bytes([len(name)]) + name, meter.writes)
+            renamed = [e for e in events_of(radio) if e['event'] == 'renamed']
+            self.assertEqual(renamed, [{'event': 'renamed', 'device_id': meter.address, 'ok': True, 'name': '客厅'}])
+            self.assertEqual(radio.names[meter.address], '客厅')
+            # Restoring the default sends an empty name and reports the default.
+            radio.rename(b'')
+            await self.visit(radio, meter)
+            self.assertIn(b'L\x00', meter.writes)
+            renamed = [e for e in events_of(radio) if e['event'] == 'renamed']
+            self.assertEqual(renamed[0]['name'], 'Sweetmeter-CF24')
+            meter.rename_result = 5
+            radio.rename(b'Desk')
+            await self.visit(radio, meter)
+            renamed = [e for e in events_of(radio) if e['event'] == 'renamed']
+            self.assertFalse(renamed[0]['ok'])
+            self.assertIn('could not save', renamed[0]['error'])
+
+    async def test_rename_without_a_connected_meter_expires(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            radio.rename(b'Desk')
+            with patch('meter.bluetooth.time.monotonic', return_value=time.monotonic() + RENAME_TIMEOUT + 1):
+                await radio._cycle()
+            renamed = [e for e in events_of(radio) if e['event'] == 'renamed']
+            self.assertEqual(len(renamed), 1)
+            self.assertFalse(renamed[0]['ok'])
+            with self.assertRaises(ValueError):
+                radio.rename(b'x' * 17)
+            with self.assertRaises(ValueError):
+                radio.rename('Desk')  # text must be encoded by naming.encode_meter_name first
+
+    async def test_rename_packet_layout(self):
+        client = FakeClient()
+        session = Session(client, HOST, 'Mac', lambda _event: None)
+        await session.subscribe()
+        async def write(characteristic, data, response):
+            client.writes.append((characteristic, bytes(data)))
+            client.callback(None, b'L\x00')
+        client.write_gatt_char = write
+        self.assertEqual(await session.rename('书房'.encode()), 0)
+        self.assertEqual(client.writes[-1], (CONTROL_UUID, b'L\x06' + '书房'.encode()))
+        with self.assertRaises(ValueError):
+            await session.rename(b'x' * 17)
+
+
+class HurryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hurry_restarts_the_idle_backoff_but_keeps_registrations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            gaps = []
+            async def record(seconds):
+                gaps.append(seconds)
+            radio._sleep = record
+            for _ in range(3):
+                await radio._cycle()
+            radio.registered['meter'] = 7
+            radio._not_before['meter'] = time.monotonic() + 60
+            radio.hurry()
+            gaps.clear()
+            await radio._cycle()
+            self.assertLess([g for g in gaps if g != 3][0], 6)  # back to the first idle gap
+            self.assertEqual(radio.registered, {'meter': 7})  # an open menu is not registered twice
+            self.assertIn('meter', radio._not_before)
+
+
+class PairingPromptAndStaleKeyTests(unittest.IsolatedAsyncioTestCase):
+    def test_stale_os_pairing_is_recognized(self):
+        from meter.bluetooth import classify_error
+        mac = Exception('failed to connect: Error Domain=CBErrorDomain Code=14 "Peer removed pairing information" '
+                        'UserInfo={NSLocalizedDescription=Peer removed pairing information}')
+        self.assertEqual(classify_error(mac), 'stale_pairing')
+        # BlueZ uses AuthenticationFailed for a cancelled first pairing too: not called stale.
+        self.assertEqual(classify_error(Exception('org.bluez.Error.AuthenticationFailed')), 'connection_failed')
+        self.assertEqual(classify_error(Exception('disconnect failed: Error Domain=CBErrorDomain Code=7 '
+                                                  '"The specified device has disconnected from us."')),
+                         'connection_failed')
+
+    def test_stale_pairing_message_names_the_os_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            for platform, words in (('darwin', 'Forget This Device'), ('win32', 'Remove device'),
+                                    ('linux', 'bluetoothctl remove')):
+                radio._last_error = (None, 0.0)
+                with patch('meter.bluetooth.sys.platform', platform):
+                    radio._error('stale_pairing', Exception('Peer removed pairing information'))
+                event = events_of(radio)[-1]
+                self.assertEqual(event['code'], 'stale_pairing')
+                self.assertIn(words, event['error'])
+
+    async def test_a_slow_first_read_reports_the_os_pairing_prompt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            class Slow:
+                async def read_gatt_char(self, _uuid):
+                    await asyncio.sleep(.3)
+                    return b'{}'
+            with patch('meter.bluetooth.PAIRING_PROMPT_AFTER', .05):
+                self.assertEqual(await radio._first_status(Slow()), b'{}')
+            self.assertEqual([e['event'] for e in events_of(radio)], ['os_pairing_prompt', 'os_pairing_done'])
+            class Fast:
+                async def read_gatt_char(self, _uuid):
+                    return b'{}'
+            self.assertEqual(await radio._first_status(Fast()), b'{}')
+            self.assertEqual(events_of(radio), [])  # an existing pairing: no prompt, nothing to say
+            class Refused:
+                async def read_gatt_char(self, _uuid):
+                    await asyncio.sleep(.2)
+                    raise OSError('Encryption is insufficient')
+            with patch('meter.bluetooth.PAIRING_PROMPT_AFTER', .05), self.assertRaises(OSError):
+                await radio._first_status(Refused())
+            self.assertEqual([e['event'] for e in events_of(radio)], ['os_pairing_prompt', 'os_pairing_done'])
+
+    async def test_the_first_read_outlasts_the_backends_own_read_timeout(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            class PairsLate:
+                """bleak's macOS read times out (20 s there) before the user clicks Connect."""
+                is_connected = True
+                reads = 0
+                async def read_gatt_char(self, _uuid):
+                    self.reads += 1
+                    await asyncio.sleep(.1)
+                    if self.reads < 3:
+                        raise asyncio.TimeoutError()
+                    return b'{}'
+            client = PairsLate()
+            with patch('meter.bluetooth.PAIRING_PROMPT_AFTER', .05):
+                self.assertEqual(await radio._first_status(client), b'{}')
+            self.assertEqual(client.reads, 3)
+            self.assertEqual([e['event'] for e in events_of(radio)], ['os_pairing_prompt', 'os_pairing_done'])
+            class Gone(PairsLate):
+                is_connected = False  # the meter dropped the link: do not read again
+            with patch('meter.bluetooth.PAIRING_PROMPT_AFTER', .05), self.assertRaises(asyncio.TimeoutError):
+                await radio._first_status(Gone())
+            with patch('meter.bluetooth.PAIRING_PROMPT_AFTER', .05), patch('meter.bluetooth.FIRST_STATUS_TIMEOUT', .3), \
+                    self.assertRaises(asyncio.TimeoutError):
+                class Never(PairsLate):
+                    async def read_gatt_char(self, _uuid):
+                        await asyncio.sleep(10)
+                await radio._first_status(Never())
+
+
+class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def visit(self, radio, meter, hinted=False):
+        return await radio._visit(SimpleNamespace(address=meter.address), hinted)
+
+    async def test_search_again_never_registers_twice_in_one_menu_opening(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter])
+            meter.menu_nonce = 41
+            await self.visit(radio, meter, hinted=True)
+            first = meter.candidates[HOST]
+            radio.rescan()  # the Search again button
+            await radio._cycle()
+            self.assertEqual(meter.candidates[HOST], first)  # a second secret would be a CONFLICT row
+            self.assertEqual(sum(1 for w in meter.writes if w[:1] == b'K'), 1)
+
+    async def test_a_rename_that_fails_in_flight_is_reported(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter(serial='d405927bcf24')
+            meter.rename = True
+            radio = radio_for(folder, [meter])
+            confirm(radio, meter)
+            meter.selected = HOST
+            radio.rename(b'Desk')
+            async def lost(_name):
+                raise DiscoveryOpened()
+            with patch.object(Session, 'rename', side_effect=lost):
+                await self.visit(radio, meter)
+            renamed = [e for e in events_of(radio) if e['event'] == 'renamed']
+            self.assertEqual(len(renamed), 1)
+            self.assertFalse(renamed[0]['ok'])
+            self.assertIn('did not confirm', renamed[0]['error'])
+
+    async def test_nearby_calls_only_a_confirmed_pairing_paired(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            radio = radio_for(folder, [meter])
+            radio.store.new_pending('serial:' + SERIAL, meter.address)  # registered, not chosen yet
+            radio._visit = lambda *_: asyncio.sleep(0, 0)
+            await radio._cycle()
+            nearby = [e for e in events_of(radio) if e['event'] == 'nearby'][0]['meters']
+            self.assertFalse(nearby[0]['paired'])
+            confirm(radio, meter)
+            await radio._cycle()
+            nearby = [e for e in events_of(radio) if e['event'] == 'nearby'][0]['meters']
+            self.assertTrue(nearby[0]['paired'])
+
+    async def test_an_unanswered_prompt_on_a_strangers_open_menu_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            stranger = FakeMeter('stranger')
+            stranger.menu_nonce = 5
+            radio = radio_for(folder, [stranger], hints={'stranger'})
+            confirm(radio, FakeMeter('mine', serial='a1b2c3d4e5f7'))  # this computer already has its meter
+            async def unanswered(self, client, *, patient=True):
+                assert patient is False  # not pairing with this one: normal read timeout
+                raise asyncio.TimeoutError()
+            with patch.object(Bluetooth, '_first_status', unanswered):
+                await radio._cycle()
+                connections = stranger.connections
+                await radio._cycle()  # its menu is still open, but it is held
+            self.assertEqual(stranger.connections, connections)
+
+    async def test_a_refused_registration_is_not_retried_at_once_in_an_open_menu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meter = FakeMeter()
+            meter.menu_nonce = 6
+            radio = radio_for(folder, [meter], hints={'meter'})
+            async def full(_nonce, _secret=None):
+                from meter.bluetooth import RegistrationRejected
+                raise RegistrationRejected(5, 0)
+            with patch.object(Session, 'register', side_effect=full):
+                await radio._cycle()
+                await radio._cycle()
+            self.assertEqual(len([e for e in events_of(radio) if e['event'] == 'registration_failed']), 1)
+
+    def test_hurry_does_not_cut_a_scan_short(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            radio._scanning = True
+            radio.hurry()
+            self.assertFalse(radio._wake.is_set())
+            self.assertTrue(radio._hurry_requested)
+            radio._scanning = False
+            radio.hurry()
+            self.assertTrue(radio._wake.is_set())
+
+    async def test_first_read_waits_long_only_while_pairing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            radio = radio_for(folder, [])
+            waits = []
+            real_wait_for = asyncio.wait_for
+            async def record(awaitable, timeout):
+                waits.append(timeout)
+                return await real_wait_for(awaitable, timeout)
+            class Quick:
+                is_connected = True
+                async def read_gatt_char(self, _uuid):
+                    await asyncio.sleep(.1)
+                    return b'{}'
+            with patch('meter.bluetooth.PAIRING_PROMPT_AFTER', .01), patch('meter.bluetooth.asyncio.wait_for', record):
+                await radio._first_status(Quick(), patient=False)
+                await radio._first_status(Quick(), patient=True)
+            self.assertLessEqual(waits[0], 10)
+            self.assertGreater(waits[1], 30)

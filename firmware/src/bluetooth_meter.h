@@ -25,6 +25,8 @@
 #include "display_policy.h"
 #include "advertising.h"
 #include "status_json.h"
+#include "meter_name.h"
+#include "link_deadline.h"
 
 const char *SERVICE_UUID="7a1e0001-ff1b-4d9f-a023-47c7752c1a01";
 const char *CONTROL_UUID="7a1e0002-ff1b-4d9f-a023-47c7752c1a01";
@@ -64,6 +66,8 @@ volatile bool connected=false;
 volatile int signalRssi=127;
 volatile uint32_t signalReadAt=0;
 volatile uint32_t linkGeneration=0,connectionAt=0,firstProbeAt=0;
+// When this link finished encryption (pairing or a bonded reconnect); 0 until then (link_deadline.h).
+volatile uint32_t encryptedAt=0;
 volatile esp_gatt_if_t gattInterface=ESP_GATT_IF_NONE;
 volatile bool bleServiceStarted=false;
 volatile uint32_t droppedRejects=0;
@@ -193,6 +197,7 @@ void rejectPacket(uint8_t kind,const uint8_t *p,size_t n,bool busy) {
   if(kind==DashboardControl && n && (p[0]=='H'||p[0]=='P'||p[0]=='Y'||p[0]=='N')) {
     uint8_t answer[2]={uint8_t(p[0]=='Y'?'Y':'H'),uint8_t(busy?helloBusy:helloRejected)}; notifyControl(answer,2); return;
   }
+  if(kind==DashboardControl && n && p[0]=='L') { uint8_t answer[2]={'L',busy?renameBusy:renameInvalid}; notifyControl(answer,2); return; }
   if(kind==DashboardControl && n && p[0]=='B') frameBeginReply(2,n>=5?read32(p+1):0,n>=9?read32(p+5):0);
   else if(kind==DashboardControl && n>=5 && p[0]=='C') bleReply(3,read32(p+1),0);
   else if(kind==DashboardData) bleReply(busy?2:4,0,0);
@@ -267,7 +272,8 @@ class ServerCallbacks : public BLEServerCallbacks {
     linkBonds.connected(linkGeneration+1,bonds);
     portEXIT_CRITICAL(&snapshotMux);
     signalRssi=127; signalReadAt=0;
-    connected=true; connectionAt=millis(); firstProbeAt=0; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
+    // The worker may test the deadlines at any moment: reset them before it can see the new link.
+    connectionAt=millis(); firstProbeAt=0; encryptedAt=0; connected=true; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
     server->updateConnParams(parameters->connect.remote_bda,12,24,0,600);
     wakeWorker();
   }
@@ -281,7 +287,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     for(size_t i=0;i<count && bondRemovalCount<sweetmeter::bondListCapacity;++i) memcpy(bondRemovals[bondRemovalCount++],added[i],6);
     portEXIT_CRITICAL(&snapshotMux);
     signalRssi=127; signalReadAt=0;
-    connected=false; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
+    connected=false; encryptedAt=0; __atomic_add_fetch(&linkGeneration,1,__ATOMIC_RELEASE);
     wakeWorker();
   }
 };
@@ -501,6 +507,9 @@ void drawScreen(bool answersPress) {
       textAt(4,37,"Open Sweetmeter on your computer.");
       textAt(4,55,"Hold bottom 3s to select it.");
       textAt(4,77,"github.com/luvxinc/Sweetmeter");
+      // The font draws printable ASCII only; other owner-chosen names show the default here.
+      char fallback[24]; sweetmeter::defaultMeterName(deviceSerial,fallback,sizeof(fallback));
+      textAt(4,95,String("This meter: ")+(sweetmeter::screenPrintable(advertisedName)?advertisedName:fallback));
     }
     box(0,0,250,13,true); textAt(3,1,"v " SWEETMETER_VERSION,false);
     textAt(90,1,"BT",false);
@@ -549,6 +558,43 @@ void setScanResponse(bool menu) {
   if(length) response.addData(std::string(reinterpret_cast<const char*>(raw),length));
   else response.setName(advertisedName);
   BLEDevice::getAdvertising()->setScanResponseData(response);
+}
+// Meter name (docs/PROTOCOL.md 2.2): the owner's choice from NVS "label"
+// (key "name" mirrors the selected computer), else Sweetmeter-XXXX.
+void loadMeterName() {
+  sweetmeter::defaultMeterName(deviceSerial,advertisedName,sizeof(advertisedName));
+  if(!nvsReady || !preferences.isKey("label")) return;
+  uint8_t stored[sweetmeter::meterNameMax]; size_t length=preferences.getBytesLength("label");
+  if(length && length<=sizeof(stored) && preferences.getBytes("label",stored,sizeof(stored))==length &&
+     sweetmeter::validMeterName(stored,length)) { memcpy(advertisedName,stored,length); advertisedName[length]=0; }
+  else Serial.println("ERR NAME_INVALID using default");
+}
+// L from the authorized computer: store and verify first, then advertise the name.
+void renameMeter(const uint8_t *p,size_t n) {
+  using namespace sweetmeter;
+  const uint8_t *name=nullptr; size_t length=0; uint8_t result=parseRename(p,n,name,length);
+  if(result==renameOk && ota.active()) result=renameBusy;
+  if(result==renameOk) {
+    // A failed write must not take effect at the next boot either: put back what was stored.
+    uint8_t check[meterNameMax],previous[meterNameMax]; size_t previousLength=0;
+    bool hadLabel=nvsReady && preferences.isKey("label");
+    if(hadLabel) previousLength=preferences.getBytes("label",previous,sizeof(previous));
+    bool stored=nvsReady && (length?preferences.putBytes("label",name,length)==length &&
+      preferences.getBytes("label",check,sizeof(check))==length && !memcmp(check,name,length):
+      !hadLabel || preferences.remove("label"));
+    if(!stored && length && nvsReady) {
+      if(hadLabel && previousLength) preferences.putBytes("label",previous,previousLength);
+      else if(!hadLabel && preferences.isKey("label")) preferences.remove("label");
+    }
+    if(!stored) result=renameStorage;
+    else {
+      if(length) { memcpy(advertisedName,name,length); advertisedName[length]=0; }
+      else defaultMeterName(deviceSerial,advertisedName,sizeof(advertisedName));
+      esp_ble_gap_set_device_name(advertisedName); setScanResponse(discovery.open); uiDirty=true;
+      Serial.printf("UI RENAME length=%u\n",unsigned(length));
+    }
+  }
+  uint8_t reply[2]={'L',result}; notifyControl(reply,sizeof(reply));
 }
 void setAdvertisedMenu(bool menu) {
   setScanResponse(menu);
@@ -660,6 +706,7 @@ void processControl(const uint8_t *p,size_t n) {
   }
   if(!isAuthorized() || discovery.open) {
     if(p[0]=='B') frameBeginReply(7,n>=5?read32(p+1):0,n>=9?read32(p+5):0);
+    else if(p[0]=='L') { uint8_t reply[2]={'L',renameRefused}; notifyControl(reply,sizeof(reply)); }
     return;
   }
   if(p[0]=='T') {
@@ -687,7 +734,8 @@ void processControl(const uint8_t *p,size_t n) {
     if(n!=5 || !receiving || pendingFrame || received!=FRAME_SIZE || seq!=incomingSequence || crc32(incomingFrame,FRAME_SIZE)!=incomingCRC) {
       receiving=false; bleReply(3,seq,incomingCRC);
     } else { receiving=false; pendingFrame=true; }
-  } else bleReply(3,0,0);
+  } else if(p[0]=='L') renameMeter(p,n);
+  else bleReply(3,0,0);
 }
 void processFrameData(const uint8_t *p,size_t n) {
   if(!isAuthorized() || ota.active() || discovery.open) return;
@@ -723,9 +771,13 @@ void setupBluetooth() {
   if(!allocated && bootHealth.pending) bootHealth.fail();
   if(!allocated) { Serial.println("ERR REQUIRED_ALLOCATION"); while(true) delay(1000); }
   memset(dashboard,0xff,FRAME_SIZE);
-  snprintf(advertisedName,sizeof(advertisedName),"Sweetmeter-%04X",unsigned(mac&0xffff));
+  loadMeterName();
   BLEDevice::init(advertisedName); bleStarted=true;
   BLEDevice::setCustomGapHandler([](esp_gap_ble_cb_event_t event,esp_ble_gap_cb_param_t *parameters) {
+    // One link at a time: its encryption completed (after pairing the peer may
+    // report its identity address, not the private one it connected with).
+    // Only the first encryption of a link counts: pairing again cannot extend its deadline.
+    if(event==ESP_GAP_BLE_AUTH_CMPL_EVT && connected && !encryptedAt && parameters->ble_security.auth_cmpl.success) { encryptedAt=millis()|1; wakeWorker(); }
     if(event==ESP_GAP_BLE_READ_RSSI_COMPLETE_EVT && connected) {
       esp_bd_addr_t peer; copyPeer(peer);
       if(!memcmp(parameters->read_rssi_cmpl.remote_addr,peer,sizeof(peer))) {
@@ -844,16 +896,17 @@ void bluetoothLoop() {
   bool wasMenu=discovery.open; discovery.tick(now);
   if(wasMenu && !discovery.open) closeDiscovery();
   if(discovery.open && connected &&
-     ((discoveryReleaseAt && expired(now,discoveryReleaseAt,2000)) || expired(now,connectionAt,15000) ||
-       (firstProbeAt && expired(now,firstProbeAt,8000)))) {
+     ((discoveryReleaseAt && expired(now,discoveryReleaseAt,2000)) || sweetmeter::linkDeadlinePassed(now,connectionAt,encryptedAt,15000) ||
+       (firstProbeAt && sweetmeter::elapsedAtLeast(now,firstProbeAt,8000)))) {
     discoveryReleaseAt=0; meterServer->disconnect(meterServer->getConnId());
   }
   // The old connection alone receives the 2 second D-event release deadline.
   if(!connected) discoveryReleaseAt=0;
-  // Outside the menu a link must authorize within 10 s, so a stray phone or a
-  // stale OS auto-connection cannot hold the single link.
+  // Outside the menu a link must authorize within 10 s of being encrypted (30 s
+  // while not encrypted: a first pairing waits for the computer's user), so a
+  // stray phone or a stale OS auto-connection cannot hold the single link.
   if(connected && !isAuthorized() && !discovery.open && !ota.active() && droppedGeneration!=seenGeneration &&
-     expired(now,connectionAt,10000)) {
+     sweetmeter::linkDeadlinePassed(now,connectionAt,encryptedAt,10000)) {
     droppedGeneration=seenGeneration; Serial.println("BLE DROP unauthorized");
     meterServer->disconnect(meterServer->getConnId());
   }
