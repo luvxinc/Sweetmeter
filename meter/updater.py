@@ -3,8 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import os
-import platform
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -16,20 +16,42 @@ import requests
 from .protocol import (BOARD_ID, MAX_MANIFEST_SIZE, select_artifact, validate_asset_url,
                        validate_download_url, verify_manifest, verify_artifact,
                        verify_envelope, match_firmware_artifact, firmware_image_version)
+from .paths import compatible_platforms, platform_id as host_platform
 from .version import Version, get_version
 
 RELEASE_API = 'https://api.github.com/repos/luvxinc/Sweetmeter/releases/latest'
 INTERVAL = 6 * 3600
+# A rocker hold, or several, never causes more than one GitHub check per minute.
+DEVICE_CHECK_MAX_AGE = 60
+# Results shown on the meter after its rocker is held (protocol `u` codes).
+NOTICE_CURRENT, NOTICE_INSTALLING, NOTICE_FAILED, NOTICE_COMPANION = 2, 3, 4, 5
+# Failed targets remembered (most recent last) so none is offered again
+# automatically; a manual check still offers them.
+FAILED_KEEP = 8
 
-def save_json(path, value):
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    temp.replace(path)
+def save_json(path, value, *, durable=False):
+    """Atomic JSON replace; `durable` also survives power loss (update decisions)."""
+    path = Path(path)
+    descriptor, name = tempfile.mkstemp(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+            output.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+            if durable:
+                output.flush()
+                os.fsync(output.fileno())
+        os.replace(name, path)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
+    if durable and os.name != 'nt':
+        folder = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
 
 def platform_id():
-    system = {'Darwin': 'macos', 'Windows': 'windows', 'Linux': 'linux'}.get(platform.system())
-    arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x86_64', 'AMD64': 'x86_64'}.get(platform.machine())
-    return system, arch
+    return host_platform()
 
 class RateLimited(RuntimeError):
     def __init__(self, retry_at):
@@ -173,38 +195,131 @@ class UpdateService:
         self.awaiting_until = None
         self._reconciled = False
         self.prompted = set()
+        self.checked_monotonic = None
+        self.download_dir = None
+        # A firmware install started by holding the meter's rocker: its
+        # outcome is also shown on the meter (protocol `u` codes).
+        self.device_initiated = False
+        self.installing = None  # Kind of the install this process started last.
 
     def start(self):
+        self.report_companion_result()
         self.thread = threading.Thread(target=self._run, name='sweetmeter-updates', daemon=True)
         self.thread.start()
         self.requests.put('automatic')
 
+    def report_companion_result(self):
+        """Show the outcome the update helper recorded (success or rollback reason)."""
+        path = self.state_dir / 'companion-update-result.json'
+        try:
+            if path.stat().st_size > 16384:
+                raise ValueError('Oversized update result')
+            result = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            result = {}
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if not isinstance(result, dict):
+            return
+        version = str(result.get('version', ''))[:20]
+        if result.get('status') == 'install_interrupted':
+            # An installer or repair was interrupted and undone at login: not
+            # an update the user started here, so nothing is marked failed.
+            self.emit({'event': 'update_notice',
+                       'message': 'An interrupted Sweetmeter installation was undone and the previously '
+                                  'installed version was kept. Run the installer again to finish it.'})
+        elif result.get('status') == 'rollback':
+            with self.lock:
+                pending = self.state.get('pending')
+                started = bool(pending and pending.get('kind') == 'companion')
+                if started:
+                    self._remember_failed({**pending, 'outcome': 'rollback'})
+                    self.state.pop('pending', None)
+                    self._save()
+            reason = str(result.get('reason') or 'The updated app did not start correctly.')[:600]
+            if started:
+                self.emit({'event': 'update_error',
+                           'error': 'Companion update ' + version + ' was not kept; this version was restored. ' + reason})
+            else:
+                self.emit({'event': 'update_notice',
+                           'message': 'An interrupted Sweetmeter update was undone; this version was kept.'})
+
+    def failed_targets(self):
+        """Remembered failed installs (dicts with kind and target), oldest first.
+        Older versions stored a single record; it is read as a one-item list."""
+        value = self.state.get('failed')
+        if isinstance(value, dict):
+            value = [value]
+        return [record for record in value if isinstance(record, dict)] if isinstance(value, list) else []
+
+    def _remember_failed(self, record):
+        """Add a failed install (caller holds the lock); keeps FAILED_KEEP."""
+        key = record.get('kind'), record.get('target')
+        kept = [old for old in self.failed_targets() if (old.get('kind'), old.get('target')) != key]
+        self.state['failed'] = (kept + [record])[-FAILED_KEEP:]
+
     def check(self):
         self.requests.put('check')
 
+    def device_request(self):
+        """The meter's rocker was held: check now and install newer firmware."""
+        self.requests.put('device')
+
     def _save(self):
-        save_json(self.path, self.state)
+        save_json(self.path, self.state, durable=True)
+
+    def cleanup(self):
+        """Remove finished download/staging folders; keep what an operation still needs."""
+        with self.lock:
+            if self.busy or self.state.get('pending'):
+                return
+            keep = self.state.get('manual_staging')
+        downloads = self.state_dir / 'downloads'
+        if downloads.is_dir():
+            for folder in downloads.glob('update-*'):
+                if folder.is_dir() and not folder.is_symlink():
+                    shutil.rmtree(folder, ignore_errors=True)
+        try:
+            from .self_update import cleanup_staging
+            cleanup_staging(self.state_dir, keep=[keep] if isinstance(keep, str) else [])
+        except (OSError, RuntimeError):
+            pass
 
     def _run(self):
+        self.cleanup()
         next_check = time.monotonic() + INTERVAL
         while not self.stop.is_set():
             try:
-                manual = self.requests.get(timeout=1) == 'check'
+                request = self.requests.get(timeout=1)
             except queue.Empty:
-                manual = False
+                request = 'automatic'
                 if time.monotonic() < next_check:
                     self.tick()
                     continue
-            self.check_now(manual=manual)
+            if request == 'device':
+                self.device_update()
+            else:
+                self.check_now(manual=request == 'check')
+                if request == 'automatic':
+                    self.cleanup()
             next_check = time.monotonic() + INTERVAL
 
-    def check_now(self, *, manual=False):
+    def check_now(self, *, manual=False, quiet=(), max_age=None):
+        """Check GitHub; with `max_age`, reuse a manifest verified that recently."""
         with self.lock:
             if self.busy:
-                return
+                return False
+            if (max_age is not None and self.manifest is not None and self.checked_monotonic is not None
+                    and time.monotonic() - self.checked_monotonic < max_age):
+                self._offers(manual, quiet=quiet)
+                return True
             if time.time() < self.state.get('retry_at', 0):
                 self.emit({'event': 'update_notice', 'message': 'Update checks are waiting for the server retry time.'})
-                return
+                return False
         try:
             headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'Sweetmeter/' + self.version,
                        'X-GitHub-Api-Version': '2022-11-28'}
@@ -229,17 +344,20 @@ class UpdateService:
             manifest = verify_manifest(manifest_raw, signature, trusted_keys=self.trusted_keys)
             with self.lock:
                 self.manifest = manifest
+                self.checked_monotonic = time.monotonic()
                 self.state.update(manifest=base64.b64encode(manifest_raw).decode(),
                                   signature=base64.b64encode(signature).decode(),
                                   etag=response_headers.get('ETag', self.state.get('etag', '')),
                                   checked_at=time.time(), retry_at=0)
                 self._save()
-                self._offers(manual)
+                self._offers(manual, quiet=quiet)
             self.emit({'event': 'update_checked', 'version': manifest['version']})
+            return True
         except NoPublishedRelease:
             with self.lock:
                 self.manifest, self.offers = None, {}
             self.emit({'event': 'update_notice', 'message': 'No published updates yet.'})
+            return True
         except RateLimited as error:
             with self.lock:
                 self.state['retry_at'] = error.retry_at
@@ -253,13 +371,62 @@ class UpdateService:
         except Exception as error:
             # Response bodies never become executable HTML or diagnostic dumps.
             self.emit({'event': 'update_error', 'error': 'Update check failed: ' + type(error).__name__})
+        return False
 
-    def _offers(self, manual=False):
+    def device_update(self):
+        """Holding the rocker is the physical confirmation for a firmware install."""
+        if self.busy:
+            self._notify_device(NOTICE_INSTALLING)
+            return
+        self.emit({'event': 'update_notice', 'message': 'Firmware check requested on the meter…'})
+        # The rocker confirms firmware only. A companion offer the user skipped
+        # or postponed stays quiet (manual=False respects those choices).
+        if not self.check_now(manual=False, quiet=('firmware',), max_age=DEVICE_CHECK_MAX_AGE):
+            self._notify_device(NOTICE_FAILED)
+            return
+        with self.lock:
+            offer = self.offers.get('firmware')
+        if offer is None:
+            self._notify_device(NOTICE_CURRENT)
+            self.emit({'event': 'update_notice', 'message': 'Meter firmware is up to date.'})
+            return
+        if offer.blocked:
+            self._notify_device(NOTICE_COMPANION)
+            self.emit({'event': 'update_error', 'error': offer.blocked})
+            return
+        self._notify_device(NOTICE_INSTALLING)
+        try:
+            # The meter's own OTA screen asks to keep USB power connected.
+            self.install(offer, usb_power=True, device_initiated=True)
+        except (ValueError, RuntimeError) as error:
+            self._notify_device(NOTICE_FAILED)
+            self.emit({'event': 'update_error', 'error': str(error)})
+
+    def _notify_device(self, code):
+        try:
+            self.radio.update_notice(code)
+        except (AttributeError, ValueError):
+            pass
+
+    def _firmware_failed(self):
+        """A firmware install ended without a verified result (caller holds
+        the lock): a rocker-hold install shows the failure on the meter."""
+        self.busy, self.awaiting_until = False, None
+        if self.device_initiated:
+            self.device_initiated = False
+            self._notify_device(NOTICE_FAILED)
+
+    def _offers(self, manual=False, quiet=()):
         if self.manifest is None or self.busy:
             return
         manifest, offers = self.manifest, {}
         os_name, arch = platform_id()
-        package = select_artifact(manifest, 'companion', os=os_name, arch=arch)
+        package = None
+        # Most preferred runnable package first (Windows on Arm falls back to x64).
+        for os_choice, arch_choice in compatible_platforms(os_name, arch):
+            package = select_artifact(manifest, 'companion', os=os_choice, arch=arch_choice)
+            if package:
+                break
         if package and Version.parse(package['version']) > Version.parse(self.version):
             offers['companion'] = self._offer(package, self.version)
         firmware = select_artifact(manifest, 'firmware', board=self.device.get('board'))
@@ -276,9 +443,17 @@ class UpdateService:
         self.offers = offers
         for kind, offer in offers.items():
             key = kind, offer.target
+            if kind in quiet:
+                # Handled by the caller; later status reads must not re-prompt.
+                self.prompted.add(key)
+                continue
             choice = self.state.get('choices', {}).get(kind, {})
             if not manual and (choice.get('skip') == offer.target or time.time() < choice.get('later', 0)):
                 continue
+            if (not manual and kind == 'companion'
+                    and any(failed.get('kind') == 'companion' and failed.get('target') == offer.target
+                            for failed in self.failed_targets())):
+                continue  # Rolled back on this computer; only a manual check offers it again.
             if not manual and key in self.prompted:
                 continue
             self.prompted.add(key)
@@ -317,12 +492,13 @@ class UpdateService:
                     self.state['completed'] = {**pending, 'completed_at': time.time()}
                     self.state.pop('pending', None)
                     self.busy, self.awaiting_until = False, None
+                    self.device_initiated = False
                     self._save()
                     self.emit({'event': 'firmware_verified', 'version': target})
                 elif status.get('ota_target') == target and status.get('last_update') in ('rollback', 'failed'):
-                    self.state['failed'] = {**pending, 'outcome': status['last_update']}
+                    self._remember_failed({**pending, 'outcome': status['last_update']})
                     self.state.pop('pending', None)
-                    self.busy, self.awaiting_until = False, None
+                    self._firmware_failed()
                     self._save()
                     self.emit({'event': 'update_error', 'error': 'Device reported ' + status['last_update'] + '; current firmware ' + status.get('firmware', '--')})
                 elif not self.busy and not self._reconciled:
@@ -337,9 +513,26 @@ class UpdateService:
                 self.awaiting_until = time.monotonic() + 120
                 self.emit({'event': 'update_notice', 'message': 'Reconnecting and checking the installed firmware…'})
             elif kind == 'ota_error':
-                self.busy = False
-                self.state.pop('pending', None)
-                self._save()
+                # Includes code 'job_expired': the Bluetooth worker dropped the
+                # job (meter disconnected, another meter, or 60 s passed).
+                pending = self.state.get('pending')
+                firmware = pending and pending.get('kind') == 'firmware'
+                if not firmware and self.installing != 'firmware':
+                    return  # Not about a firmware install (never clears a companion update).
+                if firmware and pending.get('phase') == 'commit':
+                    # The meter may already have switched images and boot
+                    # the new firmware fine: keep the target so its next
+                    # status report reconciles it, and tell the meter nothing
+                    # yet. set_device reports the verified outcome (a failure
+                    # also on the meter for a rocker-hold install).
+                    self._reconciled = False
+                    self._save()
+                    self.busy, self.awaiting_until = False, None
+                    return
+                if firmware:
+                    self.state.pop('pending', None)
+                    self._save()
+                self._firmware_failed()
             elif kind == 'ota_progress' and event.get('cancellable') is False:
                 pending = self.state.get('pending')
                 if pending:
@@ -349,8 +542,7 @@ class UpdateService:
     def tick(self):
         with self.lock:
             if self.awaiting_until is not None and time.monotonic() >= self.awaiting_until:
-                self.awaiting_until = None
-                self.busy = False
+                self._firmware_failed()
                 self.emit({'event': 'update_unconfirmed', 'message': 'No verified boot result after 120 seconds. Pending target is saved; reconnect to check it.'})
 
     def confirm_companion_startup(self):
@@ -363,7 +555,7 @@ class UpdateService:
                 self._save()
                 self.emit({'event': 'update_notice', 'message': 'Companion ' + self.version + ' installed and startup verified.'})
 
-    def install(self, offer, *, usb_power=False):
+    def install(self, offer, *, usb_power=False, device_initiated=False):
         with self.lock:
             if self.busy or self.offers.get(offer.kind) != offer:
                 raise RuntimeError('Update offer expired or another update is running')
@@ -377,6 +569,8 @@ class UpdateService:
                 if self.device.get('battery_percent', -1) in range(0, 20):
                     raise RuntimeError('Battery is below 20%; charge before updating')
             self.busy = True
+            self.installing = offer.kind
+            self.device_initiated = bool(device_initiated) and offer.kind == 'firmware'
             self.cancel_download.clear()
         threading.Thread(target=self._install, args=(offer, usb_power), name='sweetmeter-install', daemon=True).start()
 
@@ -385,7 +579,11 @@ class UpdateService:
             self.emit({'event': 'ota_progress', 'phase': 'Downloading verified update', 'percent': 0, 'cancellable': True})
             staging = self.state_dir / 'downloads'
             staging.mkdir(exist_ok=True)
+            for old in staging.glob('update-*'):
+                if old.is_dir() and not old.is_symlink():
+                    shutil.rmtree(old, ignore_errors=True)
             directory = Path(tempfile.mkdtemp(prefix='update-', dir=staging))
+            self.download_dir = directory
             artifact = offer.artifact
             image = self.downloader.artifact(artifact, directory, self.cancel_download)
             if offer.kind == 'firmware':
@@ -407,11 +605,15 @@ class UpdateService:
                                              'device_id': self.device_id, 'previous': offer.current,
                                              'phase': 'transfer', 'started_at': time.time()}
                     self._save()
+                    # The Bluetooth worker runs the job only on this meter.
                     self.radio.install_firmware(image_path=image, envelope=envelope,
-                                                companion_version=self.version, usb_power=usb_power)
+                                                companion_version=self.version, usb_power=usb_power,
+                                                device_id=self.device_id)
             else:
                 from .self_update import stage_update
-                staged = stage_update(image, artifact, self.state_dir)
+                staged = stage_update(image, artifact, self.state_dir,
+                                      bluetooth_baseline=getattr(self.radio, 'health', None))
+                shutil.rmtree(directory, ignore_errors=True)  # Verified and unpacked.
                 if self.cancel_download.is_set():
                     raise RuntimeError('Update cancelled')
                 if staged.supported:
@@ -422,6 +624,10 @@ class UpdateService:
                     staged.launch()
                     self.emit({'event': 'companion_restart'})
                 else:
+                    with self.lock:
+                        # Keep only this verified package for the user to install by hand.
+                        self.state['manual_staging'] = str(staged.manual_path.parent.parent)
+                        self._save()
                     self.emit({'event': 'companion_manual', 'message': staged.reason, 'path': str(staged.manual_path)})
                     self.busy = False
         except Exception as error:
@@ -431,6 +637,9 @@ class UpdateService:
                 if pending and pending.get('kind') == offer.kind and pending.get('target') == offer.target:
                     self.state.pop('pending', None)
                 self._save()
+            if offer.kind == 'firmware':
+                with self.lock:
+                    self._firmware_failed()  # Shown on the meter for a rocker-hold install.
             self.emit({'event': 'update_error', 'error': str(error)[:200]})
 
     def cancel(self):

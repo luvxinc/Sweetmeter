@@ -1,4 +1,5 @@
 """Offline acceptance-harness gates and outcome evidence; no device access."""
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import asyncio
 import hashlib
 import json
@@ -168,6 +169,17 @@ class AcceptanceTests(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises(acceptance.AcceptanceError):
                 acceptance.validate_initial(self.status(**overrides), host=HOST, running="2026.9.1")
 
+    def test_paired_firmware_selection_uses_selected_flag_not_host_id(self):
+        paired = {k: v for k, v in self.status().items() if k != "selected_host"}
+        paired.update(auth=1, selected=True, secured=True, serial="d405927bbf38", challenge="00" * 16)
+        acceptance.validate_initial(paired, host=HOST, running="2026.9.1")
+        with self.assertRaises(acceptance.AcceptanceError):
+            acceptance.validate_initial({**paired, "selected": False}, host=HOST, running="2026.9.1")
+        self.assertTrue(acceptance.safe_status(paired)["selected"])
+        self.assertTrue(acceptance.postcondition({**paired, "firmware": "2026.9.2", "last_update": "success",
+                                                   "ota_target": "2026.9.2"}, host=HOST, running="2026.9.1",
+                                                  target="2026.9.2", scenario="upgrade"))
+
     def test_upgrade_and_rollback_require_positive_durable_evidence(self):
         def check(status, scenario):
             return acceptance.postcondition(status, host=HOST, running="2026.9.1", target="2026.9.2", scenario=scenario)
@@ -226,6 +238,80 @@ class AcceptanceTests(unittest.TestCase):
                         await acceptance.exercise(args, candidate, HOST, report)
                 reconnect.assert_not_called()
                 self.assertFalse(report.data["passed"])
+        asyncio.run(run())
+
+    def paired_status(self, **overrides):
+        status = {k: v for k, v in self.status().items() if k != "selected_host"}
+        status.update(auth=1, selected=True, secured=False, serial="d405927bbf38", challenge="ab" * 16,
+                      firmware="2026.9.2", last_update="success", ota_target="2026.9.2")
+        status.update(overrides)
+        return status
+
+    def test_running_companion_state_is_refused(self):
+        from meter.instance_lock import InstanceLock
+        running = InstanceLock(self.state / "meter.lock")
+        try:
+            with self.assertRaisesRegex(acceptance.AcceptanceError, "still running"):
+                acceptance.companion_lock(self.state)
+        finally:
+            running.close()
+        acceptance.companion_lock(self.state).close()
+
+    def test_legacy_upgrade_is_provisioned_exactly_like_the_companion(self):
+        from meter.bluetooth import PairingStore
+        address = "AA:BB:CC:DD:EE:FF"
+        PairingStore(self.state).mark_paired("address:" + address, address, legacy=True)
+        writes = []
+
+        class StubSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def subscribe(self):
+                pass
+
+            async def hello(self):
+                writes.append("H")
+                return 8
+
+            async def provision(self, secret):
+                writes.append(("Y", secret))
+
+        async def run():
+            report = acceptance.Report(self.args())
+            report.start()
+            link = acceptance.Connection(address, HOST, report, self.state)
+            link.client = object()
+            with patch.object(acceptance, "Session", StubSession):
+                with self.assertRaisesRegex(acceptance.AcceptanceError, "finish pairing"):
+                    await link.authorize(self.paired_status())  # never outside the upgrade scenario
+                self.assertEqual(writes, [])
+                self.assertEqual(await link.authorize(self.paired_status(), allow_migration=True), "provisioned")
+            return report
+        asyncio.run(run())
+        self.assertEqual(writes[0], "H")
+        provisioned = writes[1][1]
+        stored = PairingStore(self.state)
+        self.assertEqual(stored.secret("serial:d405927bbf38"), provisioned)  # the companion will use it
+        self.assertFalse(stored.legacy_record(address))
+        self.assertEqual(len(provisioned), 32)
+
+    def test_upgrade_postcondition_comes_from_status_then_authorizes(self):
+        async def run():
+            args = self.args("upgrade")
+            args.device, args.reconnect_timeout = "AA:BB", 5
+            report = acceptance.Report(args)
+            report.start()
+            link = type("Link", (), {
+                "connect": AsyncMock(return_value=self.paired_status()),
+                "authorize": AsyncMock(return_value="provisioned"), "close": AsyncMock(),
+            })()
+            with patch.object(acceptance, "Connection", return_value=link):
+                await acceptance.reconnect_result(args, HOST, "2026.9.2", report)
+            link.authorize.assert_awaited_once()
+            self.assertTrue(link.authorize.call_args.kwargs["allow_migration"])
+            kinds = [event["kind"] for event in report.data["events"]]
+            self.assertEqual(kinds, ["confirmed_boot", "authorized_after_boot"])
         asyncio.run(run())
 
     def test_existing_evidence_is_not_overwritten(self):

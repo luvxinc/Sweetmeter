@@ -20,6 +20,54 @@ sys.path.insert(0, str(_ROOT))
 from scripts.build_provenance import capture_build_state, require_unchanged_build_state, write_json_atomic
 
 
+KEY_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,14}")
+MAX_TRUSTED_KEYS = 8
+_P256_SPKI_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004")
+
+
+def trusted_key_table(root):
+    """Every meter/assets/keys/<key-id>.pem public key, sorted by key ID.
+
+    The firmware embeds all of them; a signed header's 16-byte key ID selects
+    one. Adding a backup key here (in a prior release) enables later rotation.
+    Private keys are never read: only uncompressed P-256 SPKI PEM is accepted.
+    """
+    folder = Path(root) / "meter/assets/keys"
+    keys, seen = [], set()
+    for path in sorted(folder.glob("*.pem")):
+        key_id = path.stem
+        if not KEY_ID_PATTERN.fullmatch(key_id):
+            raise ValueError(f"Invalid trusted key ID: {key_id!r}")
+        public = path.read_text(encoding="ascii")
+        if not re.fullmatch(r"-----BEGIN PUBLIC KEY-----\n[A-Za-z0-9+/=\n]+-----END PUBLIC KEY-----\n", public):
+            raise ValueError(f"Missing/invalid public signing key resource: {path.name}")
+        der = base64.b64decode("".join(public.splitlines()[1:-1]), validate=True)
+        if len(der) != 91 or not der.startswith(_P256_SPKI_PREFIX):
+            raise ValueError(f"Public trust resource must be uncompressed P-256 SPKI: {path.name}")
+        if der in seen:
+            raise ValueError(f"Duplicate trusted public key: {path.name}")
+        seen.add(der)
+        keys.append((key_id, public))
+    if not keys:
+        raise ValueError("Missing/invalid public signing key resource")
+    if len(keys) > MAX_TRUSTED_KEYS:
+        raise ValueError("Too many trusted signing keys")
+    return keys
+
+
+def key_table_source(keys):
+    lines = [f"#define SWEETMETER_TRUSTED_KEY_COUNT {len(keys)}u\n"]
+    for index, (_, public) in enumerate(keys):
+        lines.append(f"static const char SWEETMETER_TRUSTED_KEY_{index}_PEM[] = {json.dumps(public)};\n")
+    names = ", ".join(json.dumps(key_id) for key_id, _ in keys)
+    pems = ", ".join(f"SWEETMETER_TRUSTED_KEY_{index}_PEM" for index in range(len(keys)))
+    sizes = ", ".join(f"sizeof(SWEETMETER_TRUSTED_KEY_{index}_PEM)" for index in range(len(keys)))
+    lines.append(f"static const char *const SWEETMETER_TRUSTED_KEY_IDS[] = {{{names}}};\n")
+    lines.append(f"static const char *const SWEETMETER_TRUSTED_KEY_PEMS[] = {{{pems}}};\n")
+    lines.append(f"static const unsigned SWEETMETER_TRUSTED_KEY_PEM_SIZES[] = {{{sizes}}};\n")
+    return "".join(lines)
+
+
 def generate(root, output=None, *, build_state=None):
     root = Path(root).resolve()
     output = Path(output) if output else root / "firmware/.generated/sweetmeter_release.h"
@@ -48,13 +96,7 @@ def generate(root, output=None, *, build_state=None):
     match = re.fullmatch(r"([1-9][0-9]{3})\.([1-9]|1[0-2])\.([1-9][0-9]{0,9})", version)
     if not match or int(match[3]) > 0xFFFFFFFF:
         raise ValueError("Invalid root VERSION for firmware")
-    public = (root / "meter/assets/keys/release-1.pem").read_text(encoding="ascii")
-    if not re.fullmatch(r"-----BEGIN PUBLIC KEY-----\n[A-Za-z0-9+/=\n]+-----END PUBLIC KEY-----\n", public):
-        raise ValueError("Missing/invalid public signing key resource")
-    der = base64.b64decode("".join(public.splitlines()[1:-1]), validate=True)
-    p256_prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004")
-    if len(der) != 91 or not der.startswith(p256_prefix):
-        raise ValueError("Public trust resource must be uncompressed P-256 SPKI")
+    keys = trusted_key_table(root)
     source = ("// Generated from root VERSION and the public trust resource. Do not edit.\n"
               "#pragma once\n"
               f"#define SWEETMETER_VERSION {json.dumps(version)}\n"
@@ -68,8 +110,7 @@ def generate(root, output=None, *, build_state=None):
               f"#define SWEETMETER_VERSION_YEAR {int(match[1])}u\n"
               f"#define SWEETMETER_VERSION_MONTH {int(match[2])}u\n"
               f"#define SWEETMETER_VERSION_SEQUENCE {int(match[3])}u\n"
-              '#define SWEETMETER_TRUSTED_KEY_ID "release-1"\n'
-              f"static const char SWEETMETER_PUBLIC_KEY_PEM[] = {json.dumps(public)};\n")
+              + key_table_source(keys))
     output.parent.mkdir(parents=True, exist_ok=True)
     if not output.exists() or output.read_text() != source:
         output.write_text(source, encoding="ascii")

@@ -62,3 +62,50 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 ## [2026.9.13] - 2026-09-23
 
 - Rotate every device screen by 180 degrees for the printed enclosure, including the dashboard, Bluetooth menu and sleep screen; existing button functions remain unchanged.
+
+## [2026.9.14] - 2026-09-23
+
+- Hold the rocker for 3 seconds to check for firmware and install a newer version through the paired computer, with the result shown on the meter.
+- Reinstalling never reinstalls dependencies that are already present: source installs rerun pip only when requirements change, and Linux setup skips package checks for an existing installation.
+
+## [2026.9.15] - 2026-09-23
+
+- Pair the meter with up to eight computers, each with its own secret, and switch between them from the meter menu without re-pairing; nearby devices can no longer impersonate a paired computer.
+- The display now refreshes at most once a minute, the meter powers off after 30 minutes without a computer, and replacing a meter no longer requires deleting local files.
+- Switching Claude Code or Codex accounts updates the meter within a minute without showing the previous account's quota; Sweetmeter identifies itself honestly when reading Claude usage.
+- Sweetmeter recovers automatically from Bluetooth failures and damaged local indexes, and shows plain setup instructions for each operating system.
+- Add an uninstaller, automatic repair of a missing login item, quieter Windows startup, and Linux setup for apt, dnf, pacman and zypper.
+- Updates that lose Bluetooth access are rolled back with instructions, and releases are published only through the verified release workflow.
+
+## [2026.9.16] - 2026-09-23
+
+- Pairing is safer: a paired computer's key is never sent again, a changed key must be confirmed on the meter, and the meter shows 'Update Sweetmeter on <name>' for older apps.
+- Claude and Codex quotas refresh every minute again, a button-started update that fails is shown on the meter, and the panel refreshes at most once a minute.
+- Re-running the installer repairs or updates an older or damaged installation, uninstall never leaves a half-deleted app, and an open macOS Bluetooth prompt no longer undoes an update.
+- The self-hosted CI runner reaches its disposable VM through the Tart guest agent, so it keeps working under macOS Local Network privacy.
+
+## [2026.9.17] - 2026-09-23
+
+- Pairing is bound to the meter's Bluetooth address and the meter proves the pairing secret back, so a device copying the meter's serial number cannot take over pairing; the top button now redraws the screen immediately.
+- Account switches show within one refresh cycle (Codex keyring logins within about five minutes), and a hung Codex no longer delays Claude quotas or the Refresh button.
+- Installers never interrupt an update's health check or downgrade a newer installation, and the Windows single-instance lock closes safely.
+
+## [2026.9.18] - 2026-09-23
+
+- Windows detects the processor architecture reliably when choosing which update package to install.
+
+## [2026.9.19] - 2026-09-25
+
+- A step-by-step Connect your meter window lists nearby meters with name, signal and state and walks through waking the meter, opening its computer list, confirming this computer and naming the meter; it opens by itself, also after an automatic app update, until a meter is paired.
+- Meters can be named (up to 16 letters or digits, or 5 Chinese characters) in that window or with Rename meter…; the name is stored on the meter, which advertises it to every computer. Without a name each meter now advertises Sweetmeter- plus the end of its own serial instead of the shared Sweetmeter-05D4.
+- A first Bluetooth pairing succeeds when macOS's Connection Request is answered within about 25 seconds instead of 8: the meter waits for pairing, Sweetmeter explains the prompt while it shows, and an old pairing kept by the computer is reported with the Bluetooth settings to open instead of endless retries.
+- When a meter runs newer firmware than this app, Sweetmeter checks for an app update at once and says so; a full or closed computer list on the meter is explained instead of retried silently.
+
+## [2026.9.20] - 2026-09-25
+
+- Sweetmeter keeps scanning between checks instead of restarting the scan every few seconds, so a Mac finds a meter that just woke in seconds rather than up to a minute; scanning pauses while it connects to a meter.
+
+## [2026.9.21] - 2026-09-26
+
+- Pairing no longer stalls after choosing this computer on the meter: Sweetmeter keeps scanning while it connects (it pauses only on Linux), and on a Mac it reconnected within 2–9 seconds in 11 of 11 trials, where it had taken 15–25 seconds or failed; a meter whose computer list opens is contacted at once.
+- Meters with this firmware also announce an open computer list in their main Bluetooth advertisement, so a Mac sees it within seconds instead of sometimes nearly a minute; the setup window now says to wait for this computer to appear on the meter before pressing the wheel.

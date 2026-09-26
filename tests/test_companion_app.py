@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (test sandbox; must be the first import)
 import threading
 import tempfile
 import unittest
@@ -7,6 +8,13 @@ from meter.app import ProviderWorker, Application
 from meter.__main__ import InstanceLock
 
 class AppTests(unittest.TestCase):
+    def setUp(self):
+        # The worker reads account identities every cycle; never the real
+        # keychain, ~/.claude.json or a real `codex app-server`.
+        accounts = patch('meter.app.account_fingerprints', return_value={'claude': None, 'codex': None})
+        self.accounts = accounts.start()
+        self.addCleanup(accounts.stop)
+
     def test_single_instance_lock_is_released(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'lock'
@@ -15,6 +23,7 @@ class AppTests(unittest.TestCase):
                 with self.assertRaises(OSError): InstanceLock(path)
             finally: one.close()
             two=InstanceLock(path); two.close()
+            two.close(); one.close()  # Closing twice is harmless (Windows msvcrt too).
     def test_sqlite_created_and_closed_on_same_provider_thread(self):
         ids=[]; done=threading.Event(); holder={}
         class Index:
@@ -28,13 +37,22 @@ class AppTests(unittest.TestCase):
             worker.start(); self.assertTrue(done.wait(3)); worker.close()
         self.assertEqual(len(set(ids)),1)
         self.assertNotEqual(ids[0],threading.get_ident())
-    def test_worker_initialization_failure_is_visible_to_health_gate(self):
-        with tempfile.TemporaryDirectory() as directory, patch('meter.app.TokenIndex',side_effect=OSError('denied')):
+    def test_token_index_failure_never_blocks_startup_or_quotas(self):
+        seen=[]
+        with tempfile.TemporaryDirectory() as directory, patch('meter.app.TokenIndex',side_effect=OSError('denied')), \
+                patch('meter.app.refresh',return_value={'providers':{}}):
             app=Application(directory,preview_only=True)
             try:
-                with self.assertRaises(RuntimeError): app.start()
-                self.assertTrue(app.provider.startup_error)
+                app.start()
+                self.assertIsNone(app.provider.startup_error)
+                self.assertEqual(app.provider.index_error,'OSError')
+                deadline=threading.Event()
+                for _ in range(40):
+                    seen.extend(e['event'] for e in app.pump())
+                    if 'snapshot' in seen: break
+                    deadline.wait(.05)
             finally: app.close()
+        self.assertIn('snapshot',seen)
     def test_transient_refresh_failure_recovers_on_refresh(self):
         done=threading.Event(); holder={}; failures=[]
         class Index:
