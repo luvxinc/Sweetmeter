@@ -109,3 +109,7 @@ Versions use `YYYY.M.N`, with the month determined in UTC.
 
 - Pairing no longer stalls after choosing this computer on the meter: Sweetmeter keeps scanning while it connects (it pauses only on Linux), and on a Mac it reconnected within 2–9 seconds in 11 of 11 trials, where it had taken 15–25 seconds or failed; a meter whose computer list opens is contacted at once.
 - Meters with this firmware also announce an open computer list in their main Bluetooth advertisement, so a Mac sees it within seconds instead of sometimes nearly a minute; the setup window now says to wait for this computer to appear on the meter before pressing the wheel.
+
+## [2026.9.22] - 2026-09-26
+
+- Document and test that computers read the first status byte of the merged Bluetooth marker macOS reports, which always reflects whether the meter's computer list is open.

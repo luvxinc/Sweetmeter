@@ -1689,3 +1689,18 @@ class PersistentScannerTests(unittest.IsolatedAsyncioTestCase):
             with patch('meter.bluetooth.time.monotonic', return_value=time.monotonic() + SCANNER_RESTART + 1):
                 await radio._scan()
             self.assertEqual(log, ['start', 'stop', 'start'])
+
+
+class MergedMarkerTests(unittest.TestCase):
+    """macOS merges the advertisement's and the scan response's manufacturer data
+    for one company ID into one value, advertisement first (measured with 2026.9.21
+    firmware). Only the first flags byte is current; the rest can be a cached scan
+    response from before the menu opened or closed."""
+    def kind(self, name, marker):
+        return advertised_kind(SimpleNamespace(local_name=name, manufacturer_data={0xFFFF: marker}))
+
+    def test_the_first_flags_byte_decides(self):
+        self.assertEqual(self.kind('书房', b'SM\x03SM\x01'), 'menu')       # just opened, stale response
+        self.assertEqual(self.kind('书房-PAIR', b'SM\x01SM\x03'), 'closed')  # just closed, stale name too
+        self.assertEqual(self.kind('书房-PAIR', b'SM\x03SM\x03'), 'menu')
+        self.assertEqual(self.kind('书房', b'SM\x01SM\x01'), 'closed')
