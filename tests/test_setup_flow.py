@@ -55,6 +55,8 @@ class SetupFlowTests(unittest.TestCase):
         self.assertEqual(view.meters, [('Sweetmeter-CF24', 'Strong', 'Ready to pair')])
         view = self.send({'event': 'nearby', 'meters': [meter(kind='menu')]})
         self.assertEqual((view.step, view.heading), (OPEN, 'Adding this computer…'))
+        self.assertIn('Do not press the wheel yet', view.body)
+        self.assertIn('+ Aaron-Mac', view.body)
         self.assertEqual(view.meters[0][2], 'Computer list open')
         view = self.send({'event': 'registered', 'name': 'Aaron-Mac'})
         self.assertEqual(view.step, CONFIRM)

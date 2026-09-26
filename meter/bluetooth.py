@@ -1008,15 +1008,20 @@ class Bluetooth:
         rssi = getattr(advertisement, 'rssi', None)
         merged = _Advertisement(name, data, rssi if type(rssi) is int else previous.rssi)
         self._seen[device.address] = (device, merged)
-        if not self._scanning:
-            # Between scans: a meter that just appeared, or whose computer list just
-            # opened, is looked at now instead of after the idle gap.
-            kind, before = self._kind(device.address, merged), self._last_kinds.get(device.address, 'absent')
-            if before == 'absent' or kind == 'menu' and before != 'menu':
-                self._wake.set()
+        kind, before = self._kind(device.address, merged), self._last_kinds.get(device.address, 'absent')
+        if kind == 'menu' and before != 'menu':
+            # A computer list just opened (its owner waits): act now, even mid-scan.
+            self._wake.set()
+        elif not self._scanning and before == 'absent':
+            # Between scans: a meter that just appeared is looked at now, not after the idle gap.
+            self._wake.set()
 
-    async def _pause_scanner(self):
-        """Stop scanning (before connecting; BlueZ may fail to connect while it scans)."""
+    async def _pause_scanner(self, *, connecting=False):
+        """Stop scanning. Before connecting only on Linux, where BlueZ may fail to
+        connect while it scans; CoreBluetooth and WinRT scan and connect together,
+        and a restarted macOS scan reports a meter that just disconnected late."""
+        if connecting and not sys.platform.startswith('linux'):
+            return
         stack, self._scan_stack = self._scan_stack, None
         if stack is not None:
             try:
@@ -1156,7 +1161,7 @@ class Bluetooth:
     # --- one meter -------------------------------------------------------------
     async def _visit(self, device, hinted):
         """Probe/drive one meter; returns seconds before probing it again."""
-        await self._pause_scanner()
+        await self._pause_scanner(connecting=True)
         address = device.address
         was_connected, key = False, None
         # A Forget while this visit runs must never be undone by it.

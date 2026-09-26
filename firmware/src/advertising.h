@@ -18,12 +18,22 @@ constexpr size_t advertisingLimit = 31;
 constexpr uint16_t markerCompany = 0xFFFF;
 constexpr uint8_t markerAuth = 1, markerMenu = 2;
 constexpr char menuNameSuffix[] = "-PAIR";
-constexpr size_t advertisementSize = 3 + 18;  // flags AD + complete 128-bit UUID list AD
+// flags AD + complete 128-bit UUID list AD + the capability marker (below). The
+// marker is also in the advertisement because macOS passes scan responses on
+// only now and then, so an open menu would otherwise be seen late.
+constexpr size_t markerSize = 7;
+constexpr size_t advertisementSize = 3 + 18 + markerSize;
 static_assert(advertisementSize <= advertisingLimit, "Advertisement exceeds 31 bytes");
 // Longest scan response: name AD header (2) + a 16-byte owner-chosen name
 // (meter_name.h) + "-PAIR" (5) + marker AD (7) = 30 bytes.
 constexpr size_t longestScanResponse = 2 + 16 + sizeof(menuNameSuffix) - 1 + 7;
 static_assert(longestScanResponse <= advertisingLimit, "A 16-byte name with -PAIR exceeds the scan response");
+
+// The marker's manufacturer data after its AD header: company ID, "SM", flags.
+inline void markerPayload(uint8_t *out, bool menu) {
+  out[0] = uint8_t(markerCompany & 0xff); out[1] = uint8_t(markerCompany >> 8);
+  out[2] = 'S'; out[3] = 'M'; out[4] = uint8_t(markerAuth | (menu ? markerMenu : 0));
+}
 
 // Writes the raw scan response; returns its length, or 0 if it would exceed
 // 31 bytes (callers then fall back to the name alone).
@@ -35,8 +45,7 @@ inline size_t buildScanResponse(uint8_t *out, const char *name, bool menu) {
   memcpy(out + 2, name, base); memcpy(out + 2 + base, menuNameSuffix, suffix);
   uint8_t *marker = out + 2 + nameSize;
   marker[0] = 6; marker[1] = 0xFF;  // manufacturer-specific data
-  marker[2] = uint8_t(markerCompany & 0xff); marker[3] = uint8_t(markerCompany >> 8);
-  marker[4] = 'S'; marker[5] = 'M'; marker[6] = uint8_t(markerAuth | (menu ? markerMenu : 0));
+  markerPayload(marker + 2, menu);
   return total;
 }
 }  // namespace sweetmeter

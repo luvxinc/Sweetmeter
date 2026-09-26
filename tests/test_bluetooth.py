@@ -223,15 +223,27 @@ def radio_for(folder, meters, *, hints=(), marker=True, name=True):
     (Path(folder) / 'companion.json').write_text(json.dumps({'host_id': HOST}))
     radio = Bluetooth(folder, start=False)
     class Scanner:
+        running = None
         def __init__(self, detection_callback, **_):
             self.found = detection_callback
-        async def __aenter__(self):
+        def report(self):
             for meter in meters:
                 self.found(SimpleNamespace(address=meter.address),
                            advertisement(meter, meter.address in hints, marker=marker, name=name))
+        async def __aenter__(self):
+            Scanner.running = self
+            self.report()
         async def __aexit__(self, *_):
-            pass
+            Scanner.running = None
     radio.scanner_factory = Scanner
+    scan = radio._scan
+    async def scan_again():
+        # A running scanner keeps reporting the meters it hears.
+        running = getattr(radio.scanner_factory, 'running', None)
+        if running is not None and radio._scan_stack is not None:
+            running.report()
+        return await scan()
+    radio._scan = scan_again
     radio.client_factory = meters[0].client_factory(meters) if meters else None
     async def no_sleep(_seconds):
         return None
@@ -1642,6 +1654,30 @@ class PersistentScannerTests(unittest.IsolatedAsyncioTestCase):
             scanner.found(SimpleNamespace(address='m'), SimpleNamespace(local_name='Sweetmeter-ABCD-PAIR',
                                                                         manufacturer_data={0xFFFF: b'SM\x03'}, rssi=-60))
             self.assertTrue(radio._wake.is_set())  # its computer list just opened
+            # Also in the middle of a scan: the owner is waiting for this computer.
+            await radio._scan()
+            scanner.found(SimpleNamespace(address='m'), SimpleNamespace(local_name='Sweetmeter-ABCD',
+                                                                        manufacturer_data={0xFFFF: b'SM\x01'}, rssi=-60))
+            await radio._scan()  # its list closed again
+            radio._wake.clear()
+            radio._scanning = True
+            scanner.found(SimpleNamespace(address='m'), SimpleNamespace(local_name='Sweetmeter-ABCD-PAIR',
+                                                                        manufacturer_data={0xFFFF: b'SM\x03'}, rssi=-60))
+            self.assertTrue(radio._wake.is_set())
+            radio._scanning = False
+
+    async def test_scanning_continues_while_connecting_except_on_linux(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for platform, stops in (('darwin', False), ('win32', False), ('linux', True)):
+                log = []
+                radio = radio_for(folder, [])
+                radio.scanner_factory = self.scanner(log)
+                await radio._scan()
+                with patch('meter.bluetooth.sys.platform', platform):
+                    await radio._pause_scanner(connecting=True)
+                # A restarted macOS scan reported a meter that had just disconnected
+                # 20-40 s late; BlueZ may fail to connect while it scans.
+                self.assertEqual(log, ['start', 'stop'] if stops else ['start'], platform)
 
     async def test_the_scanner_restarts_now_and_then_to_notice_bluetooth_problems(self):
         with tempfile.TemporaryDirectory() as folder:

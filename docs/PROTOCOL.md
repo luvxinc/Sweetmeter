@@ -45,8 +45,11 @@ of the firmware; this is not secure boot or protection against physical USB flas
 The ESP32 is the peripheral; Windows/macOS/Linux companions are GATT centrals.
 There is one active connection. Advertise the fixed service UUID using a legacy
 advertisement of at most 31 bytes: flags (3 bytes) plus complete 128-bit service
-UUID list (18 bytes). Put the local name in the separate scan response (also at
-most 31 bytes). Do not put a second 128-bit discovery UUID into the
+UUID list (18 bytes), plus, from firmware 2026.9.20, the capability marker below
+(7 bytes; 28 in total). Put the local name in the separate scan response (also at
+most 31 bytes). The marker is in both packets because macOS passes a scan
+response on only now and then (measured: many 3-second scans without one), so
+an open menu announced only there was often seen tens of seconds late. Do not put a second 128-bit discovery UUID into the
 advertisement or require computer advertising. Discovery state is read from
 GATT after connecting.
 

@@ -170,6 +170,12 @@ static void refreshTests() {
 }
 static void advertisingTests() {
   static_assert(advertisementSize<=advertisingLimit,"advertisement");
+  // The advertisement carries the marker too: flags 3 + UUID list 18 + marker 7.
+  static_assert(advertisementSize==28,"advertisement with marker");
+  uint8_t payload[5]; markerPayload(payload,false);
+  const uint8_t closedPayload[5]={0xFF,0xFF,'S','M',markerAuth};
+  assert(!memcmp(payload,closedPayload,5));
+  markerPayload(payload,true); assert(payload[4]==(markerAuth|markerMenu));
   uint8_t raw[advertisingLimit];
   // Normal: name AD (17) + marker AD (7) = 24 bytes; menu: "-PAIR" name (22) + marker = 29.
   size_t closed=buildScanResponse(raw,"Sweetmeter-ABCD",false);

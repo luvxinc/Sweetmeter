@@ -596,8 +596,17 @@ void renameMeter(const uint8_t *p,size_t n) {
   }
   uint8_t reply[2]={'L',result}; notifyControl(reply,sizeof(reply));
 }
+// Advertisement: flags, the service UUID and the capability marker (advertising.h).
+void setAdvertisement(bool menu) {
+  BLEAdvertisementData advertisement;
+  advertisement.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC|ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+  advertisement.setCompleteServices(BLEUUID(SERVICE_UUID));
+  uint8_t marker[5]; sweetmeter::markerPayload(marker,menu);
+  advertisement.setManufacturerData(std::string(reinterpret_cast<const char*>(marker),sizeof(marker)));
+  BLEDevice::getAdvertising()->setAdvertisementData(advertisement);
+}
 void setAdvertisedMenu(bool menu) {
-  setScanResponse(menu);
+  setAdvertisement(menu); setScanResponse(menu);
   if(!connected) advertise();
 }
 void closeDiscovery() {
@@ -816,10 +825,7 @@ void setupBluetooth() {
   otaStatusCccd=new BLE2902(); otaStatusCharacteristic->addDescriptor(otaStatusCccd); otaStatusCharacteristic->setCallbacks(new OtaStatusCallbacks());
   publishOta(ota.status,true); updateDeviceSnapshot(); service->start();
   BLEAdvertising *advertising=BLEDevice::getAdvertising();
-  BLEAdvertisementData advertisement;
-  advertisement.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC|ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
-  advertisement.setCompleteServices(BLEUUID(SERVICE_UUID));
-  advertising->setAdvertisementData(advertisement); setScanResponse(false);
+  setAdvertisement(false); setScanResponse(false);
   advertising->setMinInterval(800); advertising->setMaxInterval(1600); advertise();
   drawScreen();
   bool bleReady=bleServiceStarted && service->getHandle()!=0 && controlCharacteristic->getHandle()!=0 && otaStatusCharacteristic->getHandle()!=0;

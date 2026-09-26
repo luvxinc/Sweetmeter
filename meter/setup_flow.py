@@ -228,12 +228,15 @@ class SetupFlow:
         elif any(m.get('kind') == 'menu' for m in self.meters.values()):
             view.step = OPEN
             view.heading = 'Adding this computer…'
-            view.body = 'The meter’s computer list is open. Keep it open; this takes a few seconds.'
+            view.body = ('The meter’s computer list is open. Do not press the wheel yet: wait until “+ ' +
+                         self.computer + '” appears on the meter, usually within a few seconds.')
         elif self.meters:
             view.step = OPEN
             view.heading = 'Open the meter’s computer list'
             view.body = ('Hold the meter’s lower button for 3 seconds, until it shows SELECT COMPUTER. '
-                         'Sweetmeter then adds ' + self.computer + ' to that list.')
+                         'Then do not press anything yet: Sweetmeter adds “+ ' + self.computer + '” to that '
+                         'list within about 30 seconds. Choosing a computer already listed there does not '
+                         'pair this one.')
             if self.platform == 'darwin':
                 view.body += ('\n\nThe first time, macOS asks “Connection Request from Sweetmeter…”: click Connect '
                               'right away. Do not choose Cancel or Ignore this device.')
